@@ -1,0 +1,4 @@
+Contact: https://github.com/automicvault/automicvault/issues
+Preferred-Languages: en
+Canonical: https://www.automicvault.xyz/.well-known/security.txt
+Expires: 2027-07-28T00:00:00Z

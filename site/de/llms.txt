@@ -1,0 +1,45 @@
+# Automic Vault
+
+> Automic Vault kontrolliert auf dem Mac, wie verifizierte Software Entwickler-Credentials auf konkrete Operationen anwendet.
+
+## Wichtige Seiten
+
+- [Automic Vault | macOS schützt deine Apps. Wir schützen deine Kommandozeile.](https://www.automicvault.xyz/de/): Automic Vault ergänzt die macOS-Sicherheit für unterstützte CLI-Tools: geschützte Zugangsdaten, Autorisierung einzelner Operationen und deine gewohnten Befehle.
+
+- [Automic Vault herunterladen](https://www.automicvault.xyz/de/download/): Lade Automic Vault für macOS herunter und kontrolliere die Verwendung von Entwickler-Credentials.
+
+- [Dokumentation](https://www.automicvault.xyz/docs/): Englisches Handbuch für Automic Vault 4.18.0; anhand des Release-Quellcodes geprüft.
+
+- [Pakete](https://pkg.so/de/): Durchsuchbarer Katalog mit Entwicklerpaketen, Abhängigkeiten, Installationsbefehlen, Risikoinformationen und Automic-Vault-Härtung.
+
+- [Blog](https://www.automicvault.xyz/blog/): Sicherheitsleitfäden und Analysen zu Paket-, Erweiterungs-, Credential- und lokalen Ausführungsvorfällen.
+
+- [Über Automic Vault | Von Homebrew zur CLI-Sicherheit](https://www.automicvault.xyz/de/about/): Automic Vault ergänzt die macOS-Sicherheit für unterstützte CLI-Tools: geschützte Zugangsdaten, Autorisierung einzelner Operationen und deine gewohnten Befehle.
+
+- [Automic Vault Datenschutz](https://www.automicvault.xyz/de/privacy/): Welche Daten die Automic-Vault-App und Website senden, was lokal bleibt und welche Analysedienste Daten erhalten.
+
+- [Automic Vault Bedingungen](https://www.automicvault.xyz/de/terms/): Nutzungsbedingungen, Open-Source-Lizenz und Website-Hinweise für Automic Vault.
+
+- [GitHub](https://github.com/automicvault/automicvault): Apache-2.0-Quellcode, markierte Releases, Implementierungshistorie und öffentliche Fehlerverfolgung.
+
+- [Sicherheit](https://www.automicvault.xyz/.well-known/security.txt): Veröffentlicht den aktuellen Sicherheitskontakt, die bevorzugte Sprache, die kanonische Adresse und das Ablaufdatum.
+
+## Kernfakten
+
+- Plattform: macOS
+
+- Aktuell dokumentiertes Release: Automic Vault 4.18.0
+
+- Lizenz: Apache License 2.0
+
+- Preis: kostenlose Open-Source-Software
+
+- Gründer: Max Howell, Schöpfer von Homebrew
+
+## Kontakt
+
+- Website: https://www.automicvault.xyz/de/
+
+- GitHub: https://github.com/automicvault/automicvault
+
+- Sicherheitsmeldungen: https://github.com/automicvault/automicvault/issues

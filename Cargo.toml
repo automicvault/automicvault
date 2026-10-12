@@ -1,0 +1,75 @@
+[package]
+name = "av"
+version = "4.18.0"
+edition = "2024"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+# Rust 1.96 on macOS needs proc-macro metadata retained in build dependencies.
+[profile.release.build-override]
+strip = "none"
+
+# Exercise optimized code with isolated test fixtures. Shipped release binaries keep
+# debug assertions disabled and therefore continue to ignore AUTOMIC_VAULT_TEST_* overrides.
+[profile.test-release]
+inherits = "release"
+debug-assertions = true
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+futures-util = "0.3"
+http-body-util = "0.1"
+http-mitm-proxy = { version = "=0.18.0", default-features = false }
+hudsucker = "=0.25.0"
+hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "tls12", "webpki-tokio"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["http2", "json", "rustls-tls"] }
+ring = "0.17"
+percent-encoding = "2.3"
+pgp = { version = "0.20", default-features = false }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ssh-key = { version = "0.6.7", features = ["ed25519", "p256", "p384", "p521", "encryption"] }
+signature = "2.2"
+subtle = "2.6"
+tokio = { version = "1.53", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.9"
+tower-service = "0.3"
+ureq = { version = "3.3", default-features = false, features = ["rustls"] }
+url = "2.5"
+zeroize = "1.8"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "av"
+path = "src/cli/main.rs"
+
+[[bin]]
+name = "av-gpg"
+path = "src/av_gpg/main.rs"
+
+[[bin]]
+name = "av-brew-stub"
+path = "src/brew_stub/main.rs"
+
+[[bin]]
+name = "scanner"
+path = "src/scanner/main.rs"
+
+[[bin]]
+name = "av-approval-relay"
+path = "src/approval_relay/main.rs"
+
+[[bin]]
+name = "av-proxy-helper"
+path = "src/proxy_helper/main.rs"

@@ -1,0 +1,105 @@
+import Testing
+@testable import MenubarHelperCore
+
+@Test func approvalServiceRejectsGenericSecretLoad() {
+    #expect(ApprovalServiceOperation(rawValue: "load") == nil)
+}
+
+@Test func conditionalSaveKeepsItsCompatibleWireValue() {
+    #expect(ApprovalServiceOperation.saveIfAbsentOrEqual.rawValue == "save-if-absent")
+}
+
+@Test func varlockHasADedicatedWireOperation() {
+    #expect(ApprovalServiceOperation.varlock.rawValue == "varlock")
+}
+
+@Test func authorizationHistoryHasADedicatedWireOperation() {
+    #expect(ApprovalServiceOperation.history.rawValue == "history")
+    #expect(ApprovalServiceOperation.historyWindow.rawValue == "history-window")
+    #expect(ApprovalServiceOperation.history.disclosesProtectedMetadata)
+    #expect(ApprovalServiceOperation.historyWindow.disclosesProtectedMetadata)
+    #expect(ApprovalServiceOperation.historyRead.disclosesProtectedMetadata)
+    #expect(ApprovalServiceOperation.historyNext.disclosesProtectedMetadata)
+    #expect(ApprovalServiceOperation.list.disclosesProtectedMetadata)
+    #expect(!ApprovalServiceOperation.inject.disclosesProtectedMetadata)
+}
+
+@Test func terraformCredentialGetHasADedicatedWireOperation() {
+    #expect(ApprovalServiceOperation.terraformGet.rawValue == "terraform-get")
+}
+
+@Test func aliyunCredentialGetHasADedicatedWireOperation() {
+    #expect(ApprovalServiceOperation.aliyunHelperVersion.rawValue == "aliyun-helper-version")
+    #expect(ApprovalServiceOperation.aliyunGet.rawValue == "aliyun-get")
+}
+
+@Test func oxideCredentialsHaveDedicatedWireOperations() {
+    #expect(ApprovalServiceOperation.oxideGet.rawValue == "oxide-get")
+    #expect(ApprovalServiceOperation.oxideSave.rawValue == "oxide-save")
+    #expect(ApprovalServiceOperation.oxideDelete.rawValue == "oxide-delete")
+}
+
+@Test func fastlyCredentialsHaveDedicatedWireOperations() {
+    #expect(ApprovalServiceOperation.fastlyHelperVersion.rawValue == "fastly-helper-version")
+    #expect(ApprovalServiceOperation.fastlyGet.rawValue == "fastly-get")
+    #expect(ApprovalServiceOperation.fastlySave.rawValue == "fastly-save")
+    #expect(ApprovalServiceOperation.fastlyDelete.rawValue == "fastly-delete")
+}
+
+@Test func sqlcmdCredentialsHaveDedicatedWireOperations() {
+    #expect(ApprovalServiceOperation.sqlcmdHelperVersion.rawValue == "sqlcmd-helper-version")
+    #expect(ApprovalServiceOperation.sqlcmdGet.rawValue == "sqlcmd-get")
+    #expect(ApprovalServiceOperation.sqlcmdSave.rawValue == "sqlcmd-save")
+    #expect(ApprovalServiceOperation.sqlcmdDelete.rawValue == "sqlcmd-delete")
+}
+
+@Test func goatCredentialsHaveDedicatedWireOperations() {
+    #expect(ApprovalServiceOperation.goatGet.rawValue == "goat-get")
+    #expect(ApprovalServiceOperation.wakatimeHelperVersion.rawValue == "wakatime-helper-version")
+    #expect(ApprovalServiceOperation.wakatimeGet.rawValue == "wakatime-get")
+    #expect(ApprovalServiceOperation.goatSave.rawValue == "goat-save")
+    #expect(ApprovalServiceOperation.goatDelete.rawValue == "goat-delete")
+}
+
+@Test func railwayCredentialsHaveDedicatedWireOperations() {
+    #expect(ApprovalServiceOperation.railwayGet.rawValue == "railway-get")
+    #expect(ApprovalServiceOperation.railwaySave.rawValue == "railway-save")
+    #expect(ApprovalServiceOperation.railwayDelete.rawValue == "railway-delete")
+}
+
+@Test func rclonePasswordHasDedicatedWireOperations() {
+    #expect(ApprovalServiceOperation.rcloneHelperVersion.rawValue == "rclone-helper-version")
+    #expect(ApprovalServiceOperation.rcloneGet.rawValue == "rclone-get")
+}
+
+@Test func kubectlCredentialsHaveDedicatedWireOperations() {
+    #expect(ApprovalServiceOperation.kubectlHelperVersion.rawValue == "kubectl-helper-version")
+    #expect(ApprovalServiceOperation.kubectlGet.rawValue == "kubectl-get")
+}
+
+@Test func ordercliCredentialsHaveDedicatedWireOperations() {
+    #expect(ApprovalServiceOperation.ordercliGet.rawValue == "ordercli-get")
+    #expect(ApprovalServiceOperation.ordercliSave.rawValue == "ordercli-save")
+    #expect(ApprovalServiceOperation.ordercliDelete.rawValue == "ordercli-delete")
+}
+
+@Test func openhueCredentialsHaveDedicatedWireOperations() {
+    #expect(ApprovalServiceOperation.openhueGet.rawValue == "openhue-get")
+    #expect(ApprovalServiceOperation.openhueSave.rawValue == "openhue-save")
+}
+
+@Test func plumberCredentialsHaveDedicatedWireOperations() {
+    #expect(ApprovalServiceOperation.plumberGet.rawValue == "plumber-get")
+    #expect(ApprovalServiceOperation.plumberSave.rawValue == "plumber-save")
+}
+
+@Test func uaaCredentialsHaveDedicatedWireOperations() {
+    #expect(ApprovalServiceOperation.uaaGet.rawValue == "uaa-get")
+    #expect(ApprovalServiceOperation.uaaSave.rawValue == "uaa-save")
+    #expect(ApprovalServiceOperation.uaaDelete.rawValue == "uaa-delete")
+}
+
+@Test func approvalServiceOperationValuesAreUnique() {
+    let values = ApprovalServiceOperation.allCases.map(\.rawValue)
+    #expect(Set(values).count == values.count)
+}

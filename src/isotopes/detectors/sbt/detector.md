@@ -1,0 +1,30 @@
+# sbt
+
+It is trivial for anything on your computer to exfiltrate sbt’s secret:
+
+```sh
+cat "$HOME/.sbt/.credentials"
+```
+
+This prints the file, including any repository passwords it contains. Software
+running as you with read access can copy the same material.
+
+> ### What we check
+>
+> - sbt credentials file contains plaintext passwords.
+>
+> #### Sensitive Files
+>
+> - `~/.sbt/.credentials`
+
+## Mitigation
+
+The retired `sbt` hardener moved the detected secret to the macOS Keychain, then
+recreated `~/.sbt/.credentials` inside a temporary directory for each run. We no
+longer consider a temporary plaintext file a sufficient security boundary, so
+this detector remains report-only.
+
+If a narrow environment-variable or credential-helper interface can cover this
+state without writing the secret back to disk, we can reconsider the hardener.
+
+[Open an issue to discuss a safer integration](https://github.com/automic-vault/automic-vault/issues).

@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-Y78QKG1T9Y"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-Y78QKG1T9Y');
+  </script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>Security foundations — Automic Vault</title>
+  <meta name="description" content="How Automic Vault authorizes complete operations and where its security boundary ends.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="Automic Vault">
+  <meta property="og:title" content="Security foundations">
+  <meta property="og:description" content="How Automic Vault authorizes complete operations and where its security boundary ends.">
+  <meta property="og:url" content="https://www.automicvault.xyz/docs/security/">
+  <meta property="og:image" content="https://www.automicvault.xyz/preview.jpg">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Security foundations">
+  <meta name="twitter:description" content="How Automic Vault authorizes complete operations and where its security boundary ends.">
+  <meta name="twitter:image" content="https://www.automicvault.xyz/preview.jpg">
+  <link rel="canonical" href="index.html">
+  <link rel="alternate" type="text/markdown" title="Markdown" href="index.md">
+  <link rel="alternate" type="text/plain" title="llms.txt" href="../../llms.txt">
+  <script type="application/ld+json">
+  {"@context":"https://schema.org","@type":"TechArticle","url":"https://www.automicvault.xyz/docs/security/","headline":"Security foundations","description":"How Automic Vault authorizes complete operations and where its security boundary ends.","dateModified":"2026-10-08","author":{"@id":"https://www.automicvault.xyz/#organization"},"publisher":{"@id":"https://www.automicvault.xyz/#organization"},"about":{"@type":"SoftwareApplication","name":"Automic Vault","softwareVersion": "4.18.0","operatingSystem":"macOS","codeRepository":"https://github.com/automicvault/automicvault"}}
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&amp;family=Geist+Mono:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+  <link rel="icon" href="../../favicon.ico@v=5" sizes="16x16 32x32 48x48">
+  <link rel="icon" href="../../favicon-dark.svg@v=5" type="image/svg+xml" media="(prefers-color-scheme: dark)">
+  <link rel="icon" href="../../favicon.svg@v=5" type="image/svg+xml" media="(prefers-color-scheme: light)">
+  <link rel="mask-icon" href="../../safari-pinned-tab.svg@v=5" color="#ffffff" media="(prefers-color-scheme: dark)">
+  <link rel="mask-icon" href="../../safari-pinned-tab.svg@v=5" color="#111111" media="(prefers-color-scheme: light)">
+  <link rel="apple-touch-icon" href="../../apple-touch-icon.png@v=3">
+  <link rel="stylesheet" href="../../styles.css@v=128.css">
+  <link rel="stylesheet" href="../styles.css@v=5.css">
+</head>
+<body>
+  <div class="site-shell" id="top">
+    <header class="masthead">
+      <a class="brand" href="../../index.html" aria-label="Automic Vault home"><img class="brand-mark" src="../../assets/icon@2x.webp@v=3" alt="" width="54" height="54"><span class="brand-type">Automic Vault</span></a>
+      <button class="nav-toggle" type="button" aria-expanded="false" aria-label="Toggle navigation"><span></span><span></span></button>
+      <nav class="nav" aria-label="Main navigation"><a href="../../index.html">Home</a><a href="https://pkg.so/">Packages</a><a href="../../blog/index.html">Blog</a><a href="../index.html" aria-current="page">Docs</a><a href="../../download/index.html">Download</a><a href="https://github.com/automicvault/automicvault">GitHub</a></nav>
+    </header>
+    <main>
+      <header class="docs-hero"><div class="docs-hero-inner"><p class="eyebrow">Automic Vault 4.18.0 · macOS</p><h1>Security foundations</h1><p class="lede">The request, identity, authority, delivery, and evidence boundaries behind every decision.</p><ul class="docs-provenance" aria-label="Page formats"><li>Source linked</li><li><a href="index.md">Markdown</a></li></ul></div></header>
+      <div class="docs-layout">
+        <nav class="docs-toc" aria-label="Documentation sections">
+          <a class="docs-toc-title" href="../index.html">Manual</a>
+          <section class="docs-nav-group">
+            <h2>Documentation</h2>
+            <ul><li><a href="../index.html">Overview</a></li><li><a href="index.html" aria-current="page">Security foundations</a></li><li><a href="../app/index.html">App guide</a></li><li><a href="../authority/index.html">Approval and authority</a></li><li><a href="../cli/index.html">CLI reference</a></li><li><a href="../workflows/index.html">Workflows</a></li><li><a href="../blessed-scripts/index.html">Blessed Scripts</a></li><li><a href="../reentrant-scripts/index.html">Reentrant Blessed Scripts</a></li><li><a href="../troubleshooting/index.html">Troubleshooting</a></li><li><a href="../hardeners/index.html">Hardeners</a></li></ul>
+          </section>
+          <section class="docs-nav-group">
+            <h2>On this page</h2>
+            <ul><li class="docs-nav-depth-3"><a href="index.html#the-request-envelope">The request envelope</a></li><li class="docs-nav-depth-3"><a href="index.html#custody-application-and-disclosure">Custody, Application, and
+Disclosure</a></li><li class="docs-nav-depth-3"><a href="index.html#identity-and-provenance">Identity and provenance</a></li><li class="docs-nav-depth-3"><a href="index.html#authority-and-decision-sources">Authority and decision
+sources</a></li><li class="docs-nav-depth-3"><a href="index.html#secure-defaults">Secure defaults</a></li><li class="docs-nav-depth-3"><a href="index.html#what-automic-vault-does-not-do">What Automic Vault does not
+do</a></li></ul>
+          </section>
+        </nav>
+        <article class="docs-content"><h2 id="security-foundations">Security foundations</h2>
+<p>Automic Vault's security model starts with the operation, then works
+outward to identity, policy, human authority, delivery, and evidence.
+Reading the model in that order avoids the most common mistake: treating
+possession of a Secret Name or a signed process identity as permission
+by itself.</p>
+<h3 id="the-request-envelope">The request envelope</h3>
+<p>An <strong>Authorization Request</strong> is the complete immutable
+operation presented to policy. Depending on the Gate, it contains:</p>
+<ul>
+<li>the Verified Launcher and the observed execution chain;</li>
+<li>the Gate Client and selected Authorization Gate;</li>
+<li>the resolved Target executable, command, arguments, and physical
+working directory;</li>
+<li>the exact Secret Names and selected Value sources;</li>
+<li>Target runtime posture, including Hardened Runtime where
+required;</li>
+<li>environment conflicts and Gate-specific facts such as registry,
+host, or GPG payload digest.</li>
+</ul>
+<p>A decision binds to that envelope. Changing an argument, Target,
+directory, Value source, launcher generation, or relevant runtime fact
+creates a different request. A label such as “ChatGPT,” “gh,” or “read
+only” is useful UI shorthand, but is not the complete security
+decision.</p>
+<p><a href="../assets/approval-request.png"><img
+src="../assets/approval-request.png"
+alt="Mac Approval showing command, Secret Names, working directory, Target, Verified Launcher, execution chain, and warnings" /></a></p>
+<p>Before approving, read the request from top to bottom. Confirm the
+command is the operation you intended, the Secret Names are the minimum
+required, the working directory is expected, the full Target path is
+native and immutable enough for the policy, and the Verified Launcher is
+the app or bundle you meant to authorize. Warnings are part of the
+request, not decoration.</p>
+<h3 id="custody-application-and-disclosure">Custody, Application, and
+Disclosure</h3>
+<p><strong>Secret Custody</strong> stores a Value under macOS-backed
+protection. <strong>Secret Application</strong> places that Value into
+an authorized operation without displaying it. <strong>Secret
+Disclosure</strong> reveals the raw Value and is a stronger authority.
+These are different capabilities.</p>
+<p>A Target controls a Value after receiving it. It may log, cache,
+transform, transmit, or disclose that Value. Automic Vault narrows who
+may receive a Value and for which operation; it cannot retract a Value
+already delivered or promise that an authorized Target behaves well.</p>
+<p>An <strong>Execution Gate</strong> controls an operation without
+requiring a Secret; Homebrew is the current example. A <strong>Secret
+Gate</strong> controls Secret Application or Disclosure. GPG Signing is
+a Tool-specific Secret Gate: the signed <code>av gpg-sign</code> Target
+receives the private key, while Git and <code>av-gpg</code> receive only
+the detached signature.</p>
+<h3 id="identity-and-provenance">Identity and provenance</h3>
+<p>A <strong>Verified Launcher</strong> is a live, revalidated code
+identity used as an input to policy. Code signing, a Launcher Bundle, a
+blessed script digest, and Hardened Runtime can strengthen identity and
+integrity. None proves benign intent.</p>
+<p>Launcher provenance is checked again at use time. A mutable wrapper,
+unexpected interpreter, replaced binary, incompatible entitlement, lost
+execution ancestry, or changed script can invalidate the route. A native
+Target or exact reviewed snapshot gives policy a stable object to
+revalidate. A shell leaves every child behind a broad interpreter
+boundary.</p>
+<p>When adding a Verified Launcher, Automic Vault may discover signed
+helpers sealed inside its app. Approving an association lets that exact
+helper represent the app wherever current or future Gate policy names
+the app. Discovery, a shared Team ID, or bundle containment alone grants
+no association. Review the cross-gate warning before enabling a helper;
+disable it to remove that association without changing the app's
+rules.</p>
+<p>The built-in Claude Code association allows its exact signed helper
+to represent verified Claude.app outside the parent bundle by default,
+including separately installed copies with that identity. Its
+Tool-specific gate rules also accept Claude Code's disabled library
+validation, including existing strict Claude.app rules. Third-party code
+loaded into that helper can exercise those permissions. Review the
+warning and opt-out in Verified Launcher Helpers. Direct Access Rules,
+Temporary Access Grants, other helpers, and Claude.app itself retain
+their recorded runtime requirements. See <a
+href="https://github.com/automicvault/automicvault/blob/main/docs/signed-cli-launchers.md#claude-desktop-and-claude-code">the
+canonical helper rules</a>.</p>
+<h3 id="authority-and-decision-sources">Authority and decision
+sources</h3>
+<p>An operation can be allowed by <strong>Human</strong>,
+<strong>Policy</strong>, or a narrowly scoped <strong>Temporary Access
+Grant</strong>. Authorization History records the source so an operator
+can distinguish “a person allowed this exact request” from “an existing
+rule matched this request.”</p>
+<p>Approval may be carried on the Mac or an eligible iPhone. The Mac
+remains the <strong>Local Execution Boundary</strong> in both cases: it
+builds and revalidates the request, applies the decision, and performs
+the operation. Moving the human gesture to an iPhone does not move
+execution or Custody to the phone.</p>
+<h3 id="secure-defaults">Secure defaults</h3>
+<p>Defaults trade convenience for narrow authority:</p>
+<ul>
+<li>new Secret Gates begin at <strong>Read Only</strong>;</li>
+<li>GPG Signing and the optional SSH Agent Gate begin at
+<strong>Approval Required</strong>;</li>
+<li>Homebrew begins at <strong>Read &amp; Update</strong>, which
+excludes installs and upgrades;</li>
+<li>Direct Secret Access begins at <strong>Approval
+Required</strong>;</li>
+<li>Detached Processes is off;</li>
+<li>proxy sessions always require Approval and keep rules only in
+memory;</li>
+<li>Project Value selection never falls back after a selected Value
+fails to read;</li>
+<li>availability while locked is separate from authorization;</li>
+<li>unknown, elevated, Disclosure, Direct, and mutation operations are
+excluded from Temporary Access Grants.</li>
+</ul>
+<p>Fail-closed behavior can surface as a denial after an update, move,
+permission change, or runtime change. Diagnose the mismatch; do not
+weaken the rule merely to restore yesterday's behavior.</p>
+<h3 id="what-automic-vault-does-not-do">What Automic Vault does not
+do</h3>
+<p>Automic Vault is not a sandbox, malware detector, whole-process
+containment system, network firewall, defense against a compromised
+kernel or root account, or proof that signed code has good intent.
+Proxying does not force a Target to use the proxy. History is not a
+remote, append-only audit ledger. Project Directory is not project
+identity. Agent Task Context is not identity.</p>
+<p>Those boundaries are security properties, not disclaimers to work
+around. They tell you where another control is needed: sandbox the
+Target, restrict network egress, protect the administrator account, ship
+logs remotely, or use a dedicated short-lived credential system when the
+threat model requires it.</p>
+<p class="docs-source-link"><a href="index.md">Read this page as Markdown</a></p></article>
+      </div>
+    </main>
+    <footer class="docs-footer"><p class="docs-footer-line">Authorize the operation, not just the identity.</p><div class="docs-footer-meta"><div class="docs-footer-links"><a href="index.html#top">Back to top</a><a href="../index.html">Docs</a><a href="index.md">Markdown</a><a href="../../download/index.html">Download</a><a href="https://github.com/automicvault/automicvault">Source</a></div><span>Automic Vault 4.18.0 manual</span></div></footer>
+  </div>
+  <script src="../../app.js@v=26"></script>
+</body>
+</html>

@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-Y78QKG1T9Y"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-Y78QKG1T9Y');
+  </script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Best Practices for Using a Mac with Agents | Automic Vault Blog</title>
+  <meta name="description" content="A practical macOS security baseline for AI agents: keep Gatekeeper and SIP enabled, protect Downloads, and deny broad privacy permissions.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="Automic Vault">
+  <meta property="og:title" content="Best Practices for Using a Mac with Agents">
+  <meta property="og:description" content="Keep the Mac's native security boundaries intact when an agent can run code on your behalf.">
+  <meta property="og:url" content="https://www.automicvault.xyz/blog/mac-security-best-practices-for-agents/">
+  <meta property="og:image" content="https://www.automicvault.xyz/assets/blog/mac-security-best-practices-for-agents-og.webp">
+  <meta property="article:published_time" content="2026-07-16">
+  <meta property="article:modified_time" content="2026-07-16">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:image" content="https://www.automicvault.xyz/assets/blog/mac-security-best-practices-for-agents-og.webp">
+  <meta name="twitter:title" content="Best Practices for Using a Mac with Agents">
+  <meta name="twitter:description" content="Keep the Mac's native security boundaries intact when an agent can run code on your behalf.">
+  <link rel="canonical" href="index.html">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "Organization",
+        "@id": "https://www.automicvault.xyz/#organization",
+        "name": "Automic Vault",
+        "url": "https://www.automicvault.xyz/",
+        "logo": "https://www.automicvault.xyz/assets/icon@2x.webp?v=3"
+      },
+      {
+        "@type": "BlogPosting",
+        "@id": "https://www.automicvault.xyz/blog/mac-security-best-practices-for-agents/#article",
+        "headline": "Best Practices for Using a Mac with Agents",
+        "description": "A practical macOS security baseline for AI agents: keep Gatekeeper and SIP enabled, protect Downloads, and deny broad privacy permissions.",
+        "image": "https://www.automicvault.xyz/assets/blog/mac-security-best-practices-for-agents-og.webp",
+        "datePublished": "2026-07-16",
+        "dateModified": "2026-07-16",
+        "author": {"@id": "https://www.automicvault.xyz/#organization"},
+        "publisher": {"@id": "https://www.automicvault.xyz/#organization"},
+        "mainEntityOfPage": {"@id": "https://www.automicvault.xyz/blog/mac-security-best-practices-for-agents/#webpage"},
+        "about": ["macOS security", "AI agent security", "Gatekeeper", "System Integrity Protection"]
+      },
+      {
+        "@type": "WebPage",
+        "@id": "https://www.automicvault.xyz/blog/mac-security-best-practices-for-agents/#webpage",
+        "url": "https://www.automicvault.xyz/blog/mac-security-best-practices-for-agents/",
+        "name": "Best Practices for Using a Mac with Agents",
+        "isPartOf": {"@id": "https://www.automicvault.xyz/blog/#blog"},
+        "breadcrumb": {"@id": "https://www.automicvault.xyz/blog/mac-security-best-practices-for-agents/#breadcrumb"}
+      },
+      {
+        "@type": "BreadcrumbList",
+        "@id": "https://www.automicvault.xyz/blog/mac-security-best-practices-for-agents/#breadcrumb",
+        "itemListElement": [
+          {"@type": "ListItem", "position": 1, "name": "Automic Vault", "item": "https://www.automicvault.xyz/"},
+          {"@type": "ListItem", "position": 2, "name": "Blog", "item": "https://www.automicvault.xyz/blog/"},
+          {"@type": "ListItem", "position": 3, "name": "Best Practices for Using a Mac with Agents", "item": "https://www.automicvault.xyz/blog/mac-security-best-practices-for-agents/"}
+        ]
+      }
+    ]
+  }
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&amp;family=Geist+Mono:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+  <link rel="icon" href="../../favicon.ico@v=5" sizes="16x16 32x32 48x48">
+  <link rel="icon" href="../../favicon-dark.svg@v=5" type="image/svg+xml" media="(prefers-color-scheme: dark)">
+  <link rel="icon" href="../../favicon.svg@v=5" type="image/svg+xml" media="(prefers-color-scheme: light)">
+  <link rel="mask-icon" href="../../safari-pinned-tab.svg@v=5" color="#ffffff" media="(prefers-color-scheme: dark)">
+  <link rel="mask-icon" href="../../safari-pinned-tab.svg@v=5" color="#111111" media="(prefers-color-scheme: light)">
+  <link rel="apple-touch-icon" href="../../apple-touch-icon.png@v=3">
+  <link rel="stylesheet" href="../../styles.css@v=128.css">
+</head>
+<body>
+  <div class="scroll-meter" aria-hidden="true"><span></span></div>
+  <div class="site-shell" id="top">
+    <header class="masthead">
+      <a class="brand" href="../../index.html" aria-label="Automic Vault home">
+        <img class="brand-mark" src="../../assets/icon@2x.webp@v=3" alt="Automic Vault" width="54" height="54">
+        <span class="brand-type">Automic Vault</span>
+      </a>
+      <button class="nav-toggle" type="button" aria-expanded="false" aria-label="Toggle navigation"><span></span><span></span></button>
+      <nav class="nav" aria-label="Main navigation">
+        <a href="../../index.html">Home</a><a href="https://pkg.so/">Packages</a><a href="../index.html" aria-current="page">Blog</a>
+        <a href="../../docs/index.html">Docs</a><a href="../../Automic&#32;Vault.dmg">Download</a><a href="https://github.com/automic-vault/">GitHub</a>
+      </nav>
+    </header>
+
+    <main>
+      <article>
+        <header class="article-hero incident-hero">
+          <div class="article-hero-copy">
+            <p class="eyebrow">macOS agent security</p>
+            <h1>Keep the Mac boundary intact.</h1>
+            <p class="lede">An agent can read files, launch tools, and install software at machine speed. The safest setup is not a Mac with its protections removed. It is a normal Mac whose existing boundaries are treated as hard limits.</p>
+          </div>
+          <figure class="article-hero-image">
+            <img src="../../assets/blog/mac-security-best-practices-for-agents-og.webp" alt="A command-line data path passing from a protected Mac through a controlled vault gate" width="1774" height="887" decoding="async" fetchpriority="high">
+          </figure>
+        </header>
+
+        <section class="incident-body" aria-label="macOS agent security best practices">
+          <p class="story-kicker">Published July 16, 2026</p>
+          <p class="incident-answer">Give an agent the narrow access needed for its work, but do not dismantle the controls that limit what compromised software can do. Keep Gatekeeper and System Integrity Protection enabled, keep agents away from Downloads, and deny Full Disk Access and App Management.</p>
+
+          <section class="incident-section" aria-labelledby="defaults-title">
+            <div class="section-label"><h2 id="defaults-title">Keep the Defaults Working</h2><span>Gatekeeper and SIP</span></div>
+            <p><strong class="article-highlight">Leave Gatekeeper enabled.</strong> For downloaded apps, Gatekeeper checks developer identity, notarization, and whether signed code has been altered. Do not make “Open Anyway” routine, remove quarantine attributes to silence warnings, or globally relax the policy for agent convenience.</p>
+            <p>Leave System Integrity Protection enabled too. SIP restricts changes to critical parts of macOS even when a process has administrator privileges. An agent that genuinely requires SIP to be disabled should run on an isolated machine you are prepared to erase, not on the Mac that holds your identity, work, and credentials.</p>
+          </section>
+
+          <section class="incident-section" aria-labelledby="user-title">
+            <div class="section-label"><h2 id="user-title">Install as Your User</h2><span>no blanket elevation</span></div>
+            <p>Most developer apps and tools can be installed in locations writable by your account. That is compatible with a secure agent workflow when the installation path is controlled and downloaded apps still pass Gatekeeper.</p>
+            <p>Avoid giving the agent a reusable administrator credential or teaching it to approve every elevation prompt. Elevation should be an exceptional, visible act tied to a specific change.</p>
+          </section>
+
+          <section class="incident-section" aria-labelledby="maintainer-builds-title">
+            <div class="section-label"><h2 id="maintainer-builds-title">Treat Local App Builds as Untrusted</h2><span>maintainer risk</span></div>
+            <p>Maintainers of large open-source projects face an additional targeted risk. If you build a <code>.app</code> from source and copy it into Applications yourself, that build may never pass through the downloaded-software path where Gatekeeper checks Developer ID, notarization, and integrity. Xcode’s “Sign to Run Locally” signature is ad hoc and tied to that particular build; it does not establish a stable, independently vouched-for distribution identity.</p>
+            <p><strong class="article-highlight">Malware that can write to your build output or locally installed app may be able to replace its code and apply a new ad-hoc signature before you launch it.</strong> A valid signature then shows only that the current bundle has not changed since that new signature was applied—not that Apple notarized it or that it is the build you intended.</p>
+            <p>This makes project knowledge valuable to an attacker. Someone who knows which apps you maintain, where you build them, or which development copy you run can target that exact path instead of attacking a public release. The larger and more trusted the project, the more valuable the maintainer’s local signing keys, release credentials, and repository access may be.</p>
+            <p>For routine use, install the project’s Developer ID-signed and notarized release through a controlled download or package-management path, even when you are its maintainer. Keep development builds separate and ephemeral, protect their output directories from unrelated apps and agents, and verify the expected signing identity before treating a build as trusted. Notarization strengthens the installation boundary; it is not permanent protection for an app that remains writable afterward.</p>
+          </section>
+
+          <section class="incident-section" aria-labelledby="downloads-title">
+            <div class="section-label"><h2 id="downloads-title">Protect the Downloads Boundary</h2><span>stage, verify, install</span></div>
+            <p>In <strong>System Settings → Privacy &amp; Security → Files &amp; Folders</strong>, turn off Downloads access for agent harnesses and other apps that do not need it. A downloaded app is most exposed between arrival and first launch. <strong class="article-highlight">Software that can write to Downloads may be able to replace or modify that payload before you inspect it.</strong></p>
+            <p>This matters because Gatekeeper’s first-launch behavior depends in part on download provenance. Malware with write access could tamper with a download, apply an ad-hoc signature, and remove its quarantine metadata. Keeping untrusted automation out of Downloads preserves a clean handoff between the browser and Gatekeeper.</p>
+            <p>If an agent needs to install GUI software, prefer <code>brew install --cask</code> through a Homebrew toolchain hardened with Automic Vault. That gives installations a constrained, inspectable route without granting the agent general write access to every browser download.</p>
+          </section>
+
+          <section class="incident-section" aria-labelledby="privacy-title">
+            <div class="section-label"><h2 id="privacy-title">Deny Broad Privacy Grants</h2><span>least authority</span></div>
+            <p><strong class="article-highlight">Do not give an agent harness Full Disk Access.</strong> It collapses many of the privacy boundaries around mail, messages, browser data, backups, and other sensitive files. If a task needs a document, grant access to that document or working directory instead.</p>
+            <p><strong class="article-highlight">Do not enable the App Management permission</strong> described by macOS as allowing an app to update or delete other apps. An agent that can rewrite applications can turn a trusted future launch into code execution. Install and update software through a narrow package-management path instead.</p>
+            <p>Review Automation, Accessibility, Developer Tools, and Files &amp; Folders at the same time. Remove grants that are not required for the agent’s current work. Permissions accumulate; a quarterly review is useful, but checking after each new integration is better.</p>
+          </section>
+
+          <section class="incident-section" aria-labelledby="baseline-title">
+            <div class="section-label"><h2 id="baseline-title">The Baseline</h2><span>operating rules</span></div>
+            <div class="incident-controls">
+              <article class="incident-control"><span>01 / platform</span><h3>Keep protections on</h3><p>Gatekeeper, SIP, secure boot, and normal macOS updates remain enabled.</p></article>
+              <article class="incident-control"><span>02 / downloads</span><h3>Deny write access</h3><p>Agent apps do not receive Downloads access. Installation follows a controlled path.</p></article>
+              <article class="incident-control"><span>03 / privacy</span><h3>Reject broad grants</h3><p>No Full Disk Access and no App Management permission for agent harnesses.</p></article>
+            </div>
+            <p>Agents are useful precisely because they can act. The goal is not to make them powerless; it is to make each action occur inside boundaries that remain meaningful after a prompt injection, a compromised dependency, or a simple mistake.</p>
+          </section>
+
+          <section class="incident-section" aria-labelledby="protect-command-line-title">
+            <div class="section-label"><h2 id="protect-command-line-title">Use Automic Vault to protect your command line</h2><span>the missing boundary</span></div>
+            <p>macOS privacy controls were designed around applications. You grant Downloads, Documents, Full Disk Access, Automation, or Accessibility permission to Terminal, an editor, or an agent harness. Commands launched inside that application then run as your Unix user and can use much of the authority of their host. <strong class="article-highlight">macOS does not give every command-line executable its own granular Files &amp; Folders panel</strong>, nor does it ask whether this particular invocation of <code>gh</code>, <code>aws</code>, <code>kubectl</code>, or a package script should be allowed to perform a sensitive action.</p>
+            <p>Code signing and Gatekeeper answer whether downloaded code has an expected identity and remains intact. SIP protects critical operating-system locations. Neither is a per-command execution policy. Once an allowed host launches a tool, the operating system does not normally distinguish a command you typed from one assembled by an agent, a poisoned build script, or a compromised dependency.</p>
+            <p>Automic Vault adds that missing command-line boundary. It resolves the signed identity and path of the executable, follows the process chain back to the signed app that launched it, and evaluates the requested command, working directory, and credential together. A rule can allow a familiar tool when you launch it directly from Terminal while requiring approval—or denying it—when the same binary is launched by an agent harness or from an unexpected project.</p>
+            <p>Credentials stay out of plaintext dotfiles and out of the agent’s ambient environment. At the moment of use, Automic Vault can present the Verified Launcher, Target, arguments, directory, and Secret Names for Approval, then retain that context in Authorization History. The agent can still do useful work, but sensitive execution and Secret Application no longer follow from running as you.</p>
+            <p>Automic Vault does not replace Gatekeeper, SIP, or macOS privacy controls. It completes them at the layer they do not address: the command line.</p>
+            <div class="hero-actions">
+              <a class="button primary" href="../../index.html">Learn More About Automic Vault</a>
+            </div>
+          </section>
+
+          <section class="incident-sources" aria-labelledby="sources-title">
+            <h2 id="sources-title">Sources</h2>
+            <ul>
+              <li><a href="https://support.apple.com/guide/security/gatekeeper-and-runtime-protection-sec5599b66df/web">Apple: Gatekeeper and runtime protection in macOS</a></li>
+              <li><a href="https://support.apple.com/guide/security/system-integrity-protection-secb7ea06b49/web">Apple: System Integrity Protection</a></li>
+              <li><a href="https://support.apple.com/guide/mac-help/control-access-to-files-and-folders-on-mac-mchld5a35146/mac">Apple: Control access to files and folders on Mac</a></li>
+              <li><a href="https://support.apple.com/en-nz/guide/mac-help/mchl211c911f/mac">Apple: Change Privacy &amp; Security settings on Mac</a></li>
+              <li><a href="https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements/">Apple: Inside Code Signing requirements</a></li>
+              <li><a href="https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution">Apple: Notarizing macOS software before distribution</a></li>
+            </ul>
+          </section>
+        </section>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <p>&copy; 2026 Automic Vault.</p>
+      <div class="footer-links"><a href="../../about/index.html">About</a><a href="https://github.com/automicvault/automicvault/security">Security</a><a href="../index.html">Blog</a><a href="../../privacy/index.html">Privacy</a><a href="../../terms/index.html">Terms</a><a href="https://github.com/automic-vault/">GitHub</a></div>
+    </footer>
+  </div>
+  <script src="../../app.js@v=26"></script>
+</body>
+</html>

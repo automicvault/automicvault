@@ -1,0 +1,64 @@
+# GitHub CLI hardener
+
+Run `av harden gh` to apply this hardener and `av doctor gh` to verify it.
+
+## How Automic Vault Hardens `gh`
+
+The official macOS `gh` executable is Developer ID signed. Upstream still
+delegates Keychain reads to `/usr/bin/security` and provides `gh auth token`,
+which prints the credential to standard output. Code signing establishes the
+executable's identity and integrity; it does not authorize credential use.
+
+We provide a [patched version] of `gh`. `av harden gh` installs it from our
+[tap] when Homebrew is available, or installs the same signed release directly
+at `/usr/local/bin/gh`. The Isotope:
+
+1. Is Automic Vault-signed so the gate can bind the Gate Client and Target.
+2. Keeps the credential in Automic Vault custody instead of an upstream
+   `gh:<host>` Keychain item accessible through `/usr/bin/security`.
+3. Routes authenticated operations through the `gh` Secret Gate.
+
+[patched version]: https://github.com/automic-vault/gh-cli
+[tap]: https://github.com/automic-vault/homebrew-isotopes
+
+## Credential Migration
+
+Use `av harden gh` to install the Isotope and migrate existing `gh` credentials
+into Automic Vault. Direct installs are updated by running the same command when
+`av doctor gh` reports a new release.
+
+## Secret Gate
+
+The menu bar app creates a `gh` Secret Gate as soon as the hardened CLI is
+installed. Configure its default and per-Launcher Access Levels there. Read
+Only automically authorizes known read-only commands and `gh api` GET requests.
+Local Write also authorizes `repo clone`, `pr checkout`, `gist clone`, and
+download commands, which can change local files but do not mutate GitHub.
+Write Access authorizes recognized remote writes, but Secret Disclosure through
+`gh auth token` or `gh auth status --show-token` still requires Approval. The gate
+also classifies the entire `gh auth git-credential` command family as Secret
+Disclosure, including `get`, `store`, `erase`, and future protocol operations.
+Full Access includes recognized Secret Disclosure.
+In-process aliases, unrecognized commands, and argument forms the gate cannot
+classify require Approval at every Access Level because they may disclose the
+token. Ordinary recognized read and write commands retain their Access Levels.
+
+## Details
+
+- The migration covers standard `hosts.yml` token entries and legacy macOS
+  Keychain items named `gh:<host>`.
+- Existing Git configuration can still delegate GitHub credentials to `gh auth
+  git-credential`; the hardened `gh` helper path requests the token through
+  Automic Vault.
+- `av harden gh-cli` remains accepted as a compatibility alias.
+
+## Using GitHub while the Mac is locked
+
+iPhone Approval cannot unlock a Secret configured as When Unlocked. For a remote
+agent, enable **Available While Locked** on the relevant GitHub Secrets while
+the Mac is unlocked. The Secret Gate still authorizes each operation.
+
+If `gh auth status` reports an invalid token only while locked, or login fails
+with Keychain error `-25308`, follow the
+[locked-Mac setup and troubleshooting guide](https://github.com/automicvault/automicvault/blob/main/docs/authorization.md#remote-work-from-a-locked-mac).
+Login and credential changes can still require an unlocked Mac.

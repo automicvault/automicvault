@@ -1,0 +1,428 @@
+use super::credential_xpc::*;
+use std::ffi::{CString, OsString};
+use std::fs::File;
+use std::io::{Seek, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
+use std::process::Command;
+
+const HOMEBREW_AWS: &str = "/opt/homebrew/bin/aws";
+const OFFICIAL_AWS: &str = "/opt/av/aws/current/aws";
+const AWS_STUB_PATH: &str = "/usr/local/bin/aws";
+const HOMEBREW_STUB: &str = "#!/usr/local/bin/av aws\n";
+const OFFICIAL_STUB: &str = "#!/usr/local/bin/av aws-official\n";
+const AWS_ACCESS_KEY_ID: &str = "AWS_ACCESS_KEY_ID";
+const AWS_SECRET_ACCESS_KEY: &str = "AWS_SECRET_ACCESS_KEY";
+const AWS_HELPER_PROTOCOL_VERSION: u32 = 2;
+const SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AwsGeneration {
+    Homebrew,
+    Official,
+}
+
+impl AwsGeneration {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Homebrew => "homebrew-v1",
+            Self::Official => "official-v2",
+        }
+    }
+
+    fn stub(self) -> &'static str {
+        match self {
+            Self::Homebrew => HOMEBREW_STUB,
+            Self::Official => OFFICIAL_STUB,
+        }
+    }
+}
+
+pub(crate) fn run(args: Vec<OsString>, stderr: &mut dyn Write) -> i32 {
+    run_generation(AwsGeneration::Homebrew, args, stderr)
+}
+
+pub(crate) fn run_official(args: Vec<OsString>, stderr: &mut dyn Write) -> i32 {
+    run_generation(AwsGeneration::Official, args, stderr)
+}
+
+fn run_generation(
+    generation: AwsGeneration,
+    mut args: Vec<OsString>,
+    stderr: &mut dyn Write,
+) -> i32 {
+    if !args.first().is_some_and(|arg| is_stub_arg(arg, generation)) {
+        let _ = writeln!(
+            stderr,
+            "aws: refusing {} launcher without its installed generation-bound stub",
+            generation.name()
+        );
+        return 1;
+    }
+    args.remove(0);
+    if unsafe { libc::geteuid() } == 0 {
+        let _ = writeln!(
+            stderr,
+            "aws: Automic Vault's AWS launcher must not run as root"
+        );
+        return 1;
+    }
+    match launch(generation, args) {
+        Ok(never) => never,
+        Err(error) => {
+            let _ = writeln!(stderr, "aws: {error}");
+            1
+        }
+    }
+}
+
+fn is_stub_arg(arg: &OsString, generation: AwsGeneration) -> bool {
+    let path = PathBuf::from(arg);
+    path == aws_stub_path()
+        && std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file())
+        && std::fs::read_to_string(path).is_ok_and(|contents| contents == generation.stub())
+}
+
+pub(crate) fn credentials(
+    generation: Option<&str>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    match xpc_request("aws-credentials", |message| unsafe {
+        if let Some(generation) = generation {
+            xpc_set_string(message, "aws_generation", generation)?;
+        }
+        Ok(())
+    }) {
+        Ok(value) => {
+            let _ = writeln!(stdout, "{value}");
+            0
+        }
+        Err(error) => {
+            let _ = writeln!(stderr, "aws credential helper: {error}");
+            1
+        }
+    }
+}
+
+pub(crate) fn ensure_helper_ready() -> Result<(), String> {
+    let version = xpc_request("aws-helper-version", |message| unsafe {
+        xpc_set_u64(message, "requested_version", AWS_HELPER_PROTOCOL_VERSION.into());
+        Ok(())
+    }).map_err(|error| {
+        format!(
+            "the running Automic Vault app does not support native AWS credentials; update and reopen the app before rehardening AWS ({error})"
+        )
+    })?;
+    validate_helper_version(&version)
+}
+
+fn validate_helper_version(version: &str) -> Result<(), String> {
+    if version == AWS_HELPER_PROTOCOL_VERSION.to_string() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the running Automic Vault app reported unsupported AWS helper version {version}"
+        ))
+    }
+}
+
+fn launch(generation: AwsGeneration, args: Vec<OsString>) -> Result<i32, String> {
+    let target = real_aws_path(generation);
+    if !target.is_file() {
+        return Err(format!("AWS CLI is not installed at {}", target.display()));
+    }
+    if generation == AwsGeneration::Official
+        && crate::test_env_var("AUTOMIC_VAULT_TEST_OFFICIAL_AWS_PATH").is_none()
+    {
+        crate::isotopes::hardeners::aws_release::current_release_valid()?;
+    }
+    let metadata = aws_invocation_is_metadata(&args);
+    let (profile, config_file) = if metadata {
+        ("default".into(), None)
+    } else {
+        let profile = selected_profile(&args)?;
+        let config_path = std::env::var_os("AWS_CONFIG_FILE")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".aws/config"))
+            })
+            .ok_or_else(|| "HOME and AWS_CONFIG_FILE are not set".to_string())?;
+        let config = match std::fs::read(&config_path) {
+            Ok(config) => config,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(format!("failed to read {}: {error}", config_path.display()));
+            }
+        };
+        let cwd = crate::path_security::current_working_directory_utf8()?;
+        let words = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let generated_config = xpc_request("inject", |message| unsafe {
+            xpc_set_string(message, "target", &target.to_string_lossy())?;
+            xpc_set_string(message, "cwd", &cwd)?;
+            xpc_set_string(message, "tool", "aws")?;
+            xpc_set_string(message, "aws_profile", &profile)?;
+            xpc_set_string(message, "aws_generation", generation.name())?;
+            xpc_set_data(message, "aws_config", &config);
+            xpc_set_bool(message, "replace_existing_env", false);
+            xpc_set_bool(message, "allow_missing_keys", false);
+            xpc_set_array(
+                message,
+                "keys",
+                &[AWS_ACCESS_KEY_ID.into(), AWS_SECRET_ACCESS_KEY.into()],
+            )?;
+            xpc_set_array(message, "args", &words)?;
+            xpc_set_array(message, "env_conflicts", &[])?;
+            Ok(())
+        })?;
+        (profile, Some(inherited_file(generated_config.as_bytes())?))
+    };
+    let config_path = config_file
+        .as_ref()
+        .map(|file| format!("/dev/fd/{}", file.as_raw_fd()))
+        .unwrap_or_else(|| "/dev/null".into());
+    let mut command = Command::new(&target);
+    command.args(&args).env_clear();
+    for (key, value) in std::env::vars_os() {
+        if safe_environment_key(&key) {
+            command.env(key, value);
+        }
+    }
+    command
+        .env("HOME", "/var/empty")
+        .env("AWS_PROFILE", &profile)
+        .env("AWS_CONFIG_FILE", config_path)
+        .env("AWS_SHARED_CREDENTIALS_FILE", "/dev/null")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .env("AWS_PAGER", "")
+        .env("PAGER", "cat")
+        .env("AWS_CLI_AUTO_PROMPT", "off");
+    if metadata {
+        command.env("PATH", SYSTEM_PATH);
+    }
+    let error = command.exec();
+    drop(config_file);
+    Err(format!("failed to execute {}: {error}", target.display()))
+}
+
+fn aws_invocation_is_metadata(args: &[OsString]) -> bool {
+    let Some(words) = args
+        .iter()
+        .map(|arg| arg.to_str())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    if words == ["--version"] || words == ["help"] {
+        return true;
+    }
+    match words.as_slice() {
+        [service, "help"] => aws_command_word(service),
+        [service, operation, "help"] => aws_command_word(service) && aws_command_word(operation),
+        _ => false,
+    }
+}
+
+fn aws_command_word(word: &str) -> bool {
+    word.bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn selected_profile(args: &[OsString]) -> Result<String, String> {
+    let mut profile = std::env::var("AWS_PROFILE")
+        .or_else(|_| std::env::var("AWS_DEFAULT_PROFILE"))
+        .unwrap_or_else(|_| "default".into());
+    let mut index = 0;
+    while index < args.len() {
+        let value = args[index]
+            .to_str()
+            .ok_or_else(|| "AWS arguments must be valid UTF-8".to_string())?;
+        if value == "--profile" {
+            index += 1;
+            profile = args
+                .get(index)
+                .and_then(|arg| arg.to_str())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "--profile requires a value".to_string())?
+                .into();
+        } else if let Some(value) = value.strip_prefix("--profile=") {
+            if value.is_empty() {
+                return Err("--profile requires a value".into());
+            }
+            profile = value.into();
+        }
+        index += 1;
+    }
+    if profile.contains(['\n', '\r', ']']) {
+        return Err("invalid AWS profile name".into());
+    }
+    Ok(profile)
+}
+
+fn safe_environment_key(key: &std::ffi::OsStr) -> bool {
+    let key = key.to_string_lossy();
+    key == "TERM"
+        || key == "COLORTERM"
+        || key == "TMPDIR"
+        || key == "HTTP_PROXY"
+        || key == "HTTPS_PROXY"
+        || key == "NO_PROXY"
+        || key == "http_proxy"
+        || key == "https_proxy"
+        || key == "no_proxy"
+        || key == "SSL_CERT_FILE"
+        || key == "SSL_CERT_DIR"
+        || key.starts_with("LC_")
+        || key == "LANG"
+}
+
+fn real_aws_path(generation: AwsGeneration) -> PathBuf {
+    match generation {
+        AwsGeneration::Homebrew => crate::test_env_var("AUTOMIC_VAULT_TEST_REAL_AWS_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(HOMEBREW_AWS)),
+        AwsGeneration::Official => crate::test_env_var("AUTOMIC_VAULT_TEST_OFFICIAL_AWS_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(OFFICIAL_AWS)),
+    }
+}
+
+fn aws_stub_path() -> PathBuf {
+    crate::test_env_var("AUTOMIC_VAULT_TEST_AWS_STUB_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(AWS_STUB_PATH))
+}
+
+fn inherited_file(contents: &[u8]) -> Result<File, String> {
+    let mut template = CString::new("/tmp/automic-vault-aws-config.XXXXXX")
+        .unwrap()
+        .into_bytes_with_nul();
+    let descriptor = unsafe { libc::mkstemp(template.as_mut_ptr().cast()) };
+    if descriptor == -1 {
+        return Err(format!(
+            "failed to create AWS config: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut file = unsafe { File::from_raw_fd(descriptor) };
+    if unsafe { libc::unlink(template.as_ptr().cast()) } == -1 {
+        return Err(format!(
+            "failed to unlink AWS config: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    file.write_all(contents)
+        .and_then(|()| file.rewind())
+        .map_err(|error| format!("failed to write AWS config: {error}"))?;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) } == -1 {
+        return Err(format!(
+            "failed to preserve AWS config: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_precedence_matches_aws() {
+        let _guard = crate::global_test_env_lock().lock().unwrap();
+        unsafe { std::env::set_var("AWS_PROFILE", "env") };
+        assert_eq!(
+            selected_profile(&["s3".into(), "ls".into()]).unwrap(),
+            "env"
+        );
+        assert_eq!(
+            selected_profile(&["--profile".into(), "dev".into(), "s3".into()]).unwrap(),
+            "dev"
+        );
+        assert_eq!(
+            selected_profile(&["s3".into(), "--profile=prod".into()]).unwrap(),
+            "prod"
+        );
+        unsafe { std::env::remove_var("AWS_PROFILE") };
+    }
+
+    #[test]
+    fn native_helper_requires_the_supported_server_version() {
+        assert_eq!(validate_helper_version("2"), Ok(()));
+        assert_eq!(
+            validate_helper_version("1"),
+            Err("the running Automic Vault app reported unsupported AWS helper version 1".into())
+        );
+    }
+
+    #[test]
+    fn launcher_generation_requires_the_exact_installed_stub() {
+        let _guard = crate::global_test_env_lock().lock().unwrap();
+        let path = std::env::temp_dir().join(format!("av-aws-stub-{}", std::process::id()));
+        unsafe { std::env::set_var("AUTOMIC_VAULT_TEST_AWS_STUB_PATH", &path) };
+        std::fs::write(&path, HOMEBREW_STUB).unwrap();
+        assert!(is_stub_arg(
+            &path.clone().into_os_string(),
+            AwsGeneration::Homebrew
+        ));
+        assert!(!is_stub_arg(
+            &path.clone().into_os_string(),
+            AwsGeneration::Official
+        ));
+        std::fs::write(&path, OFFICIAL_STUB).unwrap();
+        assert!(!is_stub_arg(
+            &path.clone().into_os_string(),
+            AwsGeneration::Homebrew
+        ));
+        assert!(is_stub_arg(
+            &path.clone().into_os_string(),
+            AwsGeneration::Official
+        ));
+        unsafe { std::env::remove_var("AUTOMIC_VAULT_TEST_AWS_STUB_PATH") };
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ambient_aws_environment_is_not_forwarded() {
+        assert!(!safe_environment_key(std::ffi::OsStr::new(
+            "AWS_ACCESS_KEY_ID"
+        )));
+        assert!(!safe_environment_key(std::ffi::OsStr::new("AWS_DATA_PATH")));
+        assert!(safe_environment_key(std::ffi::OsStr::new("HTTPS_PROXY")));
+    }
+
+    #[test]
+    fn metadata_invocations_do_not_request_credentials() {
+        for args in [
+            vec!["--version"],
+            vec!["help"],
+            vec!["s3", "help"],
+            vec!["ec2", "describe-instances", "help"],
+            vec!["ec2", "run-instances", "help"],
+        ] {
+            assert!(aws_invocation_is_metadata(
+                &args.into_iter().map(OsString::from).collect::<Vec<_>>()
+            ));
+        }
+
+        for args in [
+            vec![],
+            vec!["--help"],
+            vec!["--version", "s3"],
+            vec!["--profile", "dev", "help"],
+            vec!["s3", "ls"],
+            vec!["s3", "rm", "help", "--recursive"],
+        ] {
+            let os_args = args.iter().map(OsString::from).collect::<Vec<_>>();
+            assert!(!aws_invocation_is_metadata(&os_args), "{args:?}");
+        }
+    }
+}

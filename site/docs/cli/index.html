@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-Y78QKG1T9Y"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-Y78QKG1T9Y');
+  </script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>Command reference — Automic Vault</title>
+  <meta name="description" content="Command reference for the Automic Vault 4.18.0 CLI.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="Automic Vault">
+  <meta property="og:title" content="Command reference">
+  <meta property="og:description" content="Command reference for the Automic Vault 4.18.0 CLI.">
+  <meta property="og:url" content="https://www.automicvault.xyz/docs/cli/">
+  <meta property="og:image" content="https://www.automicvault.xyz/preview.jpg">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Command reference">
+  <meta name="twitter:description" content="Command reference for the Automic Vault 4.18.0 CLI.">
+  <meta name="twitter:image" content="https://www.automicvault.xyz/preview.jpg">
+  <link rel="canonical" href="index.html">
+  <link rel="alternate" type="text/markdown" title="Markdown" href="index.md">
+  <link rel="alternate" type="text/plain" title="llms.txt" href="../../llms.txt">
+  <script type="application/ld+json">
+  {"@context":"https://schema.org","@type":"TechArticle","url":"https://www.automicvault.xyz/docs/cli/","headline":"Command reference","description":"Command reference for the Automic Vault 4.18.0 CLI.","dateModified":"2026-10-08","author":{"@id":"https://www.automicvault.xyz/#organization"},"publisher":{"@id":"https://www.automicvault.xyz/#organization"},"about":{"@type":"SoftwareApplication","name":"Automic Vault","softwareVersion": "4.18.0","operatingSystem":"macOS","codeRepository":"https://github.com/automicvault/automicvault"}}
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&amp;family=Geist+Mono:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+  <link rel="icon" href="../../favicon.ico@v=5" sizes="16x16 32x32 48x48">
+  <link rel="icon" href="../../favicon-dark.svg@v=5" type="image/svg+xml" media="(prefers-color-scheme: dark)">
+  <link rel="icon" href="../../favicon.svg@v=5" type="image/svg+xml" media="(prefers-color-scheme: light)">
+  <link rel="mask-icon" href="../../safari-pinned-tab.svg@v=5" color="#ffffff" media="(prefers-color-scheme: dark)">
+  <link rel="mask-icon" href="../../safari-pinned-tab.svg@v=5" color="#111111" media="(prefers-color-scheme: light)">
+  <link rel="apple-touch-icon" href="../../apple-touch-icon.png@v=3">
+  <link rel="stylesheet" href="../../styles.css@v=128.css">
+  <link rel="stylesheet" href="../styles.css@v=5.css">
+</head>
+<body>
+  <div class="site-shell" id="top">
+    <header class="masthead">
+      <a class="brand" href="../../index.html" aria-label="Automic Vault home"><img class="brand-mark" src="../../assets/icon@2x.webp@v=3" alt="" width="54" height="54"><span class="brand-type">Automic Vault</span></a>
+      <button class="nav-toggle" type="button" aria-expanded="false" aria-label="Toggle navigation"><span></span><span></span></button>
+      <nav class="nav" aria-label="Main navigation"><a href="../../index.html">Home</a><a href="https://pkg.so/">Packages</a><a href="../../blog/index.html">Blog</a><a href="../index.html" aria-current="page">Docs</a><a href="../../download/index.html">Download</a><a href="https://github.com/automicvault/automicvault">GitHub</a></nav>
+    </header>
+    <main>
+      <header class="docs-hero"><div class="docs-hero-inner"><p class="eyebrow">Automic Vault 4.18.0 · macOS</p><h1>Command reference</h1><p class="lede">The supported CLI surface, machine-readable catalogs, and exit behavior.</p><ul class="docs-provenance" aria-label="Page formats"><li>Source linked</li><li><a href="index.md">Markdown</a></li></ul></div></header>
+      <div class="docs-layout">
+        <nav class="docs-toc" aria-label="Documentation sections">
+          <a class="docs-toc-title" href="../index.html">Manual</a>
+          <section class="docs-nav-group">
+            <h2>Documentation</h2>
+            <ul><li><a href="../index.html">Overview</a></li><li><a href="../security/index.html">Security foundations</a></li><li><a href="../app/index.html">App guide</a></li><li><a href="../authority/index.html">Approval and authority</a></li><li><a href="index.html" aria-current="page">CLI reference</a></li><li><a href="../workflows/index.html">Workflows</a></li><li><a href="../blessed-scripts/index.html">Blessed Scripts</a></li><li><a href="../reentrant-scripts/index.html">Reentrant Blessed Scripts</a></li><li><a href="../troubleshooting/index.html">Troubleshooting</a></li><li><a href="../hardeners/index.html">Hardeners</a></li></ul>
+          </section>
+          <section class="docs-nav-group">
+            <h2>On this page</h2>
+            <ul><li class="docs-nav-depth-3"><a href="index.html#av-scan"><code>av scan</code></a></li><li class="docs-nav-depth-3"><a href="index.html#av-doctor"><code>av doctor</code></a></li><li class="docs-nav-depth-3"><a href="index.html#machine-readable-catalogs">Machine-readable catalogs</a></li><li class="docs-nav-depth-3"><a href="index.html#av-save-and-av-list"><code>av save</code> and
+<code>av list</code></a></li><li class="docs-nav-depth-3"><a href="index.html#av-history"><code>av history</code></a></li><li class="docs-nav-depth-3"><a href="index.html#av-git"><code>av git</code></a></li><li class="docs-nav-depth-3"><a href="index.html#av-inject"><code>av inject</code></a></li><li class="docs-nav-depth-3"><a href="index.html#av-proxy"><code>av proxy</code></a></li><li class="docs-nav-depth-3"><a href="index.html#av-bless"><code>av bless</code></a></li><li class="docs-nav-depth-3"><a href="index.html#av-harden-and-av-unharden-brew"><code>av harden</code> and
+<code>av unharden brew</code></a></li><li class="docs-nav-depth-3"><a href="index.html#av-gpg-sign-and-av-open"><code>av gpg-sign</code> and
+<code>av open</code></a></li><li class="docs-nav-depth-3"><a href="index.html#global-behavior-and-exit-status">Global behavior and exit
+status</a></li></ul>
+          </section>
+        </nav>
+        <article class="docs-content"><h2 id="command-reference">Command reference</h2>
+<pre class="text"><code>av scan [--show-all|--json]
+av doctor [&lt;tool&gt;] [--json]
+av detectors --json
+av hardeners --json
+av bless [--endorse-launcher] &lt;path&gt;
+av inject +KEY... [--] &lt;command&gt;
+av inject -- &lt;command&gt;
+av inject --mode=fd +KEY:FD... -- &lt;command&gt;
+av proxy +KEY... [--] &lt;command&gt;
+av list
+av history [--json] [--since &lt;duration&gt;]
+av git &lt;clone|fetch|pull|push&gt; &lt;URL&gt; [DIRECTORY]
+av save [--multiline | --stdin] [--project-directory=DIR] KEY
+av harden &lt;tool&gt; [-y|--yes]
+av unharden brew [-y|--yes]
+av gpg-sign [GPG options]
+av open [--secret-gate &lt;id&gt;]
+av help
+av --version</code></pre>
+<p>Old v1 commands <code>install</code>, <code>contain</code>,
+<code>dotenv</code>, <code>credential-helper</code>, <code>gate</code>,
+and <code>trace</code> are not part of the current CLI.</p>
+<h3 id="av-scan"><code>av scan</code></h3>
+<pre class="sh"><code>av scan
+av scan --show-all
+av scan --json
+av scan --json --detector aws-cli-credentials-file</code></pre>
+<p>The human report omits medium and low severity unless
+<code>--show-all</code> is set. JSON contains <code>findings</code> and
+<code>gui_path</code>. A completed scan exits <code>0</code> even with
+Findings; consume the report, not status, as the audit result. Repeat
+<code>--detector NAME</code> with JSON to limit automation.</p>
+<h3 id="av-doctor"><code>av doctor</code></h3>
+<pre class="sh"><code>av doctor
+av doctor gh
+av doctor gh --json
+av doctor codex</code></pre>
+<p>Without a selector it checks applicable hardeners. A selector can be
+a hardener, one of its commands, or a supported signed agent CLI. JSON
+contains <code>results</code>. Exit <code>0</code> means healthy,
+<code>1</code> means attention needed, and <code>2</code> means invalid
+or unknown selection.</p>
+<h3 id="machine-readable-catalogs">Machine-readable catalogs</h3>
+<pre class="sh"><code>av detectors --json |
+  jq &#39;.detectors[] | {name, docs_url, documentation}&#39;
+
+av hardeners --json |
+  jq &#39;.hardeners[] | {
+    name, applicable, hardened, commands, stub_path, target_path, secret_gate
+  }&#39;</code></pre>
+<p>These are authoritative for the installed build. The
+<code>documentation</code> field contains the source-checked behavior
+and security model. Generated environment wrappers warn that the Target
+can read injected credentials; dedicated/native routes may provide
+narrower boundaries.</p>
+<p>See the <a href="../hardeners/index.html">hardener reference</a> for the
+rendered documentation.</p>
+<h3 id="av-save-and-av-list"><code>av save</code> and
+<code>av list</code></h3>
+<pre class="text"><code>av save [--multiline | --stdin] [--project-directory DIR] KEY
+av save [--multiline | --stdin] [--project-directory=DIR] KEY
+av list
+av ls</code></pre>
+<p><code>list</code> shows names, never Values, and accepts no
+arguments. <code>save</code> defaults to a hidden single line; select
+<code>--multiline</code> for hidden multiline entry or
+<code>--stdin</code> for exact redirected input. Both modes require
+import Approval:</p>
+<pre class="sh"><code>av save --multiline DEPLOY_PRIVATE_KEY
+av save --stdin --project-directory=. API_TOKEN &lt;&amp;3</code></pre>
+<p>The second example assumes a trusted producer has supplied readable
+FD 3. Input is nonempty UTF-8 without NUL bytes, at most 1 MiB. See <a
+href="../authority/index.html#saving-safely">saving safely</a> for EOF and
+replacement behavior.</p>
+<h3 id="av-history"><code>av history</code></h3>
+<p>The menu bar app must be running; use <code>av open</code> before
+reading history.</p>
+<pre class="sh"><code>av history
+av history --since 7d --json</code></pre>
+<p>The default table shows the newest 50 Authorization Records.
+<code>--since</code> accepts a positive whole number followed by
+<code>s</code>, <code>m</code>, <code>h</code>, <code>d</code>, or
+<code>w</code>, up to 30 days; <code>--json</code> emits
+machine-readable records with display-safe commands. The Mac filters the
+window before disclosure. A reply over 1 MiB fails instead of dropping
+records, so request a narrower window. The successful read appears in
+its own result.</p>
+<p>Each invocation requires Approval unless the exact Verified Launcher
+has Authorization History Access in Settings. This grant is independent
+of <code>av list</code>'s Secret Name Access. An unverifiable Launcher
+needs Approval. History contains request metadata and Secret Names,
+never Secret Values; it is not a tamper-proof audit trail.</p>
+<h3 id="av-git"><code>av git</code></h3>
+<pre class="sh"><code>av git clone https://github.com/OWNER/REPO.git DIRECTORY
+av git fetch https://github.com/OWNER/REPO.git
+av git pull https://github.com/OWNER/REPO.git
+av git push https://github.com/OWNER/REPO.git</code></pre>
+<p>This constrained transport accepts exact GitHub HTTPS URLs ending in
+<code>.git</code> and operates on <code>main</code>. Only
+<code>clone</code> takes a destination argument; extra options and
+refspecs are rejected. It requires the protected Git runtime and
+hardened GitHub credential route. Its credential-bearing network phase
+uses protected configuration and the existing <code>gh</code> Secret
+Gate, separately from local repository work. Registration alone grants
+no credential authority.</p>
+<p>The architecture marks this transport as under validation. It is not
+a general replacement for Git. See the <a
+href="https://github.com/automicvault/automicvault/blob/main/docs/adr/0047-protected-git-https-transport.md">Git
+transport design</a> and <a
+href="https://github.com/automicvault/automicvault/blob/main/docs/git-workflow-testing.md">workflow
+validation</a> for the separate native remote-helper path and its
+supported surface.</p>
+<h3 id="av-inject"><code>av inject</code></h3>
+<pre class="text"><code>av inject [--replace-existing-env] [--allow-missing-keys] \
+  +KEY [+KEY...] [--] COMMAND [args...]
+av inject -- COMMAND [args...]
+av inject --mode=fd +KEY:FD [+KEY:FD...] -- COMMAND [args...]</code></pre>
+<p>Bare commands resolve through PATH; a Target containing
+<code>/</code> must be absolute. In the default environment mode
+(<code>--mode=env</code>), existing environment values win with a
+warning unless <code>--replace-existing-env</code> is used. Missing
+requested Secrets fail unless <code>--allow-missing-keys</code> leaves
+them unset. Duplicate/invalid names and root are rejected. On success,
+<code>exec</code> replaces <code>av</code> with the Target. Legacy
+<code>--allow-existing-env</code>, <code>--force</code>,
+<code>--import</code>, and <code>--migrate</code> are rejected.</p>
+<h4 id="file-descriptor-delivery">File descriptor delivery</h4>
+<p>Available since 4.6.0:</p>
+<pre class="sh"><code>av inject --mode=fd +FOO:3 +BAR:4 -- /path/to/consumer</code></pre>
+<p>The consumer must read the indicated descriptors. Each Secret arrives
+through its own read-only anonymous pipe as exact stored UTF-8 bytes,
+then EOF. There is no bundle format, trimming, or added newline.
+Consumed bytes are not replayed. Automic Vault removes the requested
+Secret Names from the Target's environment, including existing values,
+and preserves stdin/stdout/stderr and unrelated environment entries.</p>
+<p>Every invocation requires fresh human Approval. Direct Access Rules,
+Blessings, Tool-specific policies, and Temporary Access Grants do not
+authorize FD delivery. Approval shows the mappings and selected Value
+sources; Authorization History records them before release. Update the
+app and CLI together: older apps reject this operation.</p>
+<p>Descriptors must be distinct, unused decimal integers of 3 or higher,
+without leading zeros. Every Secret requires a mapping. Duplicate names,
+missing Secrets, <code>--allow-missing-keys</code>,
+<code>--replace-existing-env</code>, and FD shebangs are rejected. If a
+Value exceeds available pipe capacity, the command fails before starting
+the Target; this ceiling can be smaller than the 1 MiB save limit.</p>
+<p>The Target can copy the bytes or pass descriptors to its children. FD
+delivery does not provide encrypted backup/recovery or restore
+whitespace lost during an earlier import. See the <a
+href="https://github.com/automicvault/automicvault/blob/main/docs/direct-secret-access.md#apply-secrets-through-file-descriptors">repository
+guide</a>.</p>
+<h4 id="shebang-and-blessing-workflow">Shebang and Blessing
+workflow</h4>
+<pre class="sh"><code>#!/usr/local/bin/av inject +GH_TOKEN /bin/sh
+# --- automic-vault
+# capabilities:
+#   gh: write
+# ---
+set -eu
+gh release create &quot;$1&quot;</code></pre>
+<p>A blessable script is a regular UTF-8 file up to 1 MiB with absolute
+<code>av</code> and interpreter paths. The optional manifest immediately
+follows the shebang. Capabilities are ceilings, not grants. Execution
+normally uses a verified <code>/dev/fd/N</code> snapshot; a separately
+reviewed canonical-path exception is described in the <a
+href="../blessed-scripts/index.html">Blessed Scripts guide</a>.
+<code>AV_SCRIPT_PATH</code> and <code>AV_SCRIPT_DIR</code> identify the
+canonical source.</p>
+<p>FD mode in an <code>av inject</code> shebang is currently
+unsupported. A Blessed Script can invoke
+<code>av inject --mode=fd</code> as a command, but each invocation still
+needs fresh human Approval.</p>
+<h3 id="av-proxy"><code>av proxy</code></h3>
+<pre class="text"><code>av proxy [--replace-existing-env] +KEY [+KEY...] [--] COMMAND [args...]</code></pre>
+<p>Every session needs Approval. The Target receives random session
+Secret References and a Proxy Credential, not raw Values. Automic Vault
+replaces common uppercase/lowercase proxy variables, empties
+<code>NO_PROXY</code>, and sets standard CA variables. Conflicts fail
+unless <code>--replace-existing-env</code> is used.</p>
+<p>Destination rules are memory-only and scoped per session and origin.
+A Target can bypass configured proxies; bearer credentials remain bearer
+credentials at the destination. Proxying is narrower delivery, not
+containment. Root is denied.</p>
+<h3 id="av-bless"><code>av bless</code></h3>
+<pre class="sh"><code>av bless ./release.sh
+av bless --endorse-launcher ./release.sh</code></pre>
+<p>Approval binds the complete reviewed script. An endorsement allows
+only that Verified Launcher to use the Blessing's automic authority.
+Without an endorsement, the Blessing itself grants that Launcher no
+automic authority; any applicable inherited authority still follows the
+script's declaration. <code>--endorse-caller</code> is a compatibility
+alias. The UI inspects, narrows, replaces, and revokes Blessings.</p>
+<h3 id="av-harden-and-av-unharden-brew"><code>av harden</code> and
+<code>av unharden brew</code></h3>
+<pre class="sh"><code>av harden gh
+av harden aws --yes
+av unharden brew --yes</code></pre>
+<p>A hardener may move a credential, install or replace a launcher,
+protect ownership, install a signed Tool, or enable a native route. Read
+its embedded documentation; some operations require <code>sudo</code>,
+but do not run all hardeners as root. <code>-y</code>/<code>--yes</code>
+skips supported confirmations. Aliases include <code>homebrew</code>,
+<code>gh-cli</code>, <code>stripe-cli</code>, <code>supabase-cli</code>,
+and <code>fly</code>. <code>unharden</code> is Homebrew-only.</p>
+<h3 id="av-gpg-sign-and-av-open"><code>av gpg-sign</code> and
+<code>av open</code></h3>
+<p><code>av gpg-sign</code> is Git plumbing, not an interactive
+interface. It accepts forwarded GnuPG options, reads at most 16 MiB,
+binds to payload SHA-256, and returns a detached signature and GnuPG
+status. Configure it in Settings.</p>
+<pre class="sh"><code>av open
+av open --secret-gate gh</code></pre>
+<p>Gate IDs use only ASCII letters, digits, hyphens, underscores, and
+periods.</p>
+<h3 id="global-behavior-and-exit-status">Global behavior and exit
+status</h3>
+<pre class="sh"><code>av help
+av --version
+av inject --help
+av proxy --help</code></pre>
+<p>Not every subcommand has dedicated <code>--help</code>. Color is
+disabled by <code>NO_COLOR</code> or <code>TERM=dumb</code>. Exit
+<code>0</code> is completion/approved execution; <code>1</code>
+operational failure, denial, or unhealthy Doctor; <code>2</code>
+top-level usage or invalid Doctor selection.</p>
+<p class="docs-source-link"><a href="index.md">Read this page as Markdown</a></p></article>
+      </div>
+    </main>
+    <footer class="docs-footer"><p class="docs-footer-line">Authorize the operation, not just the identity.</p><div class="docs-footer-meta"><div class="docs-footer-links"><a href="index.html#top">Back to top</a><a href="../index.html">Docs</a><a href="index.md">Markdown</a><a href="../../download/index.html">Download</a><a href="https://github.com/automicvault/automicvault">Source</a></div><span>Automic Vault 4.18.0 manual</span></div></footer>
+  </div>
+  <script src="../../app.js@v=26"></script>
+</body>
+</html>

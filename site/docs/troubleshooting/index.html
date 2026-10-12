@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-Y78QKG1T9Y"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-Y78QKG1T9Y');
+  </script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>Troubleshooting — Automic Vault</title>
+  <meta name="description" content="Troubleshooting and source references for Automic Vault.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="Automic Vault">
+  <meta property="og:title" content="Troubleshooting">
+  <meta property="og:description" content="Troubleshooting and source references for Automic Vault.">
+  <meta property="og:url" content="https://www.automicvault.xyz/docs/troubleshooting/">
+  <meta property="og:image" content="https://www.automicvault.xyz/preview.jpg">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Troubleshooting">
+  <meta name="twitter:description" content="Troubleshooting and source references for Automic Vault.">
+  <meta name="twitter:image" content="https://www.automicvault.xyz/preview.jpg">
+  <link rel="canonical" href="index.html">
+  <link rel="alternate" type="text/markdown" title="Markdown" href="index.md">
+  <link rel="alternate" type="text/plain" title="llms.txt" href="../../llms.txt">
+  <script type="application/ld+json">
+  {"@context":"https://schema.org","@type":"TechArticle","url":"https://www.automicvault.xyz/docs/troubleshooting/","headline":"Troubleshooting","description":"Troubleshooting and source references for Automic Vault.","dateModified":"2026-10-08","author":{"@id":"https://www.automicvault.xyz/#organization"},"publisher":{"@id":"https://www.automicvault.xyz/#organization"},"about":{"@type":"SoftwareApplication","name":"Automic Vault","softwareVersion": "4.18.0","operatingSystem":"macOS","codeRepository":"https://github.com/automicvault/automicvault"}}
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&amp;family=Geist+Mono:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+  <link rel="icon" href="../../favicon.ico@v=5" sizes="16x16 32x32 48x48">
+  <link rel="icon" href="../../favicon-dark.svg@v=5" type="image/svg+xml" media="(prefers-color-scheme: dark)">
+  <link rel="icon" href="../../favicon.svg@v=5" type="image/svg+xml" media="(prefers-color-scheme: light)">
+  <link rel="mask-icon" href="../../safari-pinned-tab.svg@v=5" color="#ffffff" media="(prefers-color-scheme: dark)">
+  <link rel="mask-icon" href="../../safari-pinned-tab.svg@v=5" color="#111111" media="(prefers-color-scheme: light)">
+  <link rel="apple-touch-icon" href="../../apple-touch-icon.png@v=3">
+  <link rel="stylesheet" href="../../styles.css@v=128.css">
+  <link rel="stylesheet" href="../styles.css@v=5.css">
+</head>
+<body>
+  <div class="site-shell" id="top">
+    <header class="masthead">
+      <a class="brand" href="../../index.html" aria-label="Automic Vault home"><img class="brand-mark" src="../../assets/icon@2x.webp@v=3" alt="" width="54" height="54"><span class="brand-type">Automic Vault</span></a>
+      <button class="nav-toggle" type="button" aria-expanded="false" aria-label="Toggle navigation"><span></span><span></span></button>
+      <nav class="nav" aria-label="Main navigation"><a href="../../index.html">Home</a><a href="https://pkg.so/">Packages</a><a href="../../blog/index.html">Blog</a><a href="../index.html" aria-current="page">Docs</a><a href="../../download/index.html">Download</a><a href="https://github.com/automicvault/automicvault">GitHub</a></nav>
+    </header>
+    <main>
+      <header class="docs-hero"><div class="docs-hero-inner"><p class="eyebrow">Automic Vault 4.18.0 · macOS</p><h1>Troubleshooting</h1><p class="lede">Diagnose Approval, executable, Value selection, launcher, proxy, and Doctor failures.</p><ul class="docs-provenance" aria-label="Page formats"><li>Source linked</li><li><a href="index.md">Markdown</a></li></ul></div></header>
+      <div class="docs-layout">
+        <nav class="docs-toc" aria-label="Documentation sections">
+          <a class="docs-toc-title" href="../index.html">Manual</a>
+          <section class="docs-nav-group">
+            <h2>Documentation</h2>
+            <ul><li><a href="../index.html">Overview</a></li><li><a href="../security/index.html">Security foundations</a></li><li><a href="../app/index.html">App guide</a></li><li><a href="../authority/index.html">Approval and authority</a></li><li><a href="../cli/index.html">CLI reference</a></li><li><a href="../workflows/index.html">Workflows</a></li><li><a href="../blessed-scripts/index.html">Blessed Scripts</a></li><li><a href="../reentrant-scripts/index.html">Reentrant Blessed Scripts</a></li><li><a href="index.html" aria-current="page">Troubleshooting</a></li><li><a href="../hardeners/index.html">Hardeners</a></li></ul>
+          </section>
+          <section class="docs-nav-group">
+            <h2>On this page</h2>
+            <ul><li class="docs-nav-depth-3"><a href="index.html#approval-does-not-appear">Approval does not appear</a></li><li class="docs-nav-depth-3"><a href="index.html#github-works-unlocked-but-fails-while-the-mac-is-locked">GitHub
+works unlocked but fails while the Mac is locked</a></li><li class="docs-nav-depth-3"><a href="index.html#the-wrong-executable-runs">The wrong executable runs</a></li><li class="docs-nav-depth-3"><a href="index.html#the-wrong-project-value-is-selected">The wrong Project Value is
+selected</a></li><li class="docs-nav-depth-3"><a href="index.html#an-environment-value-wins">An environment value wins</a></li><li class="docs-nav-depth-3"><a href="index.html#fd-delivery-fails-before-the-consumer-starts">FD delivery fails
+before the consumer starts</a></li><li class="docs-nav-depth-3"><a href="index.html#a-blessing-stopped-matching">A Blessing stopped matching</a></li><li class="docs-nav-depth-3"><a href="index.html#a-launcher-bundle-is-denied-after-update">A Launcher Bundle is
+denied after update</a></li><li class="docs-nav-depth-3"><a href="index.html#proxy-traffic-does-not-appear">Proxy traffic does not
+appear</a></li><li class="docs-nav-depth-3"><a href="index.html#doctor-reports-healthy-but-the-workflow-fails">Doctor reports
+healthy but the workflow fails</a></li><li class="docs-nav-depth-3"><a href="index.html#collecting-a-safe-diagnostic">Collecting a safe diagnostic</a></li><li class="docs-nav-depth-2"><a href="index.html#source-of-truth">Source of truth</a></li></ul>
+          </section>
+        </nav>
+        <article class="docs-content"><h2 id="troubleshooting">Troubleshooting</h2>
+<h3 id="approval-does-not-appear">Approval does not appear</h3>
+<p>Run <code>av open</code> and confirm the installed app version
+matches <code>av --version</code>. If the Mac is locked, first check <a
+href="../authority/index.html#availability">Secret Availability</a>. A Secret
+configured as When Unlocked can stop the request before Automic Vault
+sends a phone notification. Inspect Authorization History for a policy
+denial that occurred before human Approval was eligible. If iPhone
+Approval is enabled, check phone eligibility, relay and iCloud Keychain
+state, device lock, and biometric availability; do not expect a local
+allow button to appear as fallback.</p>
+<h3 id="github-works-unlocked-but-fails-while-the-mac-is-locked">GitHub
+works unlocked but fails while the Mac is locked</h3>
+<p>If <code>gh auth status</code> reports an "invalid token" only while
+locked, retry while the Mac is unlocked before logging in again. Some
+app versions report an unavailable Secret as a missing token. Keychain
+error <code>-25308</code> can also indicate that Secret inventory access
+is unavailable; it does not establish that GitHub revoked the token.</p>
+<p>For remote use, follow the <a
+href="../authority/index.html#availability">Available While Locked setup</a>.
+iPhone Approval cannot override a Secret's availability setting. No
+phone notification may arrive because the request fails before
+Approval.</p>
+<p>Unlock the Mac for login or credential changes that fail with
+<code>-25308</code>. Saves require a complete Secret inventory, which
+may remain unavailable while locked even when the particular Secret
+allows use while locked. Enabling Available While Locked supports
+authorized Secret use; it does not guarantee that login or credential
+changes can complete remotely while locked.</p>
+<h3 id="the-wrong-executable-runs">The wrong executable runs</h3>
+<p>Compare <code>command -v TOOL</code>, the Target in the Approval
+request, and <code>av doctor TOOL</code>. Shell hashes, aliases, shims,
+package-manager links, and GUI PATH can all differ. Authorize the native
+executable or protected launcher described by the hardener; a mutable
+shell is too broad a Target.</p>
+<h3 id="the-wrong-project-value-is-selected">The wrong Project Value is
+selected</h3>
+<p>Compare the physical canonical working directory with every Project
+Directory. The selected directory must be an ancestor on the same
+filesystem; the nearest match wins. Symlink spelling, repository remote,
+branch, and logical <code>$PWD</code> do not establish selection.
+History records the source chosen for the request.</p>
+<h3 id="an-environment-value-wins">An environment value wins</h3>
+<p>Environment-mode <code>av inject</code> preserves an existing
+environment value by default and warns. Remove the export at its source,
+or use <code>--replace-existing-env</code> only after confirming that
+Automic Vault should override it. Do not suppress the warning without
+understanding which credential the Target would otherwise receive.</p>
+<p>FD mode instead removes the requested names from the environment,
+including existing values, and delivers the stored Values on the
+specified descriptors.</p>
+<h3 id="fd-delivery-fails-before-the-consumer-starts">FD delivery fails
+before the consumer starts</h3>
+<p>Check that each mapping names a distinct, unused descriptor of 3 or
+higher. <code>av</code> refuses to overwrite inherited descriptors. Pick
+unused numbers that the consumer supports. A Value that exceeds
+available pipe capacity also fails before Target execution, even if it
+fits the separate 1 MiB save limit.</p>
+<p>FD delivery requires fresh human Approval. A Direct Access Rule or
+Blessing does not bypass that prompt, and an FD-mode shebang is
+unsupported.</p>
+<h3 id="a-blessing-stopped-matching">A Blessing stopped matching</h3>
+<p>Path, file type, size, interpreter, declaration, and content all
+participate in the reviewed state. Compare the app's baseline with the
+current file. Re-bless only an intentional change; an unexplained
+mismatch is evidence to investigate.</p>
+<h3 id="a-launcher-bundle-is-denied-after-update">A Launcher Bundle is
+denied after update</h3>
+<p>Digest, signature, enrollment, entitlements, runtime, and protected
+ownership fail closed. Prepare and review a new generation. Do not
+replace the enrolled payload in place or add a broad compatibility
+exception merely to make the new binary run.</p>
+<h3 id="proxy-traffic-does-not-appear">Proxy traffic does not
+appear</h3>
+<p>The Target may ignore proxy variables, use a protocol the proxy does
+not handle, inherit conflicting network configuration, or open another
+channel. Confirm the session is live and the process shown in Active
+Proxies is the process making the request. Treat bypass as outside proxy
+containment, not as a UI refresh bug.</p>
+<h3 id="doctor-reports-healthy-but-the-workflow-fails">Doctor reports
+healthy but the workflow fails</h3>
+<p>Doctor validates known installation invariants. The request can still
+be denied by Gate policy, launcher identity, runtime, Value selection,
+or Tool semantics, and the external service can reject the resulting
+credential. Read History and the Tool's own error separately.</p>
+<h3 id="collecting-a-safe-diagnostic">Collecting a safe diagnostic</h3>
+<p>Record <code>av --version</code>, the relevant
+<code>av doctor TOOL --json</code> result, the detector or hardener
+name, and a redacted History entry. Never paste Values, private keys,
+proxy credentials, Secret References, session tokens, or live
+authorization artifacts into an issue.</p>
+<p>For a suspected vulnerability, follow <a
+href="../../.well-known/security.txt">security.txt</a>
+instead of the public issue tracker.</p>
+<h2 id="source-of-truth">Source of truth</h2>
+<p>The policy, SSH, and Launcher sections were checked against the
+4.18.0 release, canonical Domain Language, and Architecture on October
+8, 2026. Descendant Launcher rule overrides and per-key SSH policies are
+available in 4.18.0. Hardener pages are generated from that release's
+hardener references. The linked v1 copy script was tested with
+disposable legacy Keychain fixtures and the actual save implementation
+using isolated test storage; it is not a full v1 upgrade test. UI
+screenshots come from 3.16.0. For your installed build, prefer
+<code>av --version</code>, <code>av help</code>,
+<code>av detectors --json</code>, and
+<code>av hardeners --json</code>.</p>
+<ul>
+<li><a
+href="https://github.com/automicvault/automicvault/releases/tag/4.18.0">4.18.0
+release</a></li>
+<li><a
+href="https://github.com/automicvault/automicvault/blob/4.18.0/src/cli/mod.rs">CLI
+source</a></li>
+<li><a
+href="https://github.com/automicvault/automicvault/tree/4.18.0/src">App
+and CLI source</a></li>
+<li><a
+href="https://github.com/automicvault/automicvault/tree/4.18.0/src/isotopes/detectors">Detectors</a></li>
+<li><a
+href="https://github.com/automicvault/automicvault/tree/4.18.0/src/isotopes">Hardeners</a></li>
+<li><a
+href="https://github.com/automicvault/automicvault/blob/main/docs/domain-language.md">Domain
+Language</a></li>
+<li><a
+href="https://github.com/automicvault/automicvault/blob/main/docs/architecture.md">Architecture</a></li>
+</ul>
+<p>Report discrepancies in the <a
+href="https://github.com/automicvault/automicvault/issues">issue
+tracker</a>.</p>
+<p class="docs-source-link"><a href="index.md">Read this page as Markdown</a></p></article>
+      </div>
+    </main>
+    <footer class="docs-footer"><p class="docs-footer-line">Authorize the operation, not just the identity.</p><div class="docs-footer-meta"><div class="docs-footer-links"><a href="index.html#top">Back to top</a><a href="../index.html">Docs</a><a href="index.md">Markdown</a><a href="../../download/index.html">Download</a><a href="https://github.com/automicvault/automicvault">Source</a></div><span>Automic Vault 4.18.0 manual</span></div></footer>
+  </div>
+  <script src="../../app.js@v=26"></script>
+</body>
+</html>

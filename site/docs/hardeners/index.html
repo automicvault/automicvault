@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-Y78QKG1T9Y"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-Y78QKG1T9Y');
+  </script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>Hardener reference — Automic Vault</title>
+  <meta name="description" content="Static reference pages rendered from the Automic Vault 4.18.0 hardener Markdown sources.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="Automic Vault">
+  <meta property="og:title" content="Hardener reference">
+  <meta property="og:description" content="Static reference pages rendered from the Automic Vault 4.18.0 hardener Markdown sources.">
+  <meta property="og:url" content="https://www.automicvault.xyz/docs/hardeners/">
+  <meta property="og:image" content="https://www.automicvault.xyz/preview.jpg">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Hardener reference">
+  <meta name="twitter:description" content="Static reference pages rendered from the Automic Vault 4.18.0 hardener Markdown sources.">
+  <meta name="twitter:image" content="https://www.automicvault.xyz/preview.jpg">
+  <link rel="canonical" href="index.html">
+  <link rel="alternate" type="text/markdown" title="Markdown" href="index.md">
+  <link rel="alternate" type="text/plain" title="llms.txt" href="../../llms.txt">
+  <script type="application/ld+json">
+  {"@context":"https://schema.org","@type":"TechArticle","url":"https://www.automicvault.xyz/docs/hardeners/","headline":"Hardener reference","description":"Static reference pages rendered from the Automic Vault 4.18.0 hardener Markdown sources.","dateModified":"2026-10-08","author":{"@id":"https://www.automicvault.xyz/#organization"},"publisher":{"@id":"https://www.automicvault.xyz/#organization"},"about":{"@type":"SoftwareApplication","name":"Automic Vault","softwareVersion": "4.18.0","operatingSystem":"macOS","codeRepository":"https://github.com/automicvault/automicvault"}}
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&amp;family=Geist+Mono:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+  <link rel="icon" href="../../favicon.ico@v=5" sizes="16x16 32x32 48x48">
+  <link rel="icon" href="../../favicon-dark.svg@v=5" type="image/svg+xml" media="(prefers-color-scheme: dark)">
+  <link rel="icon" href="../../favicon.svg@v=5" type="image/svg+xml" media="(prefers-color-scheme: light)">
+  <link rel="mask-icon" href="../../safari-pinned-tab.svg@v=5" color="#ffffff" media="(prefers-color-scheme: dark)">
+  <link rel="mask-icon" href="../../safari-pinned-tab.svg@v=5" color="#111111" media="(prefers-color-scheme: light)">
+  <link rel="apple-touch-icon" href="../../apple-touch-icon.png@v=3">
+  <link rel="stylesheet" href="../../styles.css@v=128.css">
+  <link rel="stylesheet" href="../styles.css@v=5.css">
+</head>
+<body>
+  <div class="site-shell" id="top">
+    <header class="masthead">
+      <a class="brand" href="../../index.html" aria-label="Automic Vault home"><img class="brand-mark" src="../../assets/icon@2x.webp@v=3" alt="" width="54" height="54"><span class="brand-type">Automic Vault</span></a>
+      <button class="nav-toggle" type="button" aria-expanded="false" aria-label="Toggle navigation"><span></span><span></span></button>
+      <nav class="nav" aria-label="Main navigation"><a href="../../index.html">Home</a><a href="https://pkg.so/">Packages</a><a href="../../blog/index.html">Blog</a><a href="../index.html" aria-current="page">Docs</a><a href="../../download/index.html">Download</a><a href="https://github.com/automicvault/automicvault">GitHub</a></nav>
+    </header>
+    <main>
+      <header class="docs-hero"><div class="docs-hero-inner"><p class="eyebrow">Automic Vault 4.18.0 · macOS</p><h1>Hardener reference</h1><p class="lede">Hardener documentation rendered from the Automic Vault 4.18.0 source checkout.</p><ul class="docs-provenance" aria-label="Page formats"><li>Source linked</li><li><a href="index.md">Markdown</a></li></ul></div></header>
+      <div class="docs-layout">
+        <nav class="docs-toc" aria-label="Documentation sections">
+          <a class="docs-toc-title" href="../index.html">Manual</a>
+          <section class="docs-nav-group">
+            <h2>Documentation</h2>
+            <ul><li><a href="../index.html">Overview</a></li><li><a href="../security/index.html">Security foundations</a></li><li><a href="../app/index.html">App guide</a></li><li><a href="../authority/index.html">Approval and authority</a></li><li><a href="../cli/index.html">CLI reference</a></li><li><a href="../workflows/index.html">Workflows</a></li><li><a href="../blessed-scripts/index.html">Blessed Scripts</a></li><li><a href="../reentrant-scripts/index.html">Reentrant Blessed Scripts</a></li><li><a href="../troubleshooting/index.html">Troubleshooting</a></li><li><a href="index.html" aria-current="page">Hardeners</a></li></ul>
+          </section>
+          <section class="docs-nav-group">
+            <h2>On this page</h2>
+            <ul><li class="docs-nav-depth-2"><a href="index.html#hardeners">Hardeners</a></li></ul>
+          </section>
+        </nav>
+        <article class="docs-content"><h1 id="hardener-reference">Hardener reference</h1>
+<p>Hardeners replace supported insecure credential paths with
+Tool-specific routes that Automic Vault can identify, authorize, and
+verify. Check the installed state before changing it:</p>
+<pre class="sh"><code>av hardeners --json
+av harden TOOL
+av doctor TOOL</code></pre>
+<h2 id="hardeners">Hardeners</h2>
+<ul>
+<li><a href="aliyun-cli/index.html">Aliyun Cli</a> —
+<code>av harden aliyun-cli</code></li>
+<li><a href="aws/index.html">AWS</a> — <code>av harden aws</code></li>
+<li><a href="codex/index.html">Codex</a> — <code>av harden codex</code></li>
+<li><a href="docker/index.html">Docker</a> — <code>av harden docker</code></li>
+<li><a href="doctl/index.html">doctl</a> — <code>av harden doctl</code></li>
+<li><a href="fastly-cli/index.html">Fastly Cli</a> —
+<code>av harden fastly-cli</code></li>
+<li><a href="gh/index.html">GitHub CLI</a> — <code>av harden gh</code></li>
+<li><a href="goat/index.html">goat</a> — <code>av harden goat</code></li>
+<li><a href="hcloud/index.html">Hetzner Cloud</a> —
+<code>av harden hcloud</code></li>
+<li><a href="brew/index.html">Homebrew</a> — <code>av harden brew</code></li>
+<li><a href="kubectl/index.html">Kubectl</a> —
+<code>av harden kubectl</code></li>
+<li><a href="openhue-cli/index.html">Openhue Cli</a> —
+<code>av harden openhue-cli</code></li>
+<li><a href="opentofu/index.html">OpenTofu</a> —
+<code>av harden opentofu</code></li>
+<li><a href="ordercli/index.html">ordercli</a> —
+<code>av harden ordercli</code></li>
+<li><a href="oxide-cli/index.html">Oxide CLI</a> —
+<code>av harden oxide-cli</code></li>
+<li><a href="plumber/index.html">Plumber</a> —
+<code>av harden plumber</code></li>
+<li><a href="podman/index.html">Podman</a> — <code>av harden podman</code></li>
+<li><a href="railway/index.html">Railway</a> —
+<code>av harden railway</code></li>
+<li><a href="rclone/index.html">Rclone</a> — <code>av harden rclone</code></li>
+<li><a href="sqlcmd/index.html">Sqlcmd</a> — <code>av harden sqlcmd</code></li>
+<li><a href="stripe/index.html">Stripe CLI</a> —
+<code>av harden stripe</code></li>
+<li><a href="sudo/index.html">sudo</a> — <code>av harden sudo</code></li>
+<li><a href="supabase/index.html">Supabase</a> —
+<code>av harden supabase</code></li>
+<li><a href="terraform/index.html">Terraform</a> —
+<code>av harden terraform</code></li>
+<li><a href="uaa-cli/index.html">Uaa Cli</a> —
+<code>av harden uaa-cli</code></li>
+<li><a href="uv/index.html">uv</a> — <code>av harden uv</code></li>
+<li><a href="wakatime-cli/index.html">Wakatime Cli</a> —
+<code>av harden wakatime-cli</code></li>
+<li><a href="wrangler/index.html">Wrangler</a> —
+<code>av harden wrangler</code></li>
+</ul>
+<p class="docs-source-link"><a href="index.md">Read this page as Markdown</a></p></article>
+      </div>
+    </main>
+    <footer class="docs-footer"><p class="docs-footer-line">Authorize the operation, not just the identity.</p><div class="docs-footer-meta"><div class="docs-footer-links"><a href="index.html#top">Back to top</a><a href="../index.html">Docs</a><a href="index.md">Markdown</a><a href="../../download/index.html">Download</a><a href="https://github.com/automicvault/automicvault">Source</a></div><span>Automic Vault 4.18.0 manual</span></div></footer>
+  </div>
+  <script src="../../app.js@v=26"></script>
+</body>
+</html>

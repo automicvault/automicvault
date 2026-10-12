@@ -1,0 +1,325 @@
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::process::{Command, Output};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[test]
+fn av_scan_reports_clean_home() {
+    let home = temp_home("clean");
+    let output = av_scan(&home);
+
+    assert!(output.status.success());
+    let stdout = stdout(&output);
+    assert!(stdout.starts_with("╭─ system exposure audit\n│\n"));
+    assert!(!stdout.contains("GUI PATH"));
+    assert!(stdout.contains("◇ No problems found\n"));
+    assert!(stdout.ends_with("╰─ vault sealed\n"));
+    assert_eq!(stderr(&output), "");
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn av_scan_reports_findings() {
+    let home = temp_home("triggered");
+    fs::write(
+        home.join(".git-credentials"),
+        "https://user:token@example.com\n",
+    )
+    .unwrap();
+
+    let output = av_scan(&home);
+    let stdout = stdout(&output);
+
+    assert!(output.status.success());
+    assert!(stdout.contains("│  solution\n"));
+    assert!(stdout.contains("│  Remove credentials from the reported files"));
+    assert!(!stdout.contains("│  homepage\n"));
+    assert!(stdout.contains("│  full details & caveats\n"));
+    assert!(!stdout.contains("│  read more\n"));
+    assert!(stdout.contains(".git-credentials"));
+    assert!(stdout.contains("│  affected files\n"));
+    assert!(stdout.contains("╰─ scan complete\n"));
+    for line in stdout.lines().filter(|line| !line.is_empty()) {
+        assert!(
+            line.starts_with('╭')
+                || line.starts_with('◆')
+                || line.starts_with('◇')
+                || line.starts_with('└')
+                || line.starts_with('├')
+                || line.starts_with('╰')
+                || line.starts_with('│'),
+            "{line}"
+        );
+        if !line.starts_with("│  https://") {
+            assert!(line.chars().count() <= 78, "{line}");
+        }
+    }
+    assert_eq!(stderr(&output), "");
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn av_scan_json_reports_findings() {
+    let home = temp_home("json");
+    fs::write(
+        home.join(".git-credentials"),
+        "https://user:token@example.com\n",
+    )
+    .unwrap();
+
+    let output = av_scan_json(&home);
+    let stdout = stdout(&output);
+
+    assert!(output.status.success());
+    assert!(stdout.starts_with(r#"{"findings":[{"#));
+    assert!(!stdout.contains(r#""gui_path""#));
+    assert!(stdout.contains(r#""source":"git-credentials-file""#));
+    assert!(stdout.contains(".git-credentials"));
+    assert_eq!(stderr(&output), "");
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn av_scan_json_can_run_one_detector() {
+    let home = temp_home("targeted-json");
+    fs::write(
+        home.join(".git-credentials"),
+        "https://user:token@example.com\n",
+    )
+    .unwrap();
+    fs::write(home.join(".npmrc"), "min-release-age=0\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_av"))
+        .args(["scan", "--json", "--detector", "git-credentials-file"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    let stdout = stdout(&output);
+
+    assert!(output.status.success());
+    assert!(stdout.contains(r#""source":"git-credentials-file""#));
+    assert!(stdout.contains(r#""detectors":["git-credentials-file"]"#));
+    assert!(!stdout.contains(r#""source":"npm""#));
+    assert_eq!(stderr(&output), "");
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn av_scan_json_runs_gemini_cli_and_antigravity_cockpit_detectors() {
+    let home = temp_home("gemini-cli-targeted");
+    let gemini_dir = home.join(".gemini");
+    let cockpit_dir = home.join(".antigravity_cockpit");
+    fs::create_dir_all(&gemini_dir).unwrap();
+    fs::create_dir_all(&cockpit_dir).unwrap();
+    fs::write(
+        gemini_dir.join("oauth_creds.json"),
+        r#"{"access_token":"ya29.sample","refresh_token":"1//sample"}"#,
+    )
+    .unwrap();
+    fs::write(
+        cockpit_dir.join("credentials.json"),
+        r#"{"accounts":{"u":{"accessToken":"ya29.sample","refreshToken":"1//sample"}}}"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_av"))
+        .args(["scan", "--json", "--detector", "gemini-cli"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    let gemini_stdout = stdout(&output);
+
+    assert!(output.status.success());
+    assert!(gemini_stdout.contains(r#""source":"gemini-cli""#));
+    assert!(gemini_stdout.contains(".gemini/oauth_creds.json"));
+    assert!(!gemini_stdout.contains(".antigravity_cockpit/credentials.json"));
+
+    let cockpit_output = Command::new(env!("CARGO_BIN_EXE_av"))
+        .args(["scan", "--json", "--detector", "antigravity-cockpit"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    let cockpit_stdout = stdout(&cockpit_output);
+
+    assert!(cockpit_output.status.success());
+    assert!(cockpit_stdout.contains(r#""source":"antigravity-cockpit""#));
+    assert!(cockpit_stdout.contains(".antigravity_cockpit/credentials.json"));
+    assert!(!cockpit_stdout.contains(".gemini/oauth_creds.json"));
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+#[cfg(unix)]
+fn av_scan_json_reports_unsearchable_credential_parent_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = temp_home("unsearchable-parent-scan");
+    let gemini_dir = home.join(".gemini");
+    let cockpit_dir = home.join(".antigravity_cockpit");
+    fs::create_dir_all(&gemini_dir).unwrap();
+    fs::create_dir_all(&cockpit_dir).unwrap();
+    fs::write(
+        gemini_dir.join("oauth_creds.json"),
+        r#"{"access_token":"ya29.sample"}"#,
+    )
+    .unwrap();
+    fs::write(
+        cockpit_dir.join("credentials.json"),
+        r#"{"accessToken":"sample"}"#,
+    )
+    .unwrap();
+
+    let gemini_perms = fs::metadata(&gemini_dir).unwrap().permissions();
+    let cockpit_perms = fs::metadata(&cockpit_dir).unwrap().permissions();
+    fs::set_permissions(&gemini_dir, fs::Permissions::from_mode(0o000)).unwrap();
+    fs::set_permissions(&cockpit_dir, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let gemini_output = Command::new(env!("CARGO_BIN_EXE_av"))
+        .args(["scan", "--json", "--detector", "gemini-cli"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+
+    let cockpit_output = Command::new(env!("CARGO_BIN_EXE_av"))
+        .args(["scan", "--json", "--detector", "antigravity-cockpit"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+
+    let _ = fs::set_permissions(&gemini_dir, gemini_perms);
+    let _ = fs::set_permissions(&cockpit_dir, cockpit_perms);
+    let _ = fs::remove_dir_all(&home);
+
+    assert!(gemini_output.status.success());
+    let gemini_stdout = stdout(&gemini_output);
+    assert!(gemini_stdout.contains(r#""source":"gemini-cli""#));
+    assert!(gemini_stdout.contains("could not be read"));
+
+    assert!(cockpit_output.status.success());
+    let cockpit_stdout = stdout(&cockpit_output);
+    assert!(cockpit_stdout.contains(r#""source":"antigravity-cockpit""#));
+    assert!(cockpit_stdout.contains("could not be read"));
+}
+
+#[test]
+fn av_scan_git_credential_fill_does_not_invoke_configured_helpers() {
+    let home = temp_home("git-credential-fill-passive");
+    let marker = home.join("helper-invoked");
+    let helper = home.join("credential-helper");
+    fs::write(
+        &helper,
+        format!("#!/bin/sh\nprintf invoked > {}\n", marker.display()),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&helper).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&helper, permissions).unwrap();
+    fs::write(
+        home.join(".gitconfig"),
+        format!(
+            "[credential \"https://github.com\"]\nhelper =\nhelper = !{}\n",
+            helper.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_av"))
+        .args(["scan", "--json", "--detector", "git-credential-fill"])
+        .current_dir(&home)
+        .env_clear()
+        .env("HOME", &home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .output()
+        .unwrap();
+    let stdout = stdout(&output);
+    let helper_was_invoked = marker.exists();
+    let _ = fs::remove_dir_all(home);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout.contains(r#""source":"git-credential-fill""#));
+    assert!(stdout.contains("ambient credential helper"));
+    assert!(stdout.contains(r#""line":3"#));
+    assert!(
+        !helper_was_invoked,
+        "av scan invoked a configured Git credential helper"
+    );
+}
+
+#[test]
+fn av_scan_json_rejects_an_unknown_detector() {
+    let home = temp_home("unknown-detector");
+    let output = Command::new(env!("CARGO_BIN_EXE_av"))
+        .args(["scan", "--json", "--detector", "not-a-detector"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("unknown detector: not-a-detector"));
+
+    let _ = fs::remove_dir_all(home);
+}
+
+fn av_scan(home: &std::path::Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_av"))
+        .arg("scan")
+        .env_clear()
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "AUTOMIC_VAULT_TEST_BREW_TARGET",
+            home.join("missing-opt-homebrew/bin/brew"),
+        )
+        .env(
+            "AUTOMIC_VAULT_TEST_SIP_STATUS",
+            "System Integrity Protection status: enabled.",
+        )
+        .env("AUTOMIC_VAULT_DISABLE_SUDO_DETECTOR", "1")
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .output()
+        .unwrap()
+}
+
+fn av_scan_json(home: &std::path::Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_av"))
+        .args(["scan", "--json"])
+        .env_clear()
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "AUTOMIC_VAULT_TEST_BREW_TARGET",
+            home.join("missing-opt-homebrew/bin/brew"),
+        )
+        .env(
+            "AUTOMIC_VAULT_TEST_SIP_STATUS",
+            "System Integrity Protection status: enabled.",
+        )
+        .env("AUTOMIC_VAULT_DISABLE_SUDO_DETECTOR", "1")
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .output()
+        .unwrap()
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8(output.stdout.clone()).unwrap()
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8(output.stderr.clone()).unwrap()
+}
+
+fn temp_home(label: &str) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("av-cli-{label}-{}-{nanos}", std::process::id()));
+    fs::create_dir_all(&path).unwrap();
+    path
+}

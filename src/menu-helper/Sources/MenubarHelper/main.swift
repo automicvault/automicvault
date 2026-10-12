@@ -1,0 +1,20479 @@
+import AppKit
+import AppUpdater
+import ApprovalCore
+import CProcessInfo
+import CoreServices
+import CryptoKit
+import Darwin
+import Foundation
+import MenubarHelperCore
+import Security
+import SwiftUI
+@preconcurrency import XPC
+
+private let approvalServiceName = "com.automicvault.av2.approval"
+private let approvalLaunchAgentName = "com.automicvault.menubar-helper"
+private let openMainWindowArgument = "--open-main-window"
+private let pendingMainWindowKey = "pendingMainWindow"
+private let pendingSecretGateKey = "pendingSecretGate"
+private let varlockProtocolVersion: UInt64 = 1
+let secCodeSignatureAdHoc: UInt32 = 0x2
+private let scanMaximumDelay: TimeInterval = 5
+private let periodicDetectorScanInterval: TimeInterval = 5 * 60
+private let scanQueue = DispatchQueue(label: "com.automicvault.av2.scan")
+private let temporaryAccessGrantCollapseDelay: TimeInterval = 5
+private let updateCheckInterval: Duration = .seconds(24 * 60 * 60)
+private var toastWindows: [NSWindow] = []
+private var temporaryAccessGrantStripFrame: NSRect?
+
+private enum AutomaticApprovalFlashSide {
+    case left
+    case right
+
+    var next: Self { self == .left ? .right : .left }
+}
+
+@MainActor
+private func makeUpdater(
+    sessionConfiguration: URLSessionConfiguration = .default
+) -> AppUpdater {
+    AppUpdater(
+        owner: "automic-vault",
+        repo: "automic-vault",
+        configuration: .init(
+            attestationPolicy: GitHubAttestationPolicy(
+                workflow: ".github/workflows/release.yml",
+                sourceRef: "refs/heads/main"
+            )
+        ),
+        sessionConfiguration: sessionConfiguration
+    )
+}
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private static let visibleAutoApprovalCount = 5
+    private lazy var statusItem = NSStatusBar.system.statusItem(withLength: 15)
+    private lazy var scanStatusItem = NSMenuItem(title: String(localized: "Scan pending"), action: nil, keyEquivalent: "")
+    private lazy var doctorStatusItem = makeSectionMenuItem(title: "", section: .doctor)
+    private lazy var reblessingStatusItem = makeSectionMenuItem(title: "", section: .blessedScripts)
+    private lazy var checkForUpdatesItem = NSMenuItem(
+        title: String(localized: "Check for Updates…"),
+        action: #selector(checkForUpdates),
+        keyEquivalent: ""
+    )
+    private lazy var installCLIItem = NSMenuItem(
+        title: localizedUIString(CLIInstallState.missing.actionTitle!),
+        action: #selector(installCLI),
+        keyEquivalent: ""
+    )
+    private lazy var quitItem = NSMenuItem(title: String(localized: "Quit"), action: #selector(quit), keyEquivalent: "q")
+    private lazy var quitSeparator = NSMenuItem.separator()
+    private var autoApprovalItems: [NSMenuItem] = []
+    private var autoApprovalHeadingItem: NSMenuItem?
+    private var autoApprovalSeparator: NSMenuItem?
+    private var autoApprovals: [AutoApprovalRecord] = []
+    private let autoApprovalTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        formatter.dateStyle = .none
+        return formatter
+    }()
+    private var approval: ApprovalServer?
+    private let sshAgent = SSHAgentRuntime.shared
+    private var scanWorkItem: DispatchWorkItem?
+    private var scanBurstStartedAt: TimeInterval?
+    private var pendingFullScan = false
+    private var pendingScanDetectors = Set<String>()
+    private var servicesStopped = false
+    private var isScanRunning = false
+    private var failedScanDetectors = Set<String>()
+    private var fullScanFailed = false
+    private var latestDetectorFindings: [DetectorFinding] = []
+    private var detectorMetadata: [DetectorMetadata] = []
+    private var eventStream: FSEventStreamRef?
+    private var recursiveWatchDetectors: [String: Set<String>] = [:]
+    private var fileWatchSources: [DispatchSourceFileSystemObject] = []
+    private var missingFileWatchDetectors: [String: Set<String>] = [:]
+    private var missingFilePoller: DispatchSourceTimer?
+    private var periodicDetectorPoller: DispatchSourceTimer?
+    private var mainWindow: NSWindow?
+    private var isUserSessionActive = true
+    private var areScreensAwake = true
+    private let updater = makeUpdater()
+    private var automaticUpdateCheckTask: Task<Void, Never>?
+    private var readyUpdate: Update?
+    private var isCheckingForUpdates = false
+    private var lastUpdateCheck = UserDefaults.standard.object(forKey: "LastSuccessfulUpdateCheck") as? Date
+    private var isUpdating = false
+    private var isStatusMenuOpen = false
+    private var menuBeforeUpdate: NSMenu?
+    private var automaticApprovalFlashWorkItem: DispatchWorkItem?
+    private var preFlashStatusImage: NSImage?
+    private var lastAutomaticApprovalFlashSide = AutomaticApprovalFlashSide.right
+    private var isStartingUp = false
+    private let temporaryAccessGrants = TemporaryAccessGrantController()
+    private var temporaryAccessGrantSnapshots: [TemporaryAccessGrantSnapshot] = []
+    private var temporaryAccessGrantMenuItems: [NSMenuItem] = []
+    private var temporaryAccessGrantHeadingItem: NSMenuItem?
+    private var temporaryAccessGrantSeparator: NSMenuItem?
+    private var temporaryAccessGrantPanel: TemporaryAccessGrantPanel?
+    private var temporaryAccessGrantTimer: Timer?
+    private let temporaryDenialsItem = NSMenuItem(title: "Temporary denials", action: nil, keyEquivalent: "")
+    private var temporaryDenialTimer: Timer?
+    private var temporaryDenialObserver: NSObjectProtocol?
+    private var temporaryAccessGrantCollapseWorkItem: DispatchWorkItem?
+    private var isTemporaryAccessGrantStripCollapsed = false
+    private let liveSecretUses = LiveSecretUseController<LiveSecretUseProcess>()
+    private var liveSecretUseSnapshots: [LiveSecretUseSnapshot] = []
+    private var liveSecretUseMenuItems: [NSMenuItem] = []
+    private var liveSecretUseHeadingItem: NSMenuItem?
+    private var liveSecretUseSeparator: NSMenuItem?
+    private var liveSecretUseTimer: Timer?
+    private var baseStatusImage: NSImage?
+    #if !DEBUG
+    private let postHogTelemetry = PostHogTelemetry.shared
+    private var dailyHeartbeatTask: Task<Void, Never>?
+    private var lastTelemetryFindingCount: Int?
+    #endif
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        installTextEditingShortcuts()
+        installStatusMenu()
+
+        if shouldHandOffToLaunchAgent() {
+            if shouldOpenMainWindow(pending: false) {
+                UserDefaults.standard.set(true, forKey: pendingMainWindowKey)
+            }
+            if let secretGateID = requestedSecretGateID(arguments: CommandLine.arguments) {
+                UserDefaults.standard.set(secretGateID, forKey: pendingSecretGateKey)
+            }
+            handOffToLaunchAgent()
+            return
+        }
+
+        startServicesAndOpenMainWindowIfRequested()
+        startAutomaticUpdateChecks()
+        #if !DEBUG
+        startDailyHeartbeat()
+        #endif
+    }
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        let center = NSWorkspace.shared.notificationCenter
+        center.addObserver(
+            self,
+            selector: #selector(userSessionDidResignActive(_:)),
+            name: NSWorkspace.sessionDidResignActiveNotification,
+            object: nil
+        )
+        center.addObserver(
+            self,
+            selector: #selector(userSessionDidBecomeActive(_:)),
+            name: NSWorkspace.sessionDidBecomeActiveNotification,
+            object: nil
+        )
+        center.addObserver(
+            self,
+            selector: #selector(screensDidSleep(_:)),
+            name: NSWorkspace.screensDidSleepNotification,
+            object: nil
+        )
+        center.addObserver(
+            self,
+            selector: #selector(screensDidWake(_:)),
+            name: NSWorkspace.screensDidWakeNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(refreshCLIInstallState), name: cliInstallationDidFinish, object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(temporaryAccessGrantStripPresentationChanged(_:)),
+            name: temporaryAccessGrantStripPresentationDidChange,
+            object: nil
+        )
+    }
+
+    @objc private func temporaryAccessGrantStripPresentationChanged(_ notification: Notification) {
+        revealTemporaryAccessGrantStrip()
+    }
+
+    private func collapseTemporaryAccessGrantStrip() {
+        temporaryAccessGrantCollapseWorkItem?.cancel()
+        temporaryAccessGrantCollapseWorkItem = nil
+        isTemporaryAccessGrantStripCollapsed = true
+        refreshTemporaryAccessGrantPanel()
+        refreshTemporaryAccessGrantMenuItems()
+    }
+
+    @objc private func userSessionDidResignActive(_ notification: Notification) {
+        isUserSessionActive = false
+        temporaryAccessGrants.cancelAll()
+        refreshTemporaryAccessGrants()
+        abortActiveApprovalPrompt()
+    }
+
+    @objc private func userSessionDidBecomeActive(_ notification: Notification) {
+        isUserSessionActive = true
+        _ = migrateBackgroundKeychainItems()
+    }
+
+    @objc private func screensDidSleep(_ notification: Notification) {
+        areScreensAwake = false
+        temporaryAccessGrants.cancelAll()
+        refreshTemporaryAccessGrants()
+        abortActiveApprovalPrompt()
+    }
+
+    @objc private func screensDidWake(_ notification: Notification) {
+        areScreensAwake = true
+    }
+
+    private func installStatusMenu() {
+        baseStatusImage = brandImage()
+        statusItem.button?.image = baseStatusImage
+
+        let menu = NSMenu()
+        menu.addItem(scanStatusItem)
+        menu.addItem(doctorStatusItem)
+        menu.addItem(reblessingStatusItem)
+        menu.addItem(.separator())
+        checkForUpdatesItem.target = self
+        menu.addItem(checkForUpdatesItem)
+        installCLIItem.target = self
+        installCLIItem.isHidden = FileManager.default.fileExists(atPath: installedAVCLIPath)
+        menu.addItem(installCLIItem)
+        menu.addItem(.separator())
+        let openItem = NSMenuItem(title: String(localized: "Open Automic Vault"), action: #selector(openMainWindow), keyEquivalent: "")
+        setVersionBadge(appVersion(), on: openItem)
+        openItem.target = self
+        setOpenAppMenuImage(on: openItem)
+        menu.addItem(openItem)
+        temporaryDenialsItem.isHidden = true
+        menu.addItem(temporaryDenialsItem)
+        temporaryDenialObserver = NotificationCenter.default.addObserver(
+            forName: launcherDenialDidChange, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshTemporaryDenials() }
+        }
+        menu.addItem(quitSeparator)
+        menu.addItem(quitItem)
+        menu.delegate = self
+        statusItem.menu = menu
+    }
+
+    private func refreshTemporaryDenials() {
+        let now = TemporaryLauncherDenials.now
+        let active = TemporaryLauncherDenials.shared.active(now: now)
+        temporaryDenialsItem.isHidden = active.isEmpty || isStartingUp || isUpdating
+        if active.isEmpty {
+            temporaryDenialTimer?.invalidate()
+            temporaryDenialTimer = nil
+        } else if temporaryDenialTimer == nil {
+            let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.refreshTemporaryDenials() }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            temporaryDenialTimer = timer
+        }
+        if !isStatusMenuOpen {
+            let submenu = NSMenu()
+            for denial in active {
+                let item = NSMenuItem(title: "\(denial.launcherName) — \(denial.scope.gateName)", action: nil, keyEquivalent: "")
+                item.representedObject = denial.id
+                let details = NSMenu()
+                details.addItem(NSMenuItem(title: "Deny \(denial.scope.operationTitle)", action: nil, keyEquivalent: ""))
+                details.addItem(NSMenuItem(title: "", action: nil, keyEquivalent: ""))
+                let end = NSMenuItem(title: "End temporary denial", action: #selector(endTemporaryDenial(_:)), keyEquivalent: "")
+                end.target = self
+                end.representedObject = denial.id
+                details.addItem(end)
+                item.submenu = details
+                submenu.addItem(item)
+            }
+            temporaryDenialsItem.submenu = submenu
+        }
+        for item in temporaryDenialsItem.submenu?.items ?? [] {
+            let denial = active.first { $0.id == item.representedObject as? UUID }
+            let remaining = denial.map { max(0, Int(ceil($0.deadline - now))) } ?? 0
+            item.submenu?.item(at: 1)?.title = remaining > 0
+                ? "\(remaining / 60):\(String(format: "%02d", remaining % 60)) remaining" : "Ended"
+            item.isEnabled = denial != nil
+        }
+    }
+
+    @objc private func endTemporaryDenial(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID else { return }
+        TemporaryLauncherDenials.shared.cancel(id)
+    }
+
+    private func handOffToLaunchAgent() {
+        isStartingUp = true
+        statusItem.button?.image = brandImage()
+        statusItem.button?.alphaValue = 0.5
+        setStatusMenuItemTitle(String(localized: "Starting Automic Vault"), on: scanStatusItem)
+        updateMenuVisibility(
+            statusItem.menu?.items ?? [],
+            startingUp: true,
+            visibleDuringStartup: [scanStatusItem, quitSeparator, quitItem]
+        )
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Result { try handOffToLaunchAgentIfNeeded() }
+            DispatchQueue.main.async {
+                switch result {
+                case .success(true):
+                    NSApp.terminate(nil)
+                case .success(false):
+                    self.startServicesAndOpenMainWindowIfRequested()
+                case .failure(let error):
+                    UserDefaults.standard.removeObject(forKey: pendingMainWindowKey)
+                    UserDefaults.standard.removeObject(forKey: pendingSecretGateKey)
+                    NSAlert(error: error).runModal()
+                    NSApp.terminate(nil)
+                }
+            }
+        }
+    }
+
+    private func consumePendingMainWindow() -> Bool {
+        guard UserDefaults.standard.bool(forKey: pendingMainWindowKey) else { return false }
+        UserDefaults.standard.removeObject(forKey: pendingMainWindowKey)
+        return true
+    }
+
+    private func consumePendingSecretGate() -> String? {
+        guard let id = UserDefaults.standard.string(forKey: pendingSecretGateKey) else { return nil }
+        UserDefaults.standard.removeObject(forKey: pendingSecretGateKey)
+        return validSecretGateID(id) ? id : nil
+    }
+
+    private func startServicesAndOpenMainWindowIfRequested() {
+        startServices()
+        let secretGateID = consumePendingSecretGate()
+        let shouldOpen = shouldOpenMainWindow(pending: consumePendingMainWindow())
+        if secretGateID != nil || shouldOpen {
+            showMainWindow(secretGateID: secretGateID)
+        }
+    }
+
+    private func startServices() {
+        servicesStopped = false
+        if isStartingUp {
+            isStartingUp = false
+            updateMenuVisibility(
+                statusItem.menu?.items ?? [],
+                startingUp: false,
+                visibleDuringStartup: []
+            )
+            doctorStatusItem.isHidden = doctorStatusItem.title.isEmpty
+            reblessingStatusItem.isHidden = reblessingStatusItem.title.isEmpty
+            installCLIItem.isHidden = FileManager.default.fileExists(atPath: installedAVCLIPath)
+        }
+        statusItem.button?.image = brandImage()
+        statusItem.button?.alphaValue = 1
+        _ = migrateBackgroundKeychainItems()
+        _ = migrateLegacyGPGSigningSecrets()
+        _ = backfillBlessedScriptReviewedContents()
+        autoApprovals = loadAccessRequestRecords().compactMap(autoApprovalRecord)
+        refreshAutoApprovalMenuItems()
+        refreshTemporaryAccessGrants()
+        refreshLiveSecretUses()
+        refreshCLIInstallState()
+        refreshDoctorStatus()
+        do {
+            let approval = try ApprovalServer(
+                serviceName: approvalServiceName,
+                temporaryAccessGrants: temporaryAccessGrants,
+                liveSecretUses: liveSecretUses
+            ) { [weak self] event in
+                self?.recordAutoApproval(event)
+            } onAccessRequest: { [weak self] record in
+                let recorded = appendAccessRequestRecord(record)
+                if recorded {
+                    Task { @MainActor in self?.didRecordAccessRequest(record) }
+                }
+                return recorded
+            } onBlessRequest: { [weak self] request, completion in
+                guard let self else {
+                    completion(.failed("Automic Vault is unavailable"))
+                    return
+                }
+                guard !self.isUpdating else {
+                    completion(.failed("Automic Vault is updating"))
+                    return
+                }
+                self.showMainWindow(secretGateID: nil)
+                guard let controller = self.mainWindow?.contentViewController
+                    as? AutomicVaultMainWindowController
+                else {
+                    completion(.failed("Automic Vault could not open the blessing review"))
+                    return
+                }
+                controller.reviewBlessing(request, completion: completion)
+            } onOpenWindow: { [weak self] in
+                guard let self else { return }
+                let secretGateID = self.consumePendingSecretGate()
+                _ = self.consumePendingMainWindow()
+                self.showMainWindow(secretGateID: secretGateID)
+            } onTemporaryAccessGrantsChanged: { [weak self] in
+                self?.refreshTemporaryAccessGrants()
+            } onLiveSecretUsesChanged: { [weak self] in
+                self?.refreshLiveSecretUses()
+            } canRequestHumanApproval: { [weak self] in
+                PhoneApprovalCoordinator.shared.isEnabled
+                    || (self?.isUserSessionActive == true && self?.areScreensAwake == true)
+            } canRequestMacInput: { [weak self] in
+                self?.isUserSessionActive == true && self?.areScreensAwake == true
+            }
+            try approval.start()
+            self.approval = approval
+            sshAgent.startObserving()
+            scheduleScan(after: 0)
+            scanQueue.async { [weak self] in
+                let metadata = loadDetectorMetadata(avExecutableURL: avExecutableURL())
+                Task { @MainActor in
+                    self?.detectorMetadata = metadata
+                    self?.startDetectorWatchers()
+                }
+            }
+        } catch {
+            NSAlert(error: error).runModal()
+            NSApp.terminate(nil)
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        automaticUpdateCheckTask?.cancel()
+        #if !DEBUG
+        dailyHeartbeatTask?.cancel()
+        #endif
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        NotificationCenter.default.removeObserver(self)
+        stopServices()
+    }
+
+    private func stopServices() {
+        servicesStopped = true
+        sshAgent.stop()
+        temporaryAccessGrants.cancelAll()
+        refreshTemporaryAccessGrants()
+        temporaryAccessGrantTimer?.invalidate()
+        temporaryAccessGrantTimer = nil
+        temporaryDenialTimer?.invalidate()
+        if let temporaryDenialObserver { NotificationCenter.default.removeObserver(temporaryDenialObserver) }
+        temporaryAccessGrantCollapseWorkItem?.cancel()
+        temporaryAccessGrantCollapseWorkItem = nil
+        liveSecretUses.cancelAll()
+        refreshLiveSecretUses()
+        liveSecretUseTimer?.invalidate()
+        liveSecretUseTimer = nil
+        abortActiveApprovalPrompt()
+        automaticApprovalFlashWorkItem?.cancel()
+        automaticApprovalFlashWorkItem = nil
+        preFlashStatusImage = nil
+        scanWorkItem?.cancel()
+        scanWorkItem = nil
+        scanBurstStartedAt = nil
+        stopDetectorWatchers()
+        periodicDetectorPoller?.cancel()
+        periodicDetectorPoller = nil
+        approval?.stop()
+        approval = nil
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        openMainWindow()
+        return true
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard let secretGateID = urls.lazy.compactMap(secretGateID(from:)).first else { return }
+        if shouldHandOffToLaunchAgent() {
+            UserDefaults.standard.set(true, forKey: pendingMainWindowKey)
+            UserDefaults.standard.set(secretGateID, forKey: pendingSecretGateKey)
+            return
+        }
+        showMainWindow(secretGateID: secretGateID)
+    }
+
+    @MainActor @objc private func quit() {
+        NSApp.terminate(nil)
+    }
+
+    @MainActor @objc private func checkForUpdates() {
+        guard !isStartingUp else { return }
+        guard !isCheckingForUpdates else { return }
+        isCheckingForUpdates = true
+        updateCheckControls()
+
+        Task { @MainActor [weak self] in
+            await self?.performUpdateCheck()
+        }
+    }
+
+    @MainActor @objc private func installCLI() {
+        guard !isStartingUp else { return }
+        Task {
+            do {
+                if try await installBundledCLI() {
+                    (mainWindow?.contentViewController as? AutomicVaultMainWindowController)?.reload()
+                }
+            } catch {
+                NSAlert(error: error).runModal()
+            }
+        }
+    }
+
+    private func performUpdateCheck() async {
+        var stoppedServices = false
+        var updatingAlert: NSAlert?
+        var restoreMainWindow = false
+        defer {
+            if let updatingAlert {
+                finishUpdating(with: updatingAlert)
+            }
+            isCheckingForUpdates = false
+            updateCheckControls()
+        }
+
+        do {
+            let update = if let readyUpdate {
+                readyUpdate
+            } else {
+                try await checkForAvailableUpdate()
+            }
+            guard let update else {
+                readyUpdate = nil
+                let alert = NSAlert()
+                alert.messageText = String(localized: "Automic Vault is up to date")
+                alert.runModal()
+                return
+            }
+            readyUpdate = update
+
+            let alert = NSAlert()
+            alert.messageText = String(localized: "An update is ready")
+            alert.informativeText = String(localized: "Install \(update.assetName) and relaunch Automic Vault?")
+            alert.addButton(withTitle: String(localized: "Install and Relaunch"))
+            alert.addButton(withTitle: String(localized: "Later"))
+            alert.addButton(withTitle: String(localized: "View Release Notes"))
+            let response = alert.runModal()
+            if response == .alertThirdButtonReturn {
+                NSWorkspace.shared.open(URL(
+                    string: "https://github.com/automic-vault/automic-vault/releases/tag/\(update.version)"
+                )!)
+                return
+            }
+            guard response == .alertFirstButtonReturn else { return }
+
+            readyUpdate = nil
+            restoreMainWindow = beginUpdating(with: alert)
+            updatingAlert = alert
+            let prepared = try await update.prepareInstallation()
+            stopServices()
+            stoppedServices = true
+            scanQueue.sync {}
+            try await prepared.installAndRelaunch()
+        } catch {
+            if let alert = updatingAlert {
+                finishUpdating(with: alert)
+                updatingAlert = nil
+            }
+            if stoppedServices {
+                startServices()
+            }
+            if restoreMainWindow {
+                showMainWindow(secretGateID: nil)
+            }
+            showUpdateError(error)
+        }
+    }
+
+    private func beginUpdating(with alert: NSAlert) -> Bool {
+        temporaryAccessGrants.cancelAll()
+        refreshTemporaryAccessGrants()
+        abortActiveApprovalPrompt()
+        let mainWindowWasVisible = mainWindow?.isVisible == true
+        mainWindow?.orderOut(nil)
+        isUpdating = true
+        statusItem.button?.alphaValue = 0.5
+        menuBeforeUpdate = statusItem.menu
+        statusItem.menu = makeUpdatingMenu()
+
+        configureUpdatingAlert(alert)
+        alert.window.center()
+        alert.window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        return mainWindowWasVisible
+    }
+
+    private func finishUpdating(with alert: NSAlert) {
+        alert.window.orderOut(nil)
+        statusItem.menu = menuBeforeUpdate
+        menuBeforeUpdate = nil
+        statusItem.button?.alphaValue = 1
+        isUpdating = false
+    }
+
+    private func showUpdateError(_ error: Error) {
+        guard let updaterError = error as? AppUpdaterError,
+              updaterError == .attestationVerificationFailed
+        else {
+            NSAlert(error: error).runModal()
+            return
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = updateVerificationFailureText
+        alert.addButton(withTitle: String(localized: "Search GitHub Issues"))
+        alert.addButton(withTitle: String(localized: "Cancel"))
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(updateVerificationIssuesURL)
+        }
+    }
+
+    private func startAutomaticUpdateChecks() {
+        automaticUpdateCheckTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.refreshAvailableUpdate()
+                do {
+                    try await Task.sleep(for: updateCheckInterval)
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
+    #if !DEBUG
+    private func startDailyHeartbeat() {
+        dailyHeartbeatTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let delay = self?.postHogTelemetry.captureDailyHeartbeat() else { return }
+                do {
+                    try await Task.sleep(for: .seconds(delay))
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+    #endif
+
+    private func checkForAvailableUpdate() async throws -> Update? {
+        let update = try await updater.check()
+        lastUpdateCheck = Date()
+        UserDefaults.standard.set(lastUpdateCheck, forKey: "LastSuccessfulUpdateCheck")
+        return update
+    }
+
+    private func refreshAvailableUpdate() async {
+        guard !isCheckingForUpdates else { return }
+        do {
+            readyUpdate = try await checkForAvailableUpdate()
+            updateCheckControls()
+        } catch {
+            // A transient metadata failure must not hide an update already found.
+        }
+    }
+
+    private func updateCheckControls() {
+        checkForUpdatesItem.title = if isCheckingForUpdates {
+            "Checking for Updates…"
+        } else if let readyUpdate {
+            "Update to v\(readyUpdate.version)…"
+        } else {
+            "Check for Updates…"
+        }
+        checkForUpdatesItem.isEnabled = !isCheckingForUpdates
+        (mainWindow?.contentViewController as? AutomicVaultMainWindowController)?
+            .setAvailableUpdateVersion(readyUpdate?.version, checkedAt: lastUpdateCheck)
+    }
+
+    @MainActor @objc private func openMainWindow() {
+        guard !isStartingUp, !isUpdating else { return }
+        showMainWindow(secretGateID: nil)
+    }
+
+    @MainActor @objc private func openSection(_ sender: NSMenuItem) {
+        guard !isStartingUp, !isUpdating,
+              let rawValue = sender.representedObject as? String,
+              let section = DashboardSection(rawValue: rawValue) else { return }
+        showMainWindow(secretGateID: nil)
+        let controller = mainWindow?.contentViewController as? AutomicVaultMainWindowController
+        if sender === reblessingStatusItem {
+            controller?.showScriptsNeedingReblessing()
+        } else {
+            controller?.showSection(section)
+        }
+    }
+
+    private func makeSectionMenuItem(title: String, section: DashboardSection) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: #selector(openSection), keyEquivalent: "")
+        item.target = self
+        item.representedObject = section.rawValue
+        setOpenAppMenuImage(on: item)
+        item.isHidden = title.isEmpty
+        return item
+    }
+
+    @MainActor private func showMainWindow(secretGateID: String?) {
+        guard !isUpdating else { return }
+        let wasVisible = mainWindow?.isVisible ?? false
+        if let mainWindow {
+            mainWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            if let secretGateID {
+                (mainWindow.contentViewController as? AutomicVaultMainWindowController)?
+                    .showSecretGate(id: secretGateID)
+            }
+            #if !DEBUG
+            if wasVisible == false {
+                postHogTelemetry.captureMainWindowOpened()
+            }
+            #endif
+            return
+        }
+
+        let controller = AutomicVaultMainWindowController(
+            checkForUpdates: { [weak self] in self?.checkForUpdates() },
+            requestScan: { [weak self] in self?.scheduleScan(after: 0) }
+        )
+        controller.updateDetectorFindings(latestDetectorFindings)
+        controller.setAvailableUpdateVersion(readyUpdate?.version, checkedAt: lastUpdateCheck)
+        let defaultWindowSize = NSSize(width: 1269, height: 855)
+        let window = AutomicVaultWindow(
+            contentRect: NSRect(origin: .zero, size: defaultWindowSize),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = controller
+        window.title = "Automic Vault"
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.titlebarSeparatorStyle = .none
+        window.toolbarStyle = .automatic
+        window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 860, height: 558)
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        self.mainWindow = window
+        if let secretGateID {
+            controller.showSecretGate(id: secretGateID)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window.setContentSize(defaultWindowSize)
+        window.center()
+        #if !DEBUG
+        postHogTelemetry.captureMainWindowOpened()
+        #endif
+    }
+
+    @MainActor @objc private func openAutoApproval(_ sender: NSMenuItem) {
+        guard let idString = sender.representedObject as? String,
+              let id = UUID(uuidString: idString)
+        else { return }
+        showAutoApproval(id: id)
+    }
+
+    private func showAutoApproval(id: UUID) {
+        openMainWindow()
+        (mainWindow?.contentViewController as? AutomicVaultMainWindowController)?.showAccessRequest(id: id)
+    }
+
+    private func startDetectorWatchers() {
+        guard !servicesStopped else { return }
+        stopDetectorWatchers()
+        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
+        var exact = [String: Set<String>]()
+        var recursive = [String: Set<String>]()
+        for detector in detectorMetadata {
+            for scope in detector.watchScopes {
+                let path = URL(fileURLWithPath: scope.path).standardizedFileURL.path
+                guard path != home else { continue }
+                var isDirectory: ObjCBool = false
+                let exists = FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+                if scope.recursive || (exists && isDirectory.boolValue) {
+                    if exists {
+                        recursive[path, default: []].insert(detector.name)
+                    } else {
+                        missingFileWatchDetectors[path, default: []].insert(detector.name)
+                    }
+                } else if exists {
+                    exact[path, default: []].insert(detector.name)
+                } else {
+                    missingFileWatchDetectors[path, default: []].insert(detector.name)
+                }
+            }
+        }
+        for finding in latestDetectorFindings {
+            for affected in finding.affected where affected.path.hasPrefix("/") {
+                let path = URL(fileURLWithPath: affected.path).standardizedFileURL.path
+                guard path != home else { continue }
+                var isDirectory: ObjCBool = false
+                if FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+                   isDirectory.boolValue {
+                    recursive[path, default: []].formUnion(finding.detectors)
+                } else {
+                    exact[path, default: []].formUnion(finding.detectors)
+                }
+            }
+        }
+
+        for (path, detectors) in exact {
+            let descriptor = open(path, O_EVTONLY)
+            guard descriptor >= 0 else { continue }
+            let source = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: descriptor,
+                eventMask: [.write, .delete, .rename, .attrib, .extend],
+                queue: .main
+            )
+            source.setEventHandler { [weak self, source] in
+                self?.scheduleScan(detectors: detectors, after: 1)
+                if !source.data.intersection([.delete, .rename]).isEmpty {
+                    self?.startDetectorWatchers()
+                }
+            }
+            source.setCancelHandler { close(descriptor) }
+            source.resume()
+            fileWatchSources.append(source)
+        }
+
+        recursiveWatchDetectors = recursive
+        startRecursiveWatcher(paths: Array(recursive.keys))
+        startMissingFilePoller()
+        startPeriodicDetectorPoller()
+    }
+
+    private func startRecursiveWatcher(paths: [String]) {
+        guard !paths.isEmpty else { return }
+        var context = FSEventStreamContext(
+            version: 0,
+            info: Unmanaged.passUnretained(self).toOpaque(),
+            retain: nil,
+            release: nil,
+            copyDescription: nil
+        )
+        let callback: FSEventStreamCallback = { _, info, count, eventPaths, _, _ in
+            guard let info else { return }
+            let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] ?? []
+            guard paths.count == count else { return }
+            MainActor.assumeIsolated {
+                Unmanaged<AppDelegate>.fromOpaque(info).takeUnretainedValue()
+                    .handleRecursiveFileEvents(paths)
+            }
+        }
+        guard let stream = FSEventStreamCreate(
+            nil,
+            callback,
+            &context,
+            paths as CFArray,
+            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+            1,
+            FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagUseCFTypes)
+        ) else {
+            setStatusMenuItemTitle(String(localized: "Scan watcher unavailable"), on: scanStatusItem)
+            return
+        }
+        eventStream = stream
+        FSEventStreamSetDispatchQueue(stream, DispatchQueue.main)
+        FSEventStreamStart(stream)
+    }
+
+    private func handleRecursiveFileEvents(_ paths: [String]) {
+        var detectors = Set<String>()
+        for changedPath in paths {
+            for (root, names) in recursiveWatchDetectors
+            where changedPath == root || changedPath.hasPrefix(root + "/") {
+                detectors.formUnion(names)
+            }
+        }
+        if !detectors.isEmpty {
+            scheduleScan(detectors: detectors, after: 1)
+        }
+    }
+
+    private func startPeriodicDetectorPoller() {
+        // Watchers are rebuilt after every scan. Keep this independent so
+        // unrelated file activity cannot postpone a non-file state refresh.
+        guard periodicDetectorPoller == nil,
+              detectorMetadata.contains(where: \.requiresPeriodicScan) else { return }
+        let poller = DispatchSource.makeTimerSource(queue: .main)
+        poller.schedule(
+            deadline: .now() + periodicDetectorScanInterval,
+            repeating: periodicDetectorScanInterval,
+            leeway: .seconds(15)
+        )
+        poller.setEventHandler { [weak self] in
+            self?.schedulePeriodicDetectorScan()
+        }
+        poller.resume()
+        periodicDetectorPoller = poller
+    }
+
+    private func schedulePeriodicDetectorScan() {
+        let detectors = Set(detectorMetadata.filter(\.requiresPeriodicScan).map(\.name))
+        guard !detectors.isEmpty else { return }
+        // Reuse the single-flight queue: timer and file events coalesce, with
+        // at most one pending refresh while a scan is already running.
+        scheduleScan(detectors: detectors, after: 0)
+    }
+
+    private func startMissingFilePoller() {
+        guard !missingFileWatchDetectors.isEmpty else { return }
+        let poller = DispatchSource.makeTimerSource(queue: .main)
+        poller.schedule(deadline: .now() + 30, repeating: 30)
+        poller.setEventHandler { [weak self] in
+            guard let self else { return }
+            let created = self.missingFileWatchDetectors.filter {
+                FileManager.default.fileExists(atPath: $0.key)
+            }
+            guard !created.isEmpty else { return }
+            self.scheduleScan(
+                detectors: created.values.reduce(into: Set<String>()) { $0.formUnion($1) },
+                after: 0
+            )
+            self.startDetectorWatchers()
+        }
+        poller.resume()
+        missingFilePoller = poller
+    }
+
+    private func stopDetectorWatchers() {
+        fileWatchSources.forEach { $0.cancel() }
+        fileWatchSources.removeAll()
+        missingFilePoller?.cancel()
+        missingFilePoller = nil
+        missingFileWatchDetectors.removeAll()
+        recursiveWatchDetectors.removeAll()
+        if let eventStream {
+            FSEventStreamStop(eventStream)
+            FSEventStreamInvalidate(eventStream)
+            FSEventStreamRelease(eventStream)
+            self.eventStream = nil
+        }
+    }
+
+    private func scheduleScan(detectors: Set<String>? = nil, after delay: TimeInterval) {
+        guard !servicesStopped else { return }
+        if let detectors, !pendingFullScan {
+            pendingScanDetectors.formUnion(scanDetectorGroup(detectors))
+        } else if detectors == nil {
+            pendingFullScan = true
+            pendingScanDetectors.removeAll()
+        }
+        let scheduledDelay = boundedScanDelay(
+            now: ProcessInfo.processInfo.systemUptime,
+            burstStartedAt: &scanBurstStartedAt,
+            debounceDelay: delay,
+            maximumDelay: scanMaximumDelay
+        )
+        scanWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.scanWorkItem = nil
+            self?.scanBurstStartedAt = nil
+            self?.runPendingScan()
+        }
+        scanWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + scheduledDelay, execute: workItem)
+    }
+
+    private func runPendingScan() {
+        guard !servicesStopped, !isScanRunning, pendingFullScan || !pendingScanDetectors.isEmpty else { return }
+        let detectors = pendingFullScan ? nil : pendingScanDetectors
+        pendingFullScan = false
+        pendingScanDetectors.removeAll()
+        isScanRunning = true
+        scanQueue.async { [weak self] in
+            let result = scanResult(detectors: detectors)
+            Task { @MainActor in
+                self?.applyScanResult(result)
+            }
+        }
+    }
+
+    private func applyScanResult(_ result: ScanResult) {
+        isScanRunning = false
+        guard !servicesStopped else { return }
+        refreshDoctorStatus()
+        switch result {
+        case .success(let findings, let detectors):
+            if let detectors {
+                failedScanDetectors.subtract(detectors)
+                latestDetectorFindings.removeAll {
+                    !Set($0.detectors).isDisjoint(with: detectors)
+                }
+                latestDetectorFindings.append(contentsOf: findings)
+            } else {
+                failedScanDetectors.removeAll()
+                fullScanFailed = false
+                latestDetectorFindings = findings
+            }
+            if !detectorMetadata.isEmpty {
+                startDetectorWatchers()
+            }
+            updateMainWindowFindings(latestDetectorFindings)
+            let count = latestDetectorFindings.count
+            let detectorCount = Set(latestDetectorFindings.flatMap(\.detectors)).count
+            #if !DEBUG
+            if detectorCount == 0 {
+                lastTelemetryFindingCount = nil
+            } else if lastTelemetryFindingCount != detectorCount {
+                postHogTelemetry.captureDetectorTriggered(count: detectorCount)
+                lastTelemetryFindingCount = detectorCount
+            }
+            #endif
+            if latestDetectorFindings.isEmpty {
+                setBaseStatusImage(brandImage())
+                setScanStatus(
+                    String(localized: "No Vulnerabilities Detected"),
+                    image: shieldImage(symbolName: "shield.fill", color: .systemGreen)
+                )
+            } else {
+                let level = scanAlertLevel(latestDetectorFindings.map(\.severity))
+                let image = switch level {
+                case .medium: brandImage()
+                case .high: brandImage(color: .systemRed)
+                }
+                setBaseStatusImage(image)
+                setScanStatus(
+                    vulnerabilityStatusTitle(count: count),
+                    image: shieldImage(color: level.color),
+                    section: .detectors
+                )
+            }
+        case .failed(let detectors):
+            if let detectors {
+                failedScanDetectors.formUnion(detectors)
+            } else {
+                fullScanFailed = true
+            }
+        }
+        // A successful unrelated partial scan cannot certify a failed check.
+        if fullScanFailed || !failedScanDetectors.isEmpty {
+            setBaseStatusImage(brandImage(color: .systemRed))
+            setScanStatus(String(localized: "Scan failed"), image: shieldImage(color: .systemRed))
+        }
+        if scanWorkItem == nil, pendingFullScan || !pendingScanDetectors.isEmpty {
+            runPendingScan()
+        }
+    }
+
+    private func updateMainWindowFindings(_ findings: [DetectorFinding]) {
+        (mainWindow?.contentViewController as? AutomicVaultMainWindowController)?
+            .updateDetectorFindings(findings)
+    }
+
+    private func setScanStatus(_ title: String, image: NSImage?, section: DashboardSection? = nil) {
+        scanStatusItem.action = section == nil ? nil : #selector(openSection)
+        scanStatusItem.target = self
+        scanStatusItem.representedObject = section?.rawValue
+        scanStatusItem.isEnabled = section != nil
+        setStatusMenuItemTitle(title, on: scanStatusItem)
+        scanStatusItem.image = image
+        if #available(macOS 27.0, *) {
+            scanStatusItem.setValue(0, forKey: "preferredImageVisibility")
+        }
+        if section != nil { setOpenAppMenuImage(on: scanStatusItem) }
+    }
+
+    private func setDoctorStatus(count: Int) {
+        guard !isStatusMenuOpen else { return }
+        guard let title = doctorStatusTitle(count: count) else {
+            doctorStatusItem.isHidden = true
+            return
+        }
+        setStatusMenuItemTitle(title, on: doctorStatusItem)
+        doctorStatusItem.isHidden = false
+    }
+
+    private func setReblessingStatus(count: Int) {
+        guard !isStatusMenuOpen else { return }
+        reblessingStatusItem.title = reblessingStatusTitle(count: count) ?? ""
+        reblessingStatusItem.isHidden = count == 0
+    }
+
+    private func refreshDoctorStatus() {
+        scanQueue.async { [weak self] in
+            let count = loadDoctorIssues(avExecutableURL: avExecutableURL()).count
+            let reblessingCount = loadBlessedScripts().filter { blessedScriptStatus($0) == "Changed" }.count
+            Task { @MainActor in
+                self?.setDoctorStatus(count: count)
+                self?.setReblessingStatus(count: reblessingCount)
+            }
+        }
+    }
+
+    @objc private func refreshCLIInstallState() {
+        scanQueue.async { [weak self] in
+            let state = currentCLIInstallState()
+            Task { @MainActor in
+                guard self?.isStatusMenuOpen == false else { return }
+                self?.installCLIItem.title = state.actionTitle.map(localizedUIString) ?? ""
+                self?.installCLIItem.isHidden = state == .current
+            }
+        }
+    }
+
+    private func brandImage(color: NSColor? = nil) -> NSImage? {
+        let fallback = NSImage(systemSymbolName: "shield.fill", accessibilityDescription: "Automic Vault")
+        guard let image = Bundle.main.url(forResource: "NSMenuItem", withExtension: "png")
+            .flatMap(NSImage.init(contentsOf:)) ?? fallback else { return nil }
+        image.size = NSSize(width: 15, height: 18)
+        return tinted(image, color: color)
+    }
+
+    private func dimmed(_ image: NSImage, side: AutomaticApprovalFlashSide) -> NSImage {
+        let result = NSImage(size: image.size, flipped: false) { rect in
+            let left = NSRect(x: rect.minX, y: rect.minY, width: rect.width / 2, height: rect.height)
+            let right = NSRect(x: left.maxX, y: rect.minY, width: rect.width / 2, height: rect.height)
+            image.draw(in: left, from: left, operation: .sourceOver, fraction: side == .left ? 0.5 : 1)
+            image.draw(in: right, from: right, operation: .sourceOver, fraction: side == .right ? 0.5 : 1)
+            return true
+        }
+        result.isTemplate = image.isTemplate
+        return result
+    }
+
+    private func shieldImage(
+        symbolName: String = "shield.lefthalf.filled",
+        color: NSColor? = nil,
+        accessibilityDescription: String = "Shield"
+    ) -> NSImage? {
+        guard let symbol = NSImage(
+            systemSymbolName: symbolName,
+            accessibilityDescription: accessibilityDescription
+        ) else {
+            return nil
+        }
+        let image = symbol.withSymbolConfiguration(.init(pointSize: 14, weight: .semibold)) ?? symbol
+        image.size = NSSize(width: 16, height: 16)
+        return tinted(image, color: color)
+    }
+
+    private func tinted(_ image: NSImage, color: NSColor?) -> NSImage {
+        guard let color else {
+            image.isTemplate = true
+            return image
+        }
+        let tinted = NSImage(size: image.size, flipped: false) { rect in
+            image.draw(in: rect)
+            color.setFill()
+            rect.fill(using: .sourceIn)
+            return true
+        }
+        tinted.isTemplate = false
+        return tinted
+    }
+
+    private func recordAutoApproval(_ record: AutoApprovalRecord) {
+        recordMenuAccess(record)
+        switch automaticApprovalFeedback() {
+        case .notification:
+            showAutomaticAccessToast(record, below: statusItem.button)
+        case .menuBarFlash:
+            flashMenuBarForAutomaticApproval()
+        case .none:
+            break
+        }
+    }
+
+    private func flashMenuBarForAutomaticApproval() {
+        guard let button = statusItem.button else { return }
+        if automaticApprovalFlashWorkItem == nil {
+            preFlashStatusImage = button.image
+        }
+        automaticApprovalFlashWorkItem?.cancel()
+        lastAutomaticApprovalFlashSide = lastAutomaticApprovalFlashSide.next
+
+        guard let baseImage = preFlashStatusImage ?? button.image else { return }
+        let flashImage = dimmed(baseImage, side: lastAutomaticApprovalFlashSide)
+        button.image = flashImage
+        let workItem = DispatchWorkItem { [weak self, weak button] in
+            guard let self else { return }
+            if button?.image === flashImage {
+                button?.image = self.preFlashStatusImage
+            }
+            self.automaticApprovalFlashWorkItem = nil
+            self.preFlashStatusImage = nil
+        }
+        automaticApprovalFlashWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: workItem)
+    }
+
+    private func recordMenuAccess(_ record: AutoApprovalRecord) {
+        autoApprovals.insert(record, at: 0)
+        let capacity = NSScreen.screens.map { screen in
+            Self.visibleAutoApprovalCount + autoApprovalSubmenuCapacity(visibleHeight: screen.visibleFrame.height)
+        }.max() ?? Self.visibleAutoApprovalCount
+        autoApprovals = Array(autoApprovals.prefix(capacity))
+        refreshAutoApprovalMenuItems()
+        refreshTemporaryAccessGrantMenuItems()
+    }
+
+    private func didRecordAccessRequest(_ record: AccessRequestRecord) {
+        if shouldShowAutomaticAccessToast(record) {
+            showAutomaticAccessToast(automaticAccessRecord(record), below: statusItem.button)
+        }
+        (mainWindow?.contentViewController as? AutomicVaultMainWindowController)?.reloadAccessRequests()
+    }
+
+    private func refreshAutoApprovalMenuItems() {
+        guard !isUpdating, !isStatusMenuOpen else { return }
+        guard let menu = statusItem.menu else { return }
+        for item in autoApprovalItems {
+            menu.removeItem(item)
+        }
+        if let heading = autoApprovalHeadingItem {
+            menu.removeItem(heading)
+            autoApprovalHeadingItem = nil
+        }
+        if let separator = autoApprovalSeparator {
+            menu.removeItem(separator)
+            autoApprovalSeparator = nil
+        }
+        let groups = groupedAutoApprovals(autoApprovals)
+        autoApprovalItems = groups.prefix(Self.visibleAutoApprovalCount).map(autoApprovalMenuItem)
+        if groups.count > Self.visibleAutoApprovalCount {
+            let moreItem = makeSectionMenuItem(title: String(localized: "More"), section: .secretUsage)
+            autoApprovalItems.append(moreItem)
+        }
+        let insertionIndex = temporaryAccessGrantMenuItemCount + liveSecretUseMenuItemCount
+        for item in autoApprovalItems.reversed() {
+            menu.insertItem(item, at: insertionIndex)
+        }
+        guard let heading = autoApprovalHistoryHeading(hasRecords: !autoApprovalItems.isEmpty) else { return }
+        menu.insertItem(heading, at: insertionIndex)
+        autoApprovalHeadingItem = heading
+        let separator = NSMenuItem.separator()
+        menu.insertItem(separator, at: insertionIndex + autoApprovalItems.count + 1)
+        autoApprovalSeparator = separator
+    }
+
+    private var temporaryAccessGrantMenuItemCount: Int {
+        temporaryAccessGrantHeadingItem == nil ? 0 : temporaryAccessGrantMenuItems.count + 2
+    }
+
+    private var liveSecretUseMenuItemCount: Int {
+        liveSecretUseHeadingItem == nil ? 0 : liveSecretUseMenuItems.count + 2
+    }
+
+    private func refreshTemporaryAccessGrants() {
+        let previousGenerations = Set(temporaryAccessGrantSnapshots.map(\.generation))
+        temporaryAccessGrantSnapshots = temporaryAccessGrants.snapshots()
+        if temporaryAccessGrantSnapshots.contains(where: {
+            !previousGenerations.contains($0.generation)
+        }) {
+            isTemporaryAccessGrantStripCollapsed = false
+            temporaryAccessGrantCollapseWorkItem?.cancel()
+            temporaryAccessGrantCollapseWorkItem = nil
+        } else if temporaryAccessGrantSnapshots.isEmpty {
+            isTemporaryAccessGrantStripCollapsed = false
+            temporaryAccessGrantCollapseWorkItem?.cancel()
+            temporaryAccessGrantCollapseWorkItem = nil
+        }
+        if temporaryAccessGrantSnapshots.allSatisfy(\.isCountdownSuspended) {
+            temporaryAccessGrantTimer?.invalidate()
+            temporaryAccessGrantTimer = nil
+        } else if temporaryAccessGrantTimer == nil {
+            let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.refreshTemporaryAccessGrants() }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            temporaryAccessGrantTimer = timer
+        }
+        refreshTemporaryAccessGrantMenuItems()
+        refreshTemporaryAccessGrantPanel()
+        statusItem.button?.image = temporaryAccessGrantSnapshots.isEmpty
+            ? (baseStatusImage ?? brandImage())
+            : brandImage(color: .systemOrange)
+    }
+
+    private func refreshTemporaryAccessGrantMenuItems() {
+        guard !isUpdating, !isStatusMenuOpen, let menu = statusItem.menu else { return }
+        temporaryAccessGrantMenuItems.forEach(menu.removeItem)
+        temporaryAccessGrantMenuItems.removeAll()
+        if let temporaryAccessGrantHeadingItem {
+            menu.removeItem(temporaryAccessGrantHeadingItem)
+            self.temporaryAccessGrantHeadingItem = nil
+        }
+        if let temporaryAccessGrantSeparator {
+            menu.removeItem(temporaryAccessGrantSeparator)
+            self.temporaryAccessGrantSeparator = nil
+        }
+        guard !temporaryAccessGrantSnapshots.isEmpty else { return }
+
+        let wallNow = Date()
+        let monotonicNow = ProcessInfo.processInfo.systemUptime
+        temporaryAccessGrantMenuItems = temporaryAccessGrantSnapshots.map { grant in
+            let item = NSMenuItem(
+                title: temporaryAccessGrantMenuTitle(
+                    grant,
+                    wallNow: wallNow,
+                    monotonicNow: monotonicNow
+                ),
+                action: nil,
+                keyEquivalent: ""
+            )
+            item.image = shieldImage(
+                symbolName: "exclamationmark.shield.fill",
+                color: .systemOrange,
+                accessibilityDescription: "Temporary access warning"
+            )
+            let submenu = NSMenu()
+            let addTenMinutes = NSMenuItem(
+                title: String(localized: "Add 10 Minutes"),
+                action: #selector(addTenMinutesToTemporaryAccessGrant(_:)),
+                keyEquivalent: ""
+            )
+            addTenMinutes.target = self
+            addTenMinutes.representedObject = grant.id.uuidString
+            submenu.addItem(addTenMinutes)
+            submenu.addItem(.separator())
+            if isTemporaryAccessGrantStripCollapsed {
+                let showStrip = NSMenuItem(
+                    title: String(localized: "Show Temporary Access Grant Strip"),
+                    action: #selector(showTemporaryAccessGrantStrip(_:)),
+                    keyEquivalent: ""
+                )
+                showStrip.target = self
+                submenu.addItem(showStrip)
+                submenu.addItem(.separator())
+            }
+            let toggle = NSMenuItem(
+                title: grant.isCountdownSuspended
+                    ? "Resume Write Access"
+: "Suspend Write Access",
+                action: #selector(toggleTemporaryAccessGrantCountdown(_:)),
+                keyEquivalent: ""
+            )
+            toggle.target = self
+            toggle.representedObject = grant.id.uuidString
+            submenu.addItem(toggle)
+            let end = NSMenuItem(
+                title: String(localized: "End temporary Write Access"),
+                action: #selector(endTemporaryAccessGrant(_:)),
+                keyEquivalent: ""
+            )
+            end.target = self
+            end.representedObject = grant.id.uuidString
+            submenu.addItem(end)
+            item.submenu = submenu
+            return item
+        }
+        for item in temporaryAccessGrantMenuItems.reversed() {
+            menu.insertItem(item, at: 0)
+        }
+        let heading = makeStatusMenuItem(title: String(localized: "Temporary Access Grants"))
+        menu.insertItem(heading, at: 0)
+        temporaryAccessGrantHeadingItem = heading
+        let separator = NSMenuItem.separator()
+        menu.insertItem(separator, at: temporaryAccessGrantMenuItems.count + 1)
+        temporaryAccessGrantSeparator = separator
+    }
+
+    @objc private func endTemporaryAccessGrant(_ sender: NSMenuItem) {
+        guard let rawID = sender.representedObject as? String,
+              let id = UUID(uuidString: rawID)
+        else { return }
+        _ = temporaryAccessGrants.cancel(id: id)
+        refreshTemporaryAccessGrants()
+    }
+
+    @objc private func showTemporaryAccessGrantStrip(_ sender: NSMenuItem) {
+        revealTemporaryAccessGrantStrip()
+    }
+
+    @objc private func addTenMinutesToTemporaryAccessGrant(_ sender: NSMenuItem) {
+        guard let rawID = sender.representedObject as? String,
+              let id = UUID(uuidString: rawID)
+        else { return }
+        _ = temporaryAccessGrants.addTenMinutes(id: id)
+        refreshTemporaryAccessGrants()
+    }
+
+    @objc private func toggleTemporaryAccessGrantCountdown(_ sender: NSMenuItem) {
+        guard let rawID = sender.representedObject as? String,
+              let id = UUID(uuidString: rawID),
+              let grant = temporaryAccessGrantSnapshots.first(where: { $0.id == id })
+        else { return }
+        _ = temporaryAccessGrants.setCountdownSuspended(
+            id: id,
+            suspended: !grant.isCountdownSuspended
+        )
+        refreshTemporaryAccessGrants()
+    }
+
+    private func refreshLiveSecretUses() {
+        liveSecretUseSnapshots = liveSecretUses.snapshots(isLive: liveSecretUseProcessIsLive)
+        if liveSecretUseSnapshots.isEmpty {
+            liveSecretUseTimer?.invalidate()
+            liveSecretUseTimer = nil
+        } else if liveSecretUseTimer == nil {
+            let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.refreshLiveSecretUses() }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            liveSecretUseTimer = timer
+        }
+        refreshLiveSecretUseMenuItems()
+    }
+
+    private func refreshLiveSecretUseMenuItems() {
+        guard !isUpdating, !isStatusMenuOpen, let menu = statusItem.menu else { return }
+        liveSecretUseMenuItems.forEach(menu.removeItem)
+        liveSecretUseMenuItems.removeAll()
+        if let liveSecretUseHeadingItem {
+            menu.removeItem(liveSecretUseHeadingItem)
+            self.liveSecretUseHeadingItem = nil
+        }
+        if let liveSecretUseSeparator {
+            menu.removeItem(liveSecretUseSeparator)
+            self.liveSecretUseSeparator = nil
+        }
+        guard !liveSecretUseSnapshots.isEmpty else { return }
+
+        liveSecretUseMenuItems = liveSecretUseSnapshots.map { use in
+            let launcher = use.launcherName ?? "Launcher unavailable"
+            let target = URL(fileURLWithPath: use.targetPath).lastPathComponent
+            let count = "\(use.secretNames.count) \(use.secretNames.count == 1 ? "Secret" : "Secrets")"
+            let item = NSMenuItem(
+                title: "\(launcher) → \(target) · \(count)",
+                action: nil,
+                keyEquivalent: ""
+            )
+            let submenu = NSMenu()
+            let launcherItem = NSMenuItem(
+                title: use.launcherName.map { "Verified Launcher: \($0)" }
+                    ?? "Verified Launcher unavailable",
+                action: nil,
+                keyEquivalent: ""
+            )
+            launcherItem.isEnabled = false
+            submenu.addItem(launcherItem)
+            let targetItem = NSMenuItem(
+                title: "Target: \(use.targetPath) (PID \(use.processID))",
+                action: nil,
+                keyEquivalent: ""
+            )
+            targetItem.isEnabled = false
+            submenu.addItem(targetItem)
+            submenu.addItem(.separator())
+            submenu.addItem(makeStatusMenuItem(title: String(localized: "Secret Names")))
+            for name in use.secretNames {
+                let secretItem = NSMenuItem(title: name, action: nil, keyEquivalent: "")
+                secretItem.isEnabled = false
+                submenu.addItem(secretItem)
+            }
+            submenu.addItem(.separator())
+            for text in [
+                "Shown while this Target process remains live.",
+                "The Target may pass values to child processes; released values cannot be revoked.",
+            ] {
+                let note = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+                note.isEnabled = false
+                submenu.addItem(note)
+            }
+            item.submenu = submenu
+            return item
+        }
+        let insertionIndex = temporaryAccessGrantMenuItemCount
+        for item in liveSecretUseMenuItems.reversed() {
+            menu.insertItem(item, at: insertionIndex)
+        }
+        let heading = makeStatusMenuItem(title: String(localized: "Live Secret Uses"))
+        menu.insertItem(heading, at: insertionIndex)
+        liveSecretUseHeadingItem = heading
+        let separator = NSMenuItem.separator()
+        menu.insertItem(separator, at: insertionIndex + liveSecretUseMenuItems.count + 1)
+        liveSecretUseSeparator = separator
+    }
+
+    private func refreshTemporaryAccessGrantPanel() {
+        guard !temporaryAccessGrantSnapshots.isEmpty,
+              let button = statusItem.button,
+              let statusWindow = button.window
+        else {
+            temporaryAccessGrantCollapseWorkItem?.cancel()
+            temporaryAccessGrantCollapseWorkItem = nil
+            isTemporaryAccessGrantStripCollapsed = false
+            temporaryAccessGrantPanel?.orderOut(nil)
+            temporaryAccessGrantPanel = nil
+            temporaryAccessGrantStripFrame = nil
+            return
+        }
+        let autoCollapse = UserDefaults.standard.bool(
+            forKey: autoCollapseTemporaryAccessGrantStripDefaultsKey
+        )
+        if !autoCollapse {
+            temporaryAccessGrantCollapseWorkItem?.cancel()
+            temporaryAccessGrantCollapseWorkItem = nil
+        }
+        let panel = temporaryAccessGrantPanel ?? makeTemporaryAccessGrantPanel()
+        temporaryAccessGrantPanel = panel
+        let wallNow = Date()
+        let monotonicNow = ProcessInfo.processInfo.systemUptime
+        let hostingView: NSView
+        if isTemporaryAccessGrantStripCollapsed {
+            hostingView = NSHostingView(rootView: CollapsedTemporaryAccessGrantStripView(
+                grantCount: temporaryAccessGrantSnapshots.count,
+                show: { [weak self] in self?.revealTemporaryAccessGrantStrip() }
+            ))
+        } else {
+            hostingView = NSHostingView(rootView: TemporaryAccessGrantStripView(
+                grants: temporaryAccessGrantSnapshots,
+                wallNow: wallNow,
+                monotonicNow: monotonicNow,
+                collapse: { [weak self] in self?.collapseTemporaryAccessGrantStrip() },
+                addTenMinutes: { [weak self] id in
+                    guard let self else { return }
+                    _ = self.temporaryAccessGrants.addTenMinutes(id: id)
+                    self.refreshTemporaryAccessGrants()
+                },
+                end: { [weak self] id in
+                    guard let self else { return }
+                    _ = self.temporaryAccessGrants.cancel(id: id)
+                    self.refreshTemporaryAccessGrants()
+                },
+                setCountdownSuspended: { [weak self] id, suspended in
+                    guard let self else { return }
+                    _ = self.temporaryAccessGrants.setCountdownSuspended(
+                        id: id,
+                        suspended: suspended
+                    )
+                    self.refreshTemporaryAccessGrants()
+                }
+            ))
+        }
+        let size = installPanelContent(hostingView, in: panel)
+        let anchor = statusWindow.convertToScreen(button.convert(button.bounds, to: nil))
+        let visibleFrame = statusWindow.screen?.visibleFrame ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 800, height: 600)
+        let frame = isTemporaryAccessGrantStripCollapsed
+            ? temporaryAccessGrantTabFrame(anchor: anchor, visibleFrame: visibleFrame, size: size)
+            : autoApprovalToastFrame(anchor: anchor, visibleFrame: visibleFrame, size: size)
+        if shouldAnimateTemporaryAccessGrantPanelTransition(
+            isVisible: panel.isVisible,
+            reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+            from: panel.frame,
+            to: frame
+        ) {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.25
+                panel.animator().setFrame(frame, display: true)
+            }
+        } else {
+            panel.setFrame(frame, display: true)
+        }
+        temporaryAccessGrantStripFrame = frame
+        panel.orderFrontRegardless()
+        reanchorToastWindows(below: frame, visibleFrame: visibleFrame)
+        if autoCollapse, !isTemporaryAccessGrantStripCollapsed,
+           temporaryAccessGrantCollapseWorkItem == nil
+        {
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.temporaryAccessGrantCollapseWorkItem = nil
+                guard UserDefaults.standard.bool(
+                    forKey: autoCollapseTemporaryAccessGrantStripDefaultsKey
+                ), !self.temporaryAccessGrantSnapshots.isEmpty
+                else { return }
+                self.collapseTemporaryAccessGrantStrip()
+            }
+            temporaryAccessGrantCollapseWorkItem = workItem
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + temporaryAccessGrantCollapseDelay,
+                execute: workItem
+            )
+        }
+    }
+
+    private func revealTemporaryAccessGrantStrip() {
+        temporaryAccessGrantCollapseWorkItem?.cancel()
+        temporaryAccessGrantCollapseWorkItem = nil
+        isTemporaryAccessGrantStripCollapsed = false
+        refreshTemporaryAccessGrantPanel()
+        refreshTemporaryAccessGrantMenuItems()
+    }
+
+    private func setBaseStatusImage(_ image: NSImage?) {
+        baseStatusImage = image
+        if temporaryAccessGrantSnapshots.isEmpty {
+            statusItem.button?.image = image
+        }
+    }
+
+    fileprivate func autoApprovalMenuItem(_ group: AutoApprovalGroup) -> NSMenuItem {
+        guard group.count > 1 else { return autoApprovalMenuItem(group.record) }
+        let item = NSMenuItem(
+            title: autoApprovalTitle(group, formatter: autoApprovalTimeFormatter),
+            action: nil,
+            keyEquivalent: ""
+        )
+        styleHistoryMenuTitle(item, activity: "\(autoApprovalText(group.record)) \u{00D7}\(group.count)")
+        let submenu = NSMenu()
+        group.records.map(autoApprovalSubmenuItem).forEach(submenu.addItem)
+        item.submenu = submenu
+        return item
+    }
+
+    private func autoApprovalSubmenuItem(_ record: AutoApprovalRecord) -> NSMenuItem {
+        let item = autoApprovalMenuItem(record)
+        let time = "\(autoApprovalTimeFormatter.string(from: record.date))  "
+        let command = record.displayCommand.replacingOccurrences(of: " \\\n  ", with: " ")
+        item.title = time + command
+        styleHistoryMenuTitle(item, activity: command)
+        return item
+    }
+
+    private func autoApprovalMenuItem(_ record: AutoApprovalRecord) -> NSMenuItem {
+        let item = NSMenuItem(
+            title: autoApprovalTitle(record, formatter: autoApprovalTimeFormatter),
+            action: #selector(openAutoApproval),
+            keyEquivalent: ""
+        )
+        item.target = self
+        item.representedObject = record.accessRequestID.uuidString
+        styleHistoryMenuTitle(item, activity: autoApprovalText(record))
+        setOpenAppMenuImage(on: item)
+        return item
+    }
+
+    fileprivate func statusMenuTrackingSelfCheck() -> Bool {
+        installStatusMenu()
+        defer { NSStatusBar.system.removeStatusItem(statusItem) }
+        guard let menu = statusItem.menu else { return false }
+
+        setDoctorStatus(count: 2)
+        setReblessingStatus(count: 1)
+        setScanStatus(vulnerabilityStatusTitle(count: 1), image: nil, section: .detectors)
+        for (item, section) in [(scanStatusItem, DashboardSection.detectors),
+                                (doctorStatusItem, .doctor), (reblessingStatusItem, .blessedScripts)] {
+            guard !item.isHidden, !item.isSectionHeader, item.isEnabled,
+                  item.action == #selector(openSection), item.target === self,
+                  item.representedObject as? String == section.rawValue,
+                  item.image != nil else { return false }
+            if #available(macOS 27.0, *), item.value(forKey: "preferredImageVisibility") as? Int != 1 {
+                print("App-opening menu icon is not explicitly visible")
+                return false
+            }
+        }
+        guard menu.index(of: reblessingStatusItem) == menu.index(of: doctorStatusItem) + 1,
+              menu.items.first(where: { $0.action == #selector(openMainWindow) })?.image != nil
+        else { return false }
+        let moreItem = makeSectionMenuItem(title: "More", section: .secretUsage)
+        guard moreItem.action == #selector(openSection), moreItem.image != nil,
+              moreItem.representedObject as? String == DashboardSection.secretUsage.rawValue
+        else { return false }
+        setDoctorStatus(count: 0)
+        setReblessingStatus(count: 0)
+        setScanStatus("No Vulnerabilities Detected", image: nil)
+        guard doctorStatusItem.isHidden, reblessingStatusItem.isHidden,
+              scanStatusItem.action == nil, !scanStatusItem.isEnabled else { return false }
+
+        let requirement = "menu-denial-self-check-\(UUID().uuidString)"
+        let gh = SecretGate(id: "gh", keyPatterns: ["TOKEN"], routes: [], defaultProtection: .noAccess, appPolicies: [])
+        let ssh = SecretGate(id: "ssh-agent", keyPatterns: ["KEY"], routes: [], defaultProtection: .noAccess, appPolicies: [])
+        guard let writes = TemporaryLauncherDenialScope(gate: gh, classification: .mutating),
+              let authentication = TemporaryLauncherDenialScope(gate: ssh, classification: .mutating) else { return false }
+        defer {
+            for denial in TemporaryLauncherDenials.shared.active() where denial.requirement == requirement {
+                TemporaryLauncherDenials.shared.cancel(denial.id)
+            }
+            temporaryDenialTimer?.invalidate()
+            if let temporaryDenialObserver { NotificationCenter.default.removeObserver(temporaryDenialObserver) }
+        }
+        TemporaryLauncherDenials.shared.deny(requirement, launcherName: "Self Check", scope: writes)
+        TemporaryLauncherDenials.shared.deny(requirement, launcherName: "Self Check", scope: authentication)
+        guard !temporaryDenialsItem.isHidden, let denialMenu = temporaryDenialsItem.submenu,
+              denialMenu.items.count == 2,
+              denialMenu.item(at: 0)?.submenu?.item(at: 0)?.title == "Deny writes and above",
+              let end = denialMenu.item(at: 0)?.submenu?.item(at: 2),
+              end.action == #selector(endTemporaryDenial(_:)), end.target === self else { return false }
+        menuWillOpen(menu)
+        endTemporaryDenial(end)
+        guard !TemporaryLauncherDenials.shared.isDenied(requirement, gate: gh, classification: .mutating),
+              TemporaryLauncherDenials.shared.isDenied(requirement, gate: ssh, classification: .mutating),
+              temporaryDenialsItem.submenu?.items.count == 2 else { return false }
+        menuDidClose(menu)
+        guard temporaryDenialsItem.submenu?.items.count == 1 else { return false }
+        for denial in TemporaryLauncherDenials.shared.active() where denial.requirement == requirement {
+            TemporaryLauncherDenials.shared.cancel(denial.id)
+        }
+        guard temporaryDenialsItem.isHidden, temporaryDenialTimer == nil else { return false }
+
+        menuWillOpen(menu)
+        let presentedItems = menu.items
+        let process = LiveSecretUseProcess(
+            pid: 42,
+            startUsec: 1,
+            effectiveUserID: geteuid(),
+            auditSessionID: 1
+        )
+        liveSecretUses.record(
+            process: process,
+            launcherDesignatedRequirement: nil,
+            launcherName: "Self Check",
+            targetPath: "/usr/bin/true",
+            processID: process.pid,
+            secretNames: ["TEST_SECRET"]
+        )
+        liveSecretUseSnapshots = liveSecretUses.snapshots(isLive: { _ in true })
+        refreshLiveSecretUseMenuItems()
+        let stayedStable = menu.items.count == presentedItems.count
+            && zip(menu.items, presentedItems).allSatisfy { $0 === $1 }
+
+        menuDidClose(menu)
+        return stayedStable
+            && !isStatusMenuOpen
+            && liveSecretUseMenuItems.count == 1
+            && liveSecretUseHeadingItem != nil
+    }
+}
+
+private func scanDetectorGroup(_ detectors: Set<String>) -> Set<String> {
+    guard !detectors.isDisjoint(with: ["bash", "zsh"]) else { return detectors }
+    return detectors.union(["bash", "zsh"])
+}
+
+extension AppDelegate: NSMenuDelegate {
+    func menuWillOpen(_ menu: NSMenu) {
+        if !isStartingUp, !isUpdating {
+            refreshTemporaryDenials()
+            refreshAutoApprovalMenuItems()
+            refreshTemporaryAccessGrantMenuItems()
+            refreshLiveSecretUses()
+            refreshDoctorStatus()
+        }
+        isStatusMenuOpen = true
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        isStatusMenuOpen = false
+        guard !isStartingUp, !isUpdating else { return }
+        refreshTemporaryDenials()
+        refreshAutoApprovalMenuItems()
+        refreshTemporaryAccessGrantMenuItems()
+        refreshLiveSecretUseMenuItems()
+        refreshDoctorStatus()
+        refreshCLIInstallState()
+    }
+}
+
+private func updateMenuVisibility(
+    _ items: [NSMenuItem],
+    startingUp: Bool,
+    visibleDuringStartup: [NSMenuItem]
+) {
+    for item in items {
+        item.isHidden = startingUp && !visibleDuringStartup.contains { $0 === item }
+    }
+}
+
+private func makeStatusMenuItem(title: String) -> NSMenuItem {
+    let item = NSMenuItem.sectionHeader(title: title)
+    setStatusMenuItemTitle(title, on: item)
+    return item
+}
+
+private func autoApprovalHistoryHeading(hasRecords: Bool) -> NSMenuItem? {
+    guard hasRecords else { return nil }
+    let item = makeStatusMenuItem(title: String(localized: "Automic Authorization History"))
+    item.isEnabled = false
+    return item
+}
+
+private func makeUpdatingMenu() -> NSMenu {
+    let menu = NSMenu()
+    menu.addItem(makeStatusMenuItem(title: String(localized: "Updating…")))
+    menu.addItem(.separator())
+    let quitItem = NSMenuItem(title: String(localized: "Quit"), action: nil, keyEquivalent: "q")
+    quitItem.isEnabled = false
+    menu.addItem(quitItem)
+    return menu
+}
+
+@MainActor
+private func configureUpdatingAlert(_ alert: NSAlert) {
+    alert.messageText = String(localized: "Updating…")
+    alert.informativeText = String(localized: "Automic Vault will relaunch when the update is complete.")
+    alert.buttons.forEach { $0.isHidden = true }
+    let progress = NSProgressIndicator(frame: NSRect(x: 0, y: 0, width: 24, height: 24))
+    progress.style = .spinning
+    progress.isIndeterminate = true
+    progress.setAccessibilityLabel("Updating Automic Vault")
+    progress.startAnimation(nil)
+    alert.accessoryView = progress
+    alert.layout()
+}
+
+private func setStatusMenuItemTitle(_ title: String, on item: NSMenuItem) {
+    item.title = title
+    guard item.action == nil else {
+        item.attributedTitle = nil
+        return
+    }
+    item.attributedTitle = NSAttributedString(
+        string: title,
+        attributes: [
+            .font: NSFont.menuFont(ofSize: 0),
+            .foregroundColor: NSColor.disabledControlTextColor,
+        ]
+    )
+}
+
+private func setVersionBadge(_ version: String?, on item: NSMenuItem) {
+    item.badge = version.flatMap { $0.isEmpty ? nil : NSMenuItemBadge(string: "v\($0)") }
+}
+
+private struct AutoApprovalRecord {
+    let accessRequestID: UUID
+    let date: Date
+    let launcher: String
+    let launcherIconPath: String
+    let tool: String
+    let displayCommand: String
+    let keys: [String]
+    let wasCanceled: Bool
+    let wasDenied: Bool
+    var policyWarning: String? = nil
+}
+
+private struct AutoApprovalGroup {
+    var records: [AutoApprovalRecord]
+    var firstDate: Date
+    var lastDate: Date
+
+    var count: Int { records.count }
+    var record: AutoApprovalRecord { records[0] }
+
+    init(_ record: AutoApprovalRecord) {
+        records = [record]
+        firstDate = record.date
+        lastDate = record.date
+    }
+}
+
+private func autoApprovalText(_ record: AutoApprovalRecord) -> String {
+    let action = record.wasCanceled ? "canceled its request to use" : record.wasDenied ? "was denied use of" : "used"
+    return "\(record.launcher) \(action) \(record.tool)"
+}
+
+private func groupedAutoApprovals(_ records: [AutoApprovalRecord]) -> [AutoApprovalGroup] {
+    records.reduce(into: []) { groups, record in
+        if let index = groups.indices.last,
+           groups[index].record.launcher == record.launcher,
+           groups[index].record.tool == record.tool,
+           groups[index].record.policyWarning == record.policyWarning,
+           groups[index].record.wasCanceled == record.wasCanceled,
+           groups[index].record.wasDenied == record.wasDenied
+        {
+            groups[index].records.append(record)
+            groups[index].firstDate = min(groups[index].firstDate, record.date)
+            groups[index].lastDate = max(groups[index].lastDate, record.date)
+        } else {
+            groups.append(AutoApprovalGroup(record))
+        }
+    }
+}
+
+private func autoApprovalTitle(_ record: AutoApprovalRecord, formatter: DateFormatter) -> String {
+    "\(formatter.string(from: record.date)) – \(autoApprovalText(record))"
+}
+
+private func styleHistoryMenuTitle(_ item: NSMenuItem, activity: String) {
+    let title = NSMutableAttributedString(
+        string: item.title,
+        attributes: [.font: NSFont.menuFont(ofSize: 0)]
+    )
+    title.addAttribute(
+        .foregroundColor, value: NSColor.disabledControlTextColor,
+        range: NSRange(location: 0, length: title.length - (activity as NSString).length)
+    )
+    item.attributedTitle = title
+}
+
+private func autoApprovalTitle(_ group: AutoApprovalGroup, formatter: DateFormatter) -> String {
+    let firstTime = formatter.string(from: group.firstDate)
+    guard group.count > 1 else { return autoApprovalTitle(group.record, formatter: formatter) }
+    let lastTime = formatter.string(from: group.lastDate)
+    let time = firstTime == lastTime ? firstTime : "\(firstTime)\u{2013}\(lastTime)"
+    return "\(time) \(autoApprovalText(group.record)) \u{00D7}\(group.count)"
+}
+
+private func autoApprovalSubmenuCapacity(visibleHeight: CGFloat) -> Int {
+    guard visibleHeight > 0 else { return 0 }
+    return max(0, Int((visibleHeight - 16) / 22))
+}
+
+private func autoApprovalRecord(
+    accessRequestID: UUID,
+    request: ApprovalRequest,
+    script: ScriptApproval?,
+    launcher: LauncherIdentity,
+    policyWarning: String? = nil
+) -> AutoApprovalRecord {
+    let requester = approvalPromptRequester(launcher: launcher, fallback: launcher.path)
+    return AutoApprovalRecord(
+        accessRequestID: accessRequestID,
+        date: Date(),
+        launcher: requester.name,
+        launcherIconPath: requester.iconPath,
+        tool: autoApprovalToolName(request, scriptPath: script?.path),
+        displayCommand: authorizationHistoryCommand(request, scriptPath: script?.path),
+        keys: request.keys,
+        wasCanceled: false,
+        wasDenied: false,
+        policyWarning: policyWarning
+    )
+}
+
+private func autoApprovalRecord(_ record: AccessRequestRecord) -> AutoApprovalRecord? {
+    guard record.decision == "Approved", record.approvalSourceLabel == "Policy" else { return nil }
+    return automaticAccessRecord(record)
+}
+
+private func automaticAccessRecord(_ record: AccessRequestRecord) -> AutoApprovalRecord {
+    return AutoApprovalRecord(
+        accessRequestID: record.id,
+        date: record.date,
+        launcher: record.launcher ?? "Launcher unavailable",
+        launcherIconPath: record.launcherIconPath ?? "",
+        tool: record.tool,
+        displayCommand: record.commandForDisplay,
+        keys: record.keys,
+        wasCanceled: record.decision == "Canceled",
+        wasDenied: record.decision == "Denied"
+    )
+}
+
+private func shouldShowAutomaticAccessToast(_ record: AccessRequestRecord) -> Bool {
+    record.decision == "Denied" && record.approvalSourceLabel == "Policy"
+        && !record.reason.hasPrefix("Denied by Launcher rule:")
+        && record.reason != "Denied by two-minute Temporary Launcher Denial"
+}
+
+private func automaticApprovalFeedback(rawValue: String? = UserDefaults.standard.string(
+    forKey: automaticApprovalFeedbackDefaultsKey
+)) -> AutomaticApprovalFeedback {
+    rawValue.flatMap(AutomaticApprovalFeedback.init(rawValue:)) ?? .notification
+}
+
+private func accessRequestRecord(
+    id: UUID = UUID(),
+    request: ApprovalRequest,
+    callerPath: String,
+    decision: String,
+    approvalSource: String,
+    reason: String,
+    launcher: LauncherIdentity?
+) -> AccessRequestRecord {
+    AccessRequestRecord(
+        id: id,
+        date: Date(),
+        tool: autoApprovalToolName(request),
+        command: exactAuthorizationCommand(request),
+        displayCommand: authorizationHistoryCommand(request),
+        decision: decision,
+        approvalSource: approvalSource,
+        reason: reason,
+        launcher: launcher.map { approvalPromptRequester(launcher: $0, fallback: $0.path).name },
+        launcherIconPath: launcher.map { approvalPromptRequester(launcher: $0, fallback: $0.path).iconPath },
+        launcherRequirement: launcher.flatMap {
+            $0.runtimeProtection.allowsSecretGateAccess ? $0.designatedRequirement : nil
+        },
+        gateID: request.gateID,
+        temporaryDenialScope: request.temporaryDenialScope,
+        callerPath: callerPath,
+        target: request.target,
+        targetRuntimeProtection: automaticTargetRuntimeProtection(
+            request: request,
+            decision: decision,
+            approvalSource: approvalSource
+        ),
+        cwd: request.cwd,
+        keys: request.keys.sorted(),
+        detail: request.detail,
+        secretValueSources: request.selectedSecretValues.sourceDisplayNames
+    )
+}
+
+private func automaticTargetRuntimeProtection(
+    request: ApprovalRequest,
+    decision: String,
+    approvalSource: String
+) -> String? {
+    guard decision == "Approved",
+          approvalSource.caseInsensitiveCompare("Auto") == .orderedSame,
+          !request.selectedSecretValues.isEmpty
+    else { return nil }
+
+    let protection: LauncherRuntimeProtection?
+    if let parent = request.credentialParent {
+        protection = liveSigningInfo(for: parent)?.runtimeProtection
+    } else {
+        protection = executableSigningInfo(path: request.target)?.runtimeProtection
+    }
+    return protection?.targetAuthorizationHistoryDescription
+        ?? "Hardened Runtime could not be verified; Secret may be exposed to debugging or process-memory inspection"
+}
+
+private func liveSigningInfo(for parent: CredentialHelperParent) -> LiveSigningInfo? {
+    func matches(_ identity: AVProcessIdentity) -> Bool {
+        identity.start_usec == parent.startUsec
+            && identity.euid == parent.euid
+            && pathString(identity) == parent.target
+    }
+    var before = AVProcessIdentity()
+    guard av_process_identity(parent.pid, &before),
+          matches(before),
+          let signing = liveSigningInfo(pid: parent.pid),
+          signing.mainExecutable == parent.target
+    else { return nil }
+    var after = AVProcessIdentity()
+    return av_process_identity(parent.pid, &after) && matches(after) ? signing : nil
+}
+
+private func shortAppName(_ identifier: String) -> String {
+    let name = identifier.split(separator: ".").last.map(String.init) ?? identifier
+    return name.prefix(1).uppercased() + name.dropFirst()
+}
+
+private func autoApprovalToolName(_ request: ApprovalRequest, scriptPath: String? = nil) -> String {
+    if let tool = request.tool {
+        return tool
+    }
+    if let scriptPath {
+        return URL(fileURLWithPath: scriptPath).lastPathComponent
+    }
+    if let scriptPath = resolvedShebangScriptPath(request) {
+        return URL(fileURLWithPath: scriptPath).lastPathComponent
+    }
+    return URL(fileURLWithPath: request.target).lastPathComponent
+}
+
+private struct AuthorizationCommandParts {
+    let tool: String
+    let arguments: [String]
+}
+
+private func authorizationCommandParts(
+    _ request: ApprovalRequest,
+    scriptPath: String? = nil
+) -> AuthorizationCommandParts {
+    if let context = request.credentialParent?.gitContext {
+        let registration = context.registration
+        if let plan = registration.operation.remotePlan, let caller = registration.caller {
+            return AuthorizationCommandParts(tool: URL(fileURLWithPath: caller.path).lastPathComponent,
+                arguments: Array(caller.arguments.dropFirst()) + ["[protected HTTPS request]"] + plan.wire)
+        }
+        return AuthorizationCommandParts(tool: "av", arguments: Array(registration.root.arguments.dropFirst()))
+    }
+    let scriptPath = scriptPath ?? resolvedShebangScriptPath(request)
+    var args = request.args
+    if let scriptPath,
+       let scriptIndex = args.firstIndex(where: { standardizedPath($0, cwd: request.cwd) == scriptPath })
+    {
+        args.removeFirst(scriptIndex + 1)
+    }
+    return AuthorizationCommandParts(
+        tool: autoApprovalToolName(request, scriptPath: scriptPath),
+        arguments: args
+    )
+}
+
+private func exactAuthorizationCommand(_ request: ApprovalRequest, scriptPath: String? = nil) -> String {
+    let parts = authorizationCommandParts(request, scriptPath: scriptPath)
+    return prettyShellCommand(target: parts.tool, args: parts.arguments)
+}
+
+private func authorizationHistoryCommand(_ request: ApprovalRequest, scriptPath: String? = nil) -> String {
+    if let peer = request.sshPeer {
+        let tool = pathString(peer.identity)
+        return prettyShellCommand(
+            target: tool,
+            args: redactedAuthorizationArguments(tool: tool, arguments: Array(peer.arguments.dropFirst()))
+        )
+    }
+    let parts = authorizationCommandParts(request, scriptPath: scriptPath)
+    return prettyShellCommand(
+        target: parts.tool,
+        args: redactedAuthorizationArguments(tool: parts.tool, arguments: parts.arguments)
+    )
+}
+
+private func approvalCommandPath(_ request: ApprovalRequest) -> String {
+    if let peer = request.sshPeer { return pathString(peer.identity) }
+    return resolvedShebangScriptPath(request) ?? request.target
+}
+
+private func resolvedShebangScriptPath(_ request: ApprovalRequest) -> String? {
+    guard let script = request.shebangScript else { return nil }
+    let url = script.hasPrefix("/")
+        ? URL(fileURLWithPath: script)
+        : URL(fileURLWithPath: request.cwd).appendingPathComponent(script)
+    return url.standardizedFileURL.path
+}
+
+private enum ScanResult {
+    case success([DetectorFinding], Set<String>?)
+    case failed(Set<String>?)
+}
+
+private func boundedScanDelay(
+    now: TimeInterval,
+    burstStartedAt: inout TimeInterval?,
+    debounceDelay: TimeInterval,
+    maximumDelay: TimeInterval
+) -> TimeInterval {
+    let startedAt = burstStartedAt ?? now
+    burstStartedAt = startedAt
+    return min(debounceDelay, max(0, startedAt + maximumDelay - now))
+}
+
+private func doctorStatusTitle(count: Int) -> String? {
+    guard count > 0 else { return nil }
+    return "\(spelledOut(count)) Doctor \(count == 1 ? "Report" : "Reports")"
+}
+
+private func reblessingStatusTitle(count: Int) -> String? {
+    guard count > 0 else { return nil }
+    return count == 1
+        ? String(localized: "One Blessed Script Needs Reblessing")
+        : String(localized: "\(spelledOut(count)) Blessed Scripts Need Reblessing")
+}
+
+private func setOpenAppMenuImage(on item: NSMenuItem) {
+    let image = NSImage(systemSymbolName: "arrow.up.forward.app", accessibilityDescription: String(localized: "Open Automic Vault"))
+    image?.size = NSSize(width: 16, height: 16)
+    image?.isTemplate = true
+    item.image = image
+    if #available(macOS 27.0, *) {
+        // Use the public property's raw value so builds with the macOS 26 SDK still work.
+        item.setValue(1, forKey: "preferredImageVisibility") // NSMenuItem.ImageVisibility.visible
+    }
+}
+
+private func vulnerabilityStatusTitle(count: Int) -> String {
+    "\(spelledOut(count)) \(count == 1 ? "Vulnerability" : "Vulnerabilities") Detected"
+}
+
+private func spelledOut(_ count: Int) -> String {
+    NumberFormatter.localizedString(from: NSNumber(value: count), number: .spellOut).capitalized
+}
+
+private enum ScanAlertLevel {
+    case medium
+    case high
+
+    var color: NSColor {
+        switch self {
+        case .medium: .systemOrange
+        case .high: .systemRed
+        }
+    }
+}
+
+private func scanResult(detectors: Set<String>?) -> ScanResult {
+    let executableURL = avExecutableURL()
+    let process = Process()
+    process.executableURL = executableURL
+    process.arguments = ["scan", "--json"] + (detectors?.sorted().flatMap {
+        ["--detector", $0]
+    } ?? [])
+
+    let output = Pipe()
+    process.standardOutput = output
+    process.standardError = Pipe()
+
+    do {
+        try process.run()
+    } catch {
+        return .failed(detectors)
+    }
+
+    let data = output.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0,
+          let findings = try? detectorFindings(from: data)
+    else {
+        return .failed(detectors)
+    }
+    return .success(findings, detectors)
+}
+
+private func matchesMediumSeverity(_ severity: String?) -> Bool {
+    switch severity?.lowercased() {
+    case "medium", "mid": true
+    default: false
+    }
+}
+
+private func scanAlertLevel(_ severities: [String]) -> ScanAlertLevel {
+    severities.allSatisfy(matchesMediumSeverity)
+        ? .medium : .high
+}
+
+func avExecutableURL() -> URL {
+    if let bundled = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("av"),
+       FileManager.default.isExecutableFile(atPath: bundled.path)
+    {
+        return bundled
+    }
+    return URL(fileURLWithPath: "/usr/local/bin/av")
+}
+
+private func processArgumentVector(_ pid: pid_t) -> [String]? {
+    var buffer = [CChar](repeating: 0, count: 64 * 1024)
+    let count = av_process_arguments_data(pid, &buffer, buffer.count)
+    guard count > 0,
+          let text = String(bytes: buffer.prefix(count).map { UInt8(bitPattern: $0) }, encoding: .utf8)
+    else { return nil }
+    return text.split(separator: "\0", omittingEmptySubsequences: false).dropLast().map(String.init)
+}
+
+private func sshAgentPeerCWD(_ pid: pid_t) -> String? {
+    var buffer = [CChar](repeating: 0, count: 4096)
+    guard av_process_cwd(pid, &buffer, buffer.count) else { return nil }
+    return String(decoding: buffer.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+}
+
+// An SSH client cannot stand in as its own Launcher. Every ancestor must be the
+// same execution that parented its child, preventing an exec into an allowed app.
+private struct SSHAgentAncestry {
+    let launchers: [LauncherIdentity]
+    let ancestors: [AVProcessIdentity]
+}
+
+// Terminal's root-owned Apple login relay supplies ancestry, never authority.
+private func verifiedOriginalLauncherParent(_ child: AVProcessIdentity, parent: inout AVProcessIdentity) -> Bool {
+    var child = child
+    if av_original_parent_identity(&child, &parent) { return true }
+    var code: SecCode?
+    var requirement: SecRequirement?
+    guard av_original_login_parent_identity(&child, &parent),
+          SecCodeCopyGuestWithAttributes(nil, [kSecGuestAttributePid: child.ppid] as CFDictionary, [], &code) == errSecSuccess,
+          let code,
+          SecRequirementCreateWithString("anchor apple and identifier com.apple.login" as CFString, [], &requirement) == errSecSuccess,
+          let requirement,
+          SecCodeCheckValidity(code, [], requirement) == errSecSuccess
+    else { return false }
+    return true
+}
+
+private func sshAgentAncestry(for identity: AVProcessIdentity) -> SSHAgentAncestry? {
+    var child = identity
+    var ancestors: [AVProcessIdentity] = []
+    var launchers: [LauncherIdentity] = []
+    for _ in 0..<32 {
+        var parent = AVProcessIdentity()
+        guard verifiedOriginalLauncherParent(child, parent: &parent) else {
+            return launchers.isEmpty ? nil : SSHAgentAncestry(launchers: launchers, ancestors: ancestors)
+        }
+        ancestors.append(parent)
+        let candidates = launcherIdentities(pid: parent.pid, identity: parent)
+            .filter { $0.runtimeProtection.allowsSecretGateAccess }
+        launchers.append(contentsOf: candidates)
+        child = parent
+    }
+    return launchers.isEmpty ? nil : SSHAgentAncestry(launchers: launchers, ancestors: ancestors)
+}
+
+/// Retains the kernel socket evidence through Approval and release.
+private final class SSHAgentPeer: Sendable {
+    let socket: FileHandle
+    let identity: AVProcessIdentity
+    let configuration: SSHAgentConfiguration
+    let launchers: [LauncherIdentity]
+    let ancestors: [AVProcessIdentity]
+    let arguments: [String]
+    let cwd: String
+    let helperIdentity: AVProcessIdentity
+
+    // Collecting ancestors for overrides must not expand script-derived authority
+    // beyond the nearest Verified Launcher used by the existing SSH boundary.
+    var scriptAncestors: [AVProcessIdentity] {
+        guard let nearest = launchers.first,
+              let index = ancestors.firstIndex(where: { $0.pid == nearest.pid }) else { return [] }
+        return Array(ancestors.prefix(through: index))
+    }
+
+    init(socket: FileHandle, identity: AVProcessIdentity, configuration: SSHAgentConfiguration,
+         launchers: [LauncherIdentity], ancestors: [AVProcessIdentity], arguments: [String], cwd: String,
+         helperIdentity: AVProcessIdentity) {
+        self.socket = socket
+        self.identity = identity
+        self.configuration = configuration
+        self.launchers = launchers
+        self.ancestors = ancestors
+        self.arguments = arguments
+        self.cwd = cwd
+        self.helperIdentity = helperIdentity
+    }
+
+    func validate() throws {
+        var current = AVProcessIdentity()
+        var helper = AVProcessIdentity()
+        guard av_process_identity(helperIdentity.pid, &helper), sameProcessIdentity(helperIdentity, helper),
+              let signing = liveSigningInfo(pid: helper.pid),
+              signing.mainExecutable == pathString(helperIdentity),
+              signing.identifier == "com.automicvault.av", signing.runtimeProtection == .hardened,
+              av_socket_peer_identity(socket.fileDescriptor, &current),
+              sameProcessIdentity(identity, current), pathString(identity) == pathString(current),
+              processArgumentVector(current.pid) == arguments, sshAgentPeerCWD(current.pid) == cwd,
+              loadSSHAgentConfiguration() == configuration, configuration.enabled,
+              launcherBundleIntegrityError(for: current) == nil
+        else { throw AppError("SSH agent connection or configuration changed") }
+        guard let live = sshAgentAncestry(for: current),
+              ancestors.count == live.ancestors.count,
+              zip(ancestors, live.ancestors).allSatisfy({ sameProcessIdentity($0, $1) }),
+              !launchers.isEmpty, launchers.allSatisfy({ expected in
+            live.launchers.contains { $0.designatedRequirement == expected.designatedRequirement
+                && $0.runtimeProtection == expected.runtimeProtection
+                && $0.verifiedHelper == expected.verifiedHelper }
+        }) else { throw AppError("SSH Verified Launcher changed before signing") }
+    }
+}
+
+private struct ApprovalRequest {
+    let op: String
+    let keys: [String]
+    let target: String
+    let args: [String]
+    let cwd: String
+    let replaceExistingEnv: Bool
+    let allowMissingKeys: Bool
+    let envConflicts: [String]
+    let shebangScript: String?
+    let scriptData: Data?
+    let snapshotIncompatibleInterpreter: String?
+    let tool: String?
+    let title: String?
+    let detail: String?
+    let credentialScope: String?
+    let credentialParent: CredentialHelperParent?
+    let selectedSecretValues: SelectedSecretValues
+    let sshPeer: SSHAgentPeer?
+    // History metadata only; enforcement resolves the gate and classification independently.
+    var temporaryDenialScope: TemporaryLauncherDenialScope?
+    var gateID: String?
+
+    init(
+        op: String,
+        keys: [String],
+        target: String,
+        args: [String],
+        cwd: String,
+        replaceExistingEnv: Bool,
+        allowMissingKeys: Bool,
+        envConflicts: [String],
+        shebangScript: String?,
+        scriptData: Data?,
+        snapshotIncompatibleInterpreter: String? = nil,
+        tool: String?,
+        title: String?,
+        detail: String?,
+        credentialScope: String? = nil,
+        credentialParent: CredentialHelperParent? = nil,
+        selectedSecretValues: SelectedSecretValues = SelectedSecretValues(values: [:]),
+        sshPeer: SSHAgentPeer? = nil,
+        temporaryDenialScope: TemporaryLauncherDenialScope? = nil,
+        gateID: String? = nil
+    ) {
+        self.op = op
+        self.keys = keys
+        self.target = target
+        self.args = args
+        self.cwd = cwd
+        self.replaceExistingEnv = replaceExistingEnv
+        self.allowMissingKeys = allowMissingKeys
+        self.envConflicts = envConflicts
+        self.shebangScript = shebangScript
+        self.scriptData = scriptData
+        self.snapshotIncompatibleInterpreter = snapshotIncompatibleInterpreter
+        self.tool = tool
+        self.title = title
+        self.detail = detail
+        self.credentialScope = credentialScope
+        self.credentialParent = credentialParent
+        self.selectedSecretValues = selectedSecretValues
+        self.sshPeer = sshPeer
+        self.temporaryDenialScope = temporaryDenialScope
+        self.gateID = gateID
+    }
+
+    func selecting(_ values: SelectedSecretValues) -> ApprovalRequest {
+        ApprovalRequest(
+            op: op,
+            keys: keys,
+            target: target,
+            args: args,
+            cwd: cwd,
+            replaceExistingEnv: replaceExistingEnv,
+            allowMissingKeys: allowMissingKeys,
+            envConflicts: envConflicts,
+            shebangScript: shebangScript,
+            scriptData: scriptData,
+            snapshotIncompatibleInterpreter: snapshotIncompatibleInterpreter,
+            tool: tool,
+            title: title,
+            detail: detail,
+            credentialScope: credentialScope,
+            credentialParent: credentialParent,
+            selectedSecretValues: values,
+            sshPeer: sshPeer,
+            temporaryDenialScope: temporaryDenialScope,
+            gateID: gateID
+        )
+    }
+
+    func requesting(keys: [String], title: String, detail: String) -> ApprovalRequest {
+        ApprovalRequest(
+            op: op,
+            keys: keys,
+            target: target,
+            args: args,
+            cwd: cwd,
+            replaceExistingEnv: replaceExistingEnv,
+            allowMissingKeys: allowMissingKeys,
+            envConflicts: envConflicts,
+            shebangScript: shebangScript,
+            scriptData: scriptData,
+            snapshotIncompatibleInterpreter: snapshotIncompatibleInterpreter,
+            tool: tool,
+            title: title,
+            detail: detail,
+            credentialScope: credentialScope,
+            credentialParent: credentialParent,
+            selectedSecretValues: selectedSecretValues,
+            sshPeer: sshPeer,
+            temporaryDenialScope: temporaryDenialScope,
+            gateID: gateID
+        )
+    }
+
+    func decisionReuseRequest(
+        clientIdentity: AVProcessIdentity,
+        callerPath: String,
+        signing: SigningInfo
+    ) -> AuthorizationDecisionReuseRequest {
+        AuthorizationDecisionReuseRequest(
+            client: AuthorizationClientExecution(
+                pid: clientIdentity.pid,
+                pidVersion: clientIdentity.pidversion,
+                startUsec: clientIdentity.start_usec,
+                effectiveUserID: clientIdentity.euid,
+                auditSessionID: clientIdentity.audit_session_id
+            ),
+            callerPath: callerPath,
+            signingIdentifier: signing.identifier,
+            signingTeamIdentifier: signing.teamIdentifier,
+            operation: op,
+            secretNames: keys,
+            target: target,
+            arguments: args,
+            workingDirectory: cwd,
+            replaceExistingEnvironment: replaceExistingEnv,
+            allowMissingSecrets: allowMissingKeys,
+            environmentConflicts: envConflicts,
+            shebangScript: shebangScript,
+            scriptData: scriptData,
+            snapshotIncompatibleInterpreter: snapshotIncompatibleInterpreter,
+            tool: tool,
+            title: title,
+            detail: detail,
+            credentialScope: credentialScope,
+            credentialParent: credentialParent.map {
+                AuthorizationCredentialHelperParent(
+                    pid: $0.pid,
+                    startUsec: $0.startUsec,
+                    effectiveUserID: $0.euid,
+                    target: $0.target,
+                    arguments: $0.arguments
+                )
+            },
+            selectedSecretValues: selectedSecretValues,
+            // The SSH helper is shared by unrelated clients and Launchers. Even
+            // denial reuse would quarantine every client using that helper.
+            policy: op == "ssh-sign" || credentialParent?.gitContext != nil ? .disabled
+                : op == "inject-fd" || awsRequestMayUseLongLivedCredentials(self)
+                    ? .freshApprovalRequired : .reusable
+        )
+    }
+}
+
+enum SecretMutation {
+    case save(
+        account: String,
+        value: String,
+        accessibility: StoredSecretAccessibility,
+        warning: String = ""
+    )
+    case saveProject(
+        account: String,
+        value: String,
+        directory: String,
+        accessibility: StoredSecretAccessibility,
+        warning: String
+    )
+    case saveIfAbsentOrEqual(account: String, value: String, warning: String = "")
+    case delete(account: String)
+    case dockerSave(account: String, value: String, serverURL: String, username: String)
+    case dockerDelete(account: String, serverURL: String)
+    case podmanSave(account: String, value: String, serverURL: String, username: String)
+    case podmanDelete(account: String, serverURL: String)
+    case goatSave(account: String, value: String, scope: String)
+    case goatDelete(account: String, scope: String)
+    case ordercliSave(account: String, value: String, scope: String)
+    case ordercliDelete(account: String, scope: String)
+    case openhueSave(account: String, value: String, scope: String)
+    case plumberSave(account: String, value: String, scope: String)
+    case uaaSave(account: String, value: String, scope: String)
+    case uaaDelete(account: String, scope: String)
+    case railwaySave(account: String, value: String, scope: String)
+    case railwayDelete(account: String, scope: String)
+    case oxideSave(account: String, value: String, scope: String)
+    case oxideDelete(account: String, scope: String)
+    case fastlySave(account: String, value: String, scope: String)
+    case fastlyDelete(account: String, scope: String)
+    case sqlcmdSave(account: String, value: String, scope: String)
+    case sqlcmdDelete(account: String, scope: String)
+    case terraformSave(account: String, value: String, hostname: String)
+    case terraformDelete(account: String, hostname: String)
+    case deleteValue(account: String, source: StoredSecretValueSource)
+    case rename(account: String, newAccount: String)
+    case setAccessibility(account: String, accessibility: StoredSecretAccessibility)
+
+    fileprivate var usesCompactApproval: Bool {
+        switch self {
+        case .save, .saveProject, .saveIfAbsentOrEqual: true
+        default: false
+        }
+    }
+
+    fileprivate func approvalRequest(callerPath: String, requestCWD: String = "") -> ApprovalRequest {
+        let properties: (op: String, keys: [String], args: [String], title: String, detail: String)
+        switch self {
+        case .save(let account, _, _, let warning):
+            properties = (
+                "save", [account], ["save", account], "Add or modify \(account)?",
+                "This will create or replace a Global Value in Automic Vault."
+                    + (warning.isEmpty ? "" : " \(warning)")
+            )
+        case .saveProject(let account, _, let directory, _, let warning):
+            properties = (
+                "save", [account], ["save", "--project-directory=\(escapedSecurityPath(directory))", account],
+                "Add or modify \(account) Project Value?", warning
+            )
+        case .saveIfAbsentOrEqual(let account, _, let warning):
+            properties = (
+                "save-if-absent", [account], ["save-if-absent", account], "Add \(account)?",
+                "This will create the Global Value only if no differing value already exists."
+                    + (warning.isEmpty ? "" : " \(warning)")
+            )
+        case .delete(let account):
+            properties = (
+                "delete", [account], ["delete", account], "Delete \(account)?",
+                "This will remove the secret from Automic Vault."
+            )
+        case .dockerSave(let account, _, let serverURL, let username):
+            properties = (
+                "docker-save", [account], ["credential", "store", serverURL],
+                "Store Docker credential for \(serverURL)?",
+                "Docker will use the \(username) credential for this registry through its Automic Vault Secret Gate."
+            )
+        case .dockerDelete(let account, let serverURL):
+            properties = (
+                "docker-delete", [account], ["credential", "erase", serverURL],
+                "Delete Docker credential for \(serverURL)?",
+                "Docker will no longer be able to authenticate to this registry with the stored credential."
+            )
+        case .podmanSave(let account, _, let serverURL, let username):
+            properties = (
+                "docker-save", [account], ["credential", "store", serverURL],
+                "Store Podman credential for \(serverURL)?",
+                "Podman will use the \(username) credential for this registry through its Automic Vault Secret Gate."
+            )
+        case .podmanDelete(let account, let serverURL):
+            properties = (
+                "docker-delete", [account], ["credential", "erase", serverURL],
+                "Delete Podman credential for \(serverURL)?",
+                "Podman will no longer be able to authenticate to this registry with the stored credential."
+            )
+        case .goatSave(let account, _, let scope):
+            properties = (
+                "goat-save", [account], ["credential", "store", scope],
+                "Store goat auth session?",
+                "goat will use this password session through its Automic Vault Secret Gate."
+            )
+        case .goatDelete(let account, let scope):
+            properties = (
+                "goat-delete", [account], ["credential", "forget", scope],
+                "Delete goat auth session?",
+                "goat will no longer be able to authenticate with this session."
+            )
+        case .ordercliSave(let account, _, let scope):
+            properties = (
+                "ordercli-save", [account], ["credential", "store", scope],
+                "Store ordercli session?",
+                "ordercli will use this Foodora session through its Automic Vault Secret Gate."
+            )
+        case .ordercliDelete(let account, let scope):
+            properties = (
+                "ordercli-delete", [account], ["credential", "forget", scope],
+                "Delete ordercli session?",
+                "ordercli will no longer be able to authenticate to Foodora with this session."
+            )
+        case .openhueSave(let account, _, let scope):
+            properties = (
+                "openhue-save", [account], ["credential", "store", scope],
+                "Store Hue application key?",
+                "OpenHue CLI will use this bridge credential through its Automic Vault Secret Gate."
+            )
+        case .plumberSave(let account, _, let scope):
+            properties = (
+                "plumber-save", [account], ["credential", "store", scope],
+                "Store Plumber local config?",
+                "Plumber will use this config through its Automic Vault Secret Gate."
+            )
+        case .uaaSave(let account, _, let scope):
+            properties = (
+                "uaa-save", [account], ["credential", "store", scope],
+                "Store UAA OAuth contexts?",
+                "UAA CLI will use these OAuth tokens through its Automic Vault Secret Gate."
+            )
+        case .uaaDelete(let account, let scope):
+            properties = (
+                "uaa-delete", [account], ["credential", "forget", scope],
+                "Delete UAA OAuth contexts?",
+                "UAA CLI will no longer be able to authenticate with these stored contexts."
+            )
+        case .railwaySave(let account, _, let scope):
+            properties = (
+                "railway-save", [account], ["credential", "store", scope],
+                "Store Railway credential?",
+                "Railway CLI will use this credential through its Automic Vault Secret Gate."
+            )
+        case .railwayDelete(let account, let scope):
+            properties = (
+                "railway-delete", [account], ["credential", "forget", scope],
+                "Delete Railway credential?",
+                "Railway CLI will no longer be able to authenticate in this environment."
+            )
+        case .oxideSave(let account, _, let scope):
+            properties = (
+                "oxide-save", [account], ["credential", "store", scope],
+                "Store Oxide credential?",
+                "Oxide CLI will use this profile token through its Automic Vault Secret Gate."
+            )
+        case .oxideDelete(let account, let scope):
+            properties = (
+                "oxide-delete", [account], ["credential", "forget", scope],
+                "Delete Oxide credential?",
+                "Oxide CLI will no longer be able to authenticate with this profile."
+            )
+        case .fastlySave(let account, _, let scope):
+            properties = (
+                "fastly-save", [account], ["credential", "store", scope],
+                "Store Fastly API token?",
+                "Fastly CLI will use this named token through its Automic Vault Secret Gate."
+            )
+        case .fastlyDelete(let account, let scope):
+            properties = (
+                "fastly-delete", [account], ["credential", "forget", scope],
+                "Delete Fastly API token?",
+                "Fastly CLI will no longer be able to authenticate with this named token."
+            )
+        case .sqlcmdSave(let account, _, let scope):
+            properties = (
+                "sqlcmd-save", [account], ["credential", "store", scope],
+                "Store sqlcmd password?",
+                "sqlcmd will use this user profile through its Automic Vault Secret Gate."
+            )
+        case .sqlcmdDelete(let account, let scope):
+            properties = (
+                "sqlcmd-delete", [account], ["credential", "forget", scope],
+                "Delete sqlcmd password?",
+                "sqlcmd will no longer be able to authenticate with this user profile."
+            )
+        case .terraformSave(let account, _, let hostname):
+            properties = (
+                "terraform-save", [account], ["credential", "store", hostname],
+                "Store Terraform/OpenTofu credential for \(hostname)?",
+                "Terraform and OpenTofu will use this token through their Automic Vault Secret Gates."
+            )
+        case .terraformDelete(let account, let hostname):
+            properties = (
+                "terraform-delete", [account], ["credential", "forget", hostname],
+                "Delete Terraform/OpenTofu credential for \(hostname)?",
+                "Terraform and OpenTofu will no longer be able to authenticate to this host with the stored credential."
+            )
+        case .deleteValue(let account, let source):
+            properties = (
+                "delete", [account], ["delete", account, escapedSecurityPath(source.displayName)],
+                "Delete \(account) Value?", "This will remove the selected Secret Value."
+            )
+        case .rename(let account, let newAccount):
+            properties = (
+                "rename", [account, newAccount], ["rename", account, newAccount],
+                "Rename \(account)?", "This will rename the secret to \(newAccount)."
+            )
+        case .setAccessibility(let account, let accessibility):
+            let protection = accessibility.isAvailableWhileLocked ? "after-first-unlock" : "when-unlocked"
+            properties = (
+                "set-accessibility", [account], ["set-accessibility", account, protection],
+                "Change protection for \(account)?",
+                accessibility.isAvailableWhileLocked
+                    ? "This will make the secret available after the first unlock following a restart."
+                    : "This will restrict the secret to use while your Mac is unlocked."
+            )
+        }
+        let tool = switch self {
+        case .dockerSave, .dockerDelete: "docker"
+        case .podmanSave, .podmanDelete: "podman"
+        case .goatSave, .goatDelete: "goat"
+        case .ordercliSave, .ordercliDelete: "ordercli"
+        case .openhueSave: "openhue-cli"
+        case .plumberSave: "plumber"
+        case .uaaSave, .uaaDelete: "uaa-cli"
+        case .railwaySave, .railwayDelete: "railway"
+        case .oxideSave, .oxideDelete: "oxide-cli"
+        case .fastlySave, .fastlyDelete: "fastly-cli"
+        case .sqlcmdSave, .sqlcmdDelete: "sqlcmd"
+        case .terraformSave, .terraformDelete: "terraform"
+        default: URL(fileURLWithPath: callerPath).lastPathComponent
+        }
+        let cwd: String
+        let selectedSecretValues: SelectedSecretValues
+        let credentialScope: String?
+        switch self {
+        case .saveProject(let account, _, let directory, let accessibility, _):
+            cwd = directory
+            selectedSecretValues = SelectedSecretValues(values: [account: StoredSecretValue(
+                source: .projectDirectory(directory),
+                keychainAccount: storedSecretKeychainAccount(
+                    secretName: account,
+                    source: .projectDirectory(directory)
+                ),
+                accessibility: accessibility,
+                keychainProperties: []
+            )])
+            credentialScope = nil
+        case .dockerSave(_, _, let serverURL, _), .dockerDelete(_, let serverURL),
+             .podmanSave(_, _, let serverURL, _), .podmanDelete(_, let serverURL):
+            cwd = requestCWD
+            selectedSecretValues = SelectedSecretValues(values: [:])
+            credentialScope = serverURL
+        case .goatSave(_, _, let scope), .goatDelete(_, let scope):
+            cwd = ""
+            selectedSecretValues = SelectedSecretValues(values: [:])
+            credentialScope = scope
+        case .ordercliSave(_, _, let scope), .ordercliDelete(_, let scope):
+            cwd = ""
+            selectedSecretValues = SelectedSecretValues(values: [:])
+            credentialScope = scope
+        case .openhueSave(_, _, let scope):
+            cwd = ""
+            selectedSecretValues = SelectedSecretValues(values: [:])
+            credentialScope = scope
+        case .plumberSave(_, _, let scope):
+            cwd = ""
+            selectedSecretValues = SelectedSecretValues(values: [:])
+            credentialScope = scope
+        case .uaaSave(_, _, let scope), .uaaDelete(_, let scope):
+            cwd = ""
+            selectedSecretValues = SelectedSecretValues(values: [:])
+            credentialScope = scope
+        case .railwaySave(_, _, let scope), .railwayDelete(_, let scope):
+            cwd = ""
+            selectedSecretValues = SelectedSecretValues(values: [:])
+            credentialScope = scope
+        case .oxideSave(_, _, let scope), .oxideDelete(_, let scope):
+            cwd = ""
+            selectedSecretValues = SelectedSecretValues(values: [:])
+            credentialScope = scope
+        case .fastlySave(_, _, let scope), .fastlyDelete(_, let scope):
+            cwd = ""
+            selectedSecretValues = SelectedSecretValues(values: [:])
+            credentialScope = scope
+        case .sqlcmdSave(_, _, let scope), .sqlcmdDelete(_, let scope):
+            cwd = ""
+            selectedSecretValues = SelectedSecretValues(values: [:])
+            credentialScope = scope
+        case .terraformSave(_, _, let hostname), .terraformDelete(_, let hostname):
+            cwd = requestCWD
+            selectedSecretValues = SelectedSecretValues(values: [:])
+            credentialScope = hostname
+        default:
+            cwd = requestCWD
+            selectedSecretValues = SelectedSecretValues(values: [:])
+            credentialScope = nil
+        }
+        return ApprovalRequest(
+            op: properties.op,
+            keys: properties.keys,
+            target: callerPath,
+            args: properties.args,
+            cwd: cwd,
+            replaceExistingEnv: false,
+            allowMissingKeys: false,
+            envConflicts: [],
+            shebangScript: nil,
+            scriptData: nil,
+            tool: tool,
+            title: properties.title,
+            detail: properties.detail,
+            credentialScope: credentialScope,
+            selectedSecretValues: selectedSecretValues
+        )
+    }
+
+    fileprivate func perform() -> OSStatus {
+        guard let pendingNames = pendingSecretMutationNames() else { return errSecDecode }
+        if !pendingNames.isEmpty {
+            let repairStatus = resumePendingSecretMutation()
+            return repairStatus == errSecSuccess ? errSecNotAvailable : repairStatus
+        }
+        switch self {
+        case .save(let account, let value, let accessibility, _):
+            let secrets: [StoredSecret]
+            switch loadStoredSecretsResult() {
+            case .success(let loaded): secrets = loaded
+            case .failure(let status): return status
+            }
+            let existing = secrets.first { $0.account == account }
+            guard existing?.hasConsistentAccessibility != false else { return errSecDecode }
+            return saveStoredSecret(
+                account: account,
+                value: value,
+                accessibility: existing?.accessibility ?? accessibility
+            )
+        case .saveProject(let account, let value, let directory, let accessibility, _):
+            guard (try? validateCanonicalProjectDirectory(directory)) != nil else { return errSecParam }
+            let secrets: [StoredSecret]
+            switch loadStoredSecretsResult() {
+            case .success(let loaded): secrets = loaded
+            case .failure(let status): return status
+            }
+            let existing = secrets.first { $0.account == account }
+            guard existing?.hasConsistentAccessibility != false else { return errSecDecode }
+            return saveStoredSecret(
+                account: account,
+                value: value,
+                accessibility: existing?.accessibility ?? accessibility,
+                source: .projectDirectory(directory)
+            )
+        case .saveIfAbsentOrEqual(let account, let value, _):
+            return saveStoredSecretIfAbsentOrEqual(account: account, value: value)
+        case .delete(let account):
+            return deleteStoredSecretRevokingDirectAccess(account: account)
+        case .dockerSave(let account, let value, _, _):
+            return saveStoredSecret(account: account, value: value, accessibility: .whenUnlocked)
+        case .dockerDelete(let account, _):
+            return deleteStoredSecretRevokingDirectAccess(account: account)
+        case .podmanSave(let account, let value, _, _):
+            return saveStoredSecret(account: account, value: value, accessibility: .whenUnlocked)
+        case .podmanDelete(let account, _):
+            return deleteStoredSecretRevokingDirectAccess(account: account)
+        case .goatSave(let account, let value, _):
+            return saveStoredSecret(account: account, value: value, accessibility: .whenUnlocked)
+        case .goatDelete(let account, _):
+            return deleteStoredSecretRevokingDirectAccess(account: account)
+        case .ordercliSave(let account, let value, _):
+            return saveStoredSecret(account: account, value: value, accessibility: .whenUnlocked)
+        case .ordercliDelete(let account, _):
+            return deleteStoredSecretRevokingDirectAccess(account: account)
+        case .openhueSave(let account, let value, _):
+            return saveStoredSecret(account: account, value: value, accessibility: .whenUnlocked)
+        case .plumberSave(let account, let value, _):
+            return saveStoredSecret(account: account, value: value, accessibility: .whenUnlocked)
+        case .uaaSave(let account, let value, _):
+            return saveStoredSecret(account: account, value: value, accessibility: .whenUnlocked)
+        case .uaaDelete(let account, _):
+            return deleteStoredSecretRevokingDirectAccess(account: account)
+        case .railwaySave(let account, let value, _):
+            return saveStoredSecret(account: account, value: value, accessibility: .whenUnlocked)
+        case .railwayDelete(let account, _):
+            return deleteStoredSecretRevokingDirectAccess(account: account)
+        case .oxideSave(let account, let value, _):
+            return saveStoredSecret(account: account, value: value, accessibility: .whenUnlocked)
+        case .oxideDelete(let account, _):
+            return deleteStoredSecretRevokingDirectAccess(account: account)
+        case .fastlySave(let account, let value, _):
+            return saveStoredSecret(account: account, value: value, accessibility: .whenUnlocked)
+        case .fastlyDelete(let account, _):
+            return deleteStoredSecretRevokingDirectAccess(account: account)
+        case .sqlcmdSave(let account, let value, _):
+            return saveStoredSecret(account: account, value: value, accessibility: .whenUnlocked)
+        case .sqlcmdDelete(let account, _):
+            return deleteStoredSecretRevokingDirectAccess(account: account)
+        case .terraformSave(let account, let value, _):
+            return saveStoredSecret(account: account, value: value, accessibility: .whenUnlocked)
+        case .terraformDelete(let account, _):
+            return deleteStoredSecretRevokingDirectAccess(account: account)
+        case .deleteValue(let account, let source):
+            return deleteStoredSecretValueRevokingDirectAccessIfLast(
+                secretName: account,
+                source: source
+            )
+        case .rename(let account, let newAccount):
+            return renameStoredSecretRevokingDirectAccess(account: account, to: newAccount)
+        case .setAccessibility(let account, let accessibility):
+            return setStoredSecretAccessibility(account: account, accessibility: accessibility)
+        }
+    }
+}
+
+private struct LauncherDenialError: LocalizedError {
+    let reason: String
+    let launcher: LauncherIdentity?
+    var errorDescription: String? { reason }
+}
+
+private func evaluateLauncherDenial(
+    gate: SecretGate?, classification: SecretGateRequestClassification, launchers: [LauncherIdentity]
+) -> LauncherDenialError? {
+    if let gate, let launcher = launchers.first(where: {
+        TemporaryLauncherDenials.shared.isDenied($0.designatedRequirement, gate: gate, classification: classification)
+    }) { return LauncherDenialError(reason: "Denied by two-minute Temporary Launcher Denial", launcher: launcher) }
+    // Direct Secret requests have no tool-gate policy. A failed read of an
+    // existing gate remains a denial, as enforced by secretGateDenial.
+    guard let gate, let denial = secretGateDenial(
+        gate: gate, classification: classification, launcherRequirements: launchers.map(\.designatedRequirement),
+        defaultPolicyLauncherRequirements: gate.isSSHAgentGate
+            ? launchers.filter { $0.pid == launchers.first?.pid }.map(\.designatedRequirement) : nil
+    ) else { return nil }
+    return LauncherDenialError(reason: denial.reason,
+        launcher: launchers.first { $0.designatedRequirement == denial.launcherRequirement })
+}
+
+private enum ApprovalDecision: Equatable {
+    case canceled
+    case interrupted
+    case denied
+    case approved
+    case alwaysApproved
+    case temporaryWriteAccess
+    case reevaluated
+    case rebless
+}
+
+private extension ApprovalDecision {
+    var reuseOutcome: AuthorizationDecisionReuseOutcome {
+        switch self {
+        case .canceled: .canceled
+        case .interrupted: .interrupted
+        case .denied: .denied
+        case .approved: .approved
+        case .alwaysApproved: .alwaysApproved
+        case .temporaryWriteAccess: .temporaryAccessGrant
+        case .reevaluated, .rebless:
+            preconditionFailure("Nonterminal decisions must not be stored into reuse cache")
+        }
+    }
+}
+
+private func terminalApprovalDecision(
+    _ decision: ApprovalDecision,
+    cancellation: ApprovalCancellation?
+) -> ApprovalDecision {
+    guard cancellation?.isCanceled != true else { return .canceled }
+    return decision == .canceled ? .interrupted : decision
+}
+
+private func canceledAccessRequestRecord(
+    request: ApprovalRequest,
+    callerPath: String,
+    launcher: LauncherIdentity?,
+    launchers: [LauncherIdentity]
+) -> AccessRequestRecord {
+    accessRequestRecord(
+        request: request,
+        callerPath: callerPath,
+        decision: "Canceled",
+        approvalSource: "Manual",
+        reason: "Gate client exited",
+        launcher: denialActionLauncher(displayedLauncher: launcher, attributedLaunchers: launchers) ?? launcher
+    )
+}
+
+private func interruptedAccessRequestRecord(
+    request: ApprovalRequest,
+    callerPath: String,
+    launcher: LauncherIdentity?,
+    launchers: [LauncherIdentity]
+) -> AccessRequestRecord {
+    accessRequestRecord(
+        request: request,
+        callerPath: callerPath,
+        decision: "Failed",
+        approvalSource: "Auto",
+        reason: "Approval presentation interrupted",
+        launcher: denialActionLauncher(displayedLauncher: launcher, attributedLaunchers: launchers) ?? launcher
+    )
+}
+
+@MainActor
+private func performApprovedSecretMutation(
+    _ mutation: SecretMutation,
+    callerPath: String,
+    pid: pid_t,
+    signing: SigningInfo,
+    launcher: LauncherIdentity?,
+    launchers: [LauncherIdentity] = [],
+    launcherFallbackPath: String,
+    canRequestHumanApproval: () -> Bool,
+    onAccessRequest: (AccessRequestRecord) -> Bool,
+    cancellation: ApprovalCancellation? = nil,
+    decision: ((ApprovalRequest) -> ApprovalDecision)? = nil,
+    perform: ((SecretMutation) -> OSStatus)? = nil,
+    preflight: (() -> String?)? = nil,
+    requestOverride: ApprovalRequest? = nil
+) async -> (status: OSStatus?, error: String?) {
+    let request = requestOverride ?? mutation.approvalRequest(callerPath: callerPath)
+    if cancellation?.isCanceled == true {
+        _ = onAccessRequest(canceledAccessRequestRecord(
+            request: request, callerPath: callerPath, launcher: launcher, launchers: launchers
+        ))
+        return (nil, "secret mutation canceled")
+    }
+    guard canRequestHumanApproval() else {
+        _ = onAccessRequest(accessRequestRecord(
+            request: request,
+            callerPath: callerPath,
+            decision: "Denied",
+            approvalSource: "Auto",
+            reason: "User session is inactive",
+            launcher: launcher
+        ))
+        return (nil, "secret mutation denied while user session is inactive")
+    }
+
+    let approval = if let decision {
+        decision(request)
+    } else {
+        await showApprovalAlert(
+            request: request,
+            callerPath: callerPath,
+            pid: pid,
+            signing: signing,
+            scriptApproval: nil,
+            launcher: launcher,
+            denialLaunchers: launchers,
+            launcherFallbackPath: launcherFallbackPath,
+            automaticApprovalExplanation: nil,
+            cancellation: cancellation,
+            compact: mutation.usesCompactApproval
+        )
+    }
+    if approval == .interrupted {
+        _ = onAccessRequest(interruptedAccessRequestRecord(
+            request: request, callerPath: callerPath, launcher: launcher, launchers: launchers
+        ))
+        return (nil, "approval presentation interrupted")
+    }
+    guard approval == .approved else {
+        let canceled = approval == .canceled
+        _ = onAccessRequest(accessRequestRecord(
+            request: request,
+            callerPath: callerPath,
+            decision: canceled ? "Canceled" : "Denied",
+            approvalSource: "Manual",
+            reason: canceled ? "Gate client exited" : "Denied in prompt",
+            launcher: canceled ? (denialActionLauncher(displayedLauncher: launcher, attributedLaunchers: launchers) ?? launcher) : launcher
+        ))
+        return (nil, canceled ? "secret mutation canceled" : "secret mutation denied")
+    }
+    if let error = preflight?() {
+        _ = onAccessRequest(accessRequestRecord(
+            request: request,
+            callerPath: callerPath,
+            decision: "Failed",
+            approvalSource: "Manual",
+            reason: error,
+            launcher: launcher
+        ))
+        return (nil, error)
+    }
+    guard onAccessRequest(accessRequestRecord(
+        request: request,
+        callerPath: callerPath,
+        decision: "Approved",
+        approvalSource: "Manual",
+        reason: "Approved in prompt",
+        launcher: launcher
+    )) else {
+        return (nil, "Authorization History is unavailable")
+    }
+    return (perform?(mutation) ?? mutation.perform(), nil)
+}
+
+@MainActor
+func performInAppSecretMutation(
+    _ mutation: SecretMutation
+) -> (status: OSStatus?, error: String?) {
+    (mutation.perform(), nil)
+}
+
+private let humanApprovalRequiredEvent = "human-approval-required"
+
+private func blessingReply(
+    for outcome: BlessedScriptReviewOutcome
+) -> (ok: Bool, error: String?, humanApprovalDecision: String?) {
+    switch outcome {
+    case .approved: (true, nil, "approved")
+    case .denied: (false, "script blessing denied", "denied")
+    case .failed(let error): (false, error, nil)
+    }
+}
+
+private func approvalEvent(
+    for cachedDecision: ApprovalDecision?,
+    humanApprovalAvailable: Bool = true
+) -> String? {
+    humanApprovalAvailable && cachedDecision == nil ? humanApprovalRequiredEvent : nil
+}
+
+private func approvalDecision(
+    for reusedOutcome: AuthorizationDecisionReuseOutcome?
+) -> ApprovalDecision? {
+    switch reusedOutcome {
+    case .denied: .denied
+    case .approved, .alwaysApproved: .approved
+    case nil: nil
+    case .canceled, .interrupted, .temporaryAccessGrant:
+        preconditionFailure("the decision reuse cache returned a non-reusable outcome")
+    }
+}
+
+final class ApprovalCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var canceled = false
+    let historyTransfer = AuthorizationHistoryTransfer()
+    private var observers: [UUID: @MainActor @Sendable () -> Void] = [:]
+
+    var isCanceled: Bool {
+        lock.withLock { canceled }
+    }
+
+    func cancel() {
+        let list: [@MainActor @Sendable () -> Void] = lock.withLock {
+            guard !canceled else { return [] }
+            canceled = true
+            historyTransfer.cancel()
+            let items = Array(self.observers.values)
+            self.observers.removeAll()
+            return items
+        }
+        if !list.isEmpty {
+            Task { @MainActor in
+                for item in list {
+                    item()
+                }
+            }
+        }
+    }
+
+    @discardableResult
+    func observe(id: UUID = UUID(), _ observer: @escaping @MainActor @Sendable () -> Void) -> Bool {
+        lock.withLock {
+            guard !canceled else { return false }
+            observers[id] = observer
+            return true
+        }
+    }
+
+    func stopObserving(id: UUID? = nil) {
+        lock.withLock {
+            if let id {
+                observers.removeValue(forKey: id)
+            } else {
+                observers.removeAll()
+            }
+        }
+    }
+}
+
+
+private func isApprovalCancellationEvent(_ event: xpc_object_t) -> Bool {
+    xpc_equal(event, XPC_ERROR_CONNECTION_INTERRUPTED)
+        || xpc_equal(event, XPC_ERROR_CONNECTION_INVALID)
+}
+
+private func missingRequiredSecret(
+    for request: ApprovalRequest,
+    exists: ((String) -> Bool)? = nil
+) -> String? {
+    guard !request.allowMissingKeys else { return nil }
+    let conflicts = Set(request.envConflicts)
+    return request.keys.first {
+        (request.replaceExistingEnv || !conflicts.contains($0))
+            && !(exists?($0) ?? request.selectedSecretValues.contains($0))
+    }
+}
+
+private enum RetainedAuthorizationGate: Hashable {
+    case blessing(path: String, checksum: String)
+    case directSecret
+    case secretGate(String)
+}
+
+private struct RetainedProcessExecution: Hashable, Sendable {
+    let pid: Int32
+    let pidVersion: Int32
+    let startUsec: UInt64
+    let effectiveUserID: UInt32
+    let auditSessionID: UInt32
+    let codeIdentity: Data
+}
+
+private struct ApprovalProcessExecution: Sendable {
+    let pid: Int32
+    let pidVersion: Int32?
+    let startUsec: UInt64
+    let effectiveUserID: UInt32
+    let auditSessionID: UInt32?
+    let codeIdentity: Data
+}
+
+private struct LiveSecretUseProcess: Hashable, Sendable {
+    let pid: Int32
+    let startUsec: UInt64
+    let effectiveUserID: UInt32
+    let auditSessionID: UInt32
+}
+
+private struct RetainedProcessChainNode {
+    let pid: Int32
+    let path: String
+    let execution: RetainedProcessExecution?
+}
+
+private struct RetainedProcessProvenanceMatch {
+    let launcher: LauncherIdentity
+    let processPath: String
+    let execution: RetainedProcessExecution
+}
+
+private struct RetainedProcessProvenanceStore {
+    private var records: [RetainedAuthorizationGate: [RetainedProcessExecution: LauncherIdentity]] = [:]
+
+    mutating func remember(
+        _ executions: [RetainedProcessExecution],
+        at gate: RetainedAuthorizationGate,
+        launcher: LauncherIdentity,
+        isLive: (RetainedProcessExecution) -> Bool = retainedProcessExecutionIsLive
+    ) {
+        prune(isLive: isLive)
+        guard !executions.isEmpty else { return }
+        for execution in executions
+            where execution.effectiveUserID == geteuid() && isLive(execution)
+        {
+            records[gate, default: [:]][execution] = launcher
+        }
+    }
+
+    mutating func match(
+        at gate: RetainedAuthorizationGate,
+        in chains: [[RetainedProcessChainNode]],
+        isLive: (RetainedProcessExecution) -> Bool = retainedProcessExecutionIsLive
+    ) -> RetainedProcessProvenanceMatch? {
+        prune(isLive: isLive)
+        guard let gateRecords = records[gate] else { return nil }
+        for node in chains.joined() {
+            guard let execution = node.execution,
+                  let launcher = gateRecords[execution]
+            else { continue }
+            return RetainedProcessProvenanceMatch(
+                launcher: launcher,
+                processPath: node.path,
+                execution: execution
+            )
+        }
+        return nil
+    }
+
+    private mutating func prune(isLive: (RetainedProcessExecution) -> Bool) {
+        records = records.compactMapValues { gateRecords in
+            let live = gateRecords.filter { isLive($0.key) }
+            return live.isEmpty ? nil : live
+        }
+    }
+}
+
+private struct SigningInfo {
+    let identifier: String
+    let teamIdentifier: String
+}
+
+private struct MutationCaller {
+    let pid: pid_t
+    let identity: AVProcessIdentity
+    let path: String
+    let signing: SigningInfo
+}
+
+struct LauncherIdentity: Sendable {
+    let pid: pid_t
+    let path: String
+    let identifier: String
+    let teamIdentifier: String
+    let designatedRequirement: String
+    let runtimeProtection: LauncherRuntimeProtection
+    let isStandalone: Bool
+    let appURL: URL?
+    // Attached only after complete helper verification; never supplied by a Gate Client.
+    let verifiedHelper: VerifiedLauncherHelper?
+
+    init(
+        pid: pid_t,
+        path: String,
+        identifier: String,
+        teamIdentifier: String,
+        designatedRequirement: String,
+        runtimeProtection: LauncherRuntimeProtection,
+        isStandalone: Bool = false,
+        appURL: URL? = nil,
+        verifiedHelper: VerifiedLauncherHelper? = nil
+    ) {
+        self.pid = pid
+        self.path = path
+        self.identifier = identifier
+        self.teamIdentifier = teamIdentifier
+        self.designatedRequirement = designatedRequirement
+        self.runtimeProtection = runtimeProtection
+        self.isStandalone = isStandalone
+        self.appURL = appURL
+        self.verifiedHelper = verifiedHelper
+    }
+}
+
+private struct TemporaryAccessGrantCandidate {
+    let scope: TemporaryAccessGrantScope
+    let launcher: LauncherIdentity
+    let launcherName: String
+    let authorizationGateName: String
+}
+
+private func agentTaskContext(pid: pid_t) -> AgentTaskContext? {
+    var environment: [String: String] = [:]
+    for provider in AgentProvider.allCases {
+        var value = [CChar](repeating: 0, count: 64)
+        guard av_process_environment_value(
+            pid,
+            provider.environmentVariable,
+            &value,
+            value.count
+        ) else { continue }
+        environment[provider.environmentVariable] = String(
+            decoding: value.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) },
+            as: UTF8.self
+        )
+    }
+    return AgentTaskContext(environment: environment)
+}
+
+// Resolve task context only after ordinary Gate Client and gate verification.
+private func agentTaskContext(
+    for request: ApprovalRequest,
+    identity: AVProcessIdentity,
+    gateID: String?,
+    callerPath: String,
+    signing: SigningInfo,
+    message: xpc_object_t
+) -> AgentTaskContext? {
+    var current = AVProcessIdentity()
+    guard request.sshPeer == nil,
+          av_process_identity(identity.pid, &current), sameProcessIdentity(identity, current),
+          pathString(identity) == pathString(current)
+    else { return nil }
+    guard gateID == "brew", request.op == "authorize", request.tool == "brew",
+          request.keys.isEmpty, isTrustedBrewStubCaller(path: callerPath, signing: signing)
+    else { return agentTaskContext(pid: identity.pid) }
+
+    // macOS withholds the setuid stub's environment. Its signed, single-request
+    // Gate Client supplies only this forgeable narrowing label (ADR 0045).
+    var environment: [String: String] = [:]
+    for provider in AgentProvider.allCases {
+        let field = "brew_\(provider.environmentVariable)"
+        guard let value = xpc_dictionary_get_value(message, field) else { continue }
+        guard xpc_get_type(value) == XPC_TYPE_STRING,
+              xpc_string_get_length(value) == 36,
+              let pointer = xpc_string_get_string_ptr(value),
+              let string = String(validatingCString: pointer)
+        else { return nil }
+        environment[provider.environmentVariable] = string
+    }
+    return AgentTaskContext(environment: environment)
+}
+
+private func brewAgentTaskContextSelfCheck() -> Bool {
+    // No readable task environment: exercise the transported context with a live peer.
+    let process = Process()
+    guard let executable = Bundle.main.executableURL else { return false }
+    process.executableURL = executable
+    process.arguments = ["--self-check-sleep"]
+    process.environment = [:]
+    do { try process.run() } catch { return false }
+    defer {
+        if process.isRunning { process.terminate() }
+        process.waitUntilExit()
+    }
+    var identity = AVProcessIdentity()
+    guard av_process_identity(process.processIdentifier, &identity) else { return false }
+    let message = xpc_dictionary_create_empty()
+    let uuid = "11111111-2222-3333-4444-555555555555"
+    uuid.withCString { xpc_dictionary_set_string(message, "brew_CODEX_THREAD_ID", $0) }
+    let request = ApprovalRequest(
+        op: "authorize", keys: [], target: "/opt/homebrew/bin/brew",
+        args: ["install", "--formula", "tree"], cwd: "/tmp",
+        replaceExistingEnv: false, allowMissingKeys: false, envConflicts: [],
+        shebangScript: nil, scriptData: nil, tool: "brew", title: nil, detail: nil
+    )
+    func context(
+        gateID: String? = "brew",
+        callerPath: String = "/usr/local/bin/brew",
+        identifier: String = "com.automicvault.av-brew-stub",
+        identity: AVProcessIdentity = identity,
+        request: ApprovalRequest = request
+    ) -> AgentTaskContext? {
+        agentTaskContext(
+            for: request, identity: identity, gateID: gateID, callerPath: callerPath,
+            signing: SigningInfo(identifier: identifier, teamIdentifier: "ZU76A67LGU"),
+            message: message
+        )
+    }
+    let expected = AgentTaskContext(provider: .codex, id: UUID(uuidString: uuid)!)
+    guard context() == expected else {
+        print("brew task context unavailable when the peer environment cannot be read")
+        return false
+    }
+    let launcher = LauncherIdentity(
+        pid: 41, path: "/Applications/Codex.app/Contents/MacOS/Codex",
+        identifier: "com.openai.codex", teamIdentifier: "TEAM",
+        designatedRequirement: "identifier com.openai.codex", runtimeProtection: .hardened
+    )
+    let gate = SecretGate(id: "brew", keyPatterns: [], routes: [], defaultProtection: .noAccess, appPolicies: [])
+    guard let candidate = temporaryAccessGrantCandidate(
+        gate: gate, classification: brewRequestClassification(request.args),
+        launcher: launcher, agentTaskContext: context()
+    ), candidate.scope.agentTaskContext == expected,
+       candidate.scope.matches(
+           authorizationGateID: "brew", launcherDesignatedRequirement: launcher.designatedRequirement,
+           launcherRuntimeProtection: .hardened, agentTaskContext: expected,
+           classification: brewRequestClassification(["upgrade", "--formula", "tree"])
+       ),
+       context(gateID: "gh") == nil,
+       context(gateID: nil) == nil,
+       context(identifier: "com.automicvault.av") == nil,
+       context(callerPath: "/usr/local/bin/unrelated") == nil,
+       context(request: request.requesting(keys: ["SECRET"], title: "", detail: "")) == nil
+    else { return false }
+
+    // Both providers, malformed UUIDs, oversized strings and wrong XPC types fail closed.
+    uuid.withCString { xpc_dictionary_set_string(message, "brew_CLAUDE_CODE_SESSION_ID", $0) }
+    guard context() == nil else { return false }
+    xpc_dictionary_set_value(message, "brew_CODEX_THREAD_ID", nil)
+    guard context() == AgentTaskContext(provider: .claudeCode, id: expected.id) else { return false }
+    for invalid in ["", String(repeating: "x", count: 36), uuid + "x"] {
+        invalid.withCString { xpc_dictionary_set_string(message, "brew_CLAUDE_CODE_SESSION_ID", $0) }
+        guard context() == nil else { return false }
+    }
+    xpc_dictionary_set_int64(message, "brew_CLAUDE_CODE_SESSION_ID", 1)
+    guard context() == nil else { return false }
+    xpc_dictionary_set_value(message, "brew_CLAUDE_CODE_SESSION_ID", nil)
+    guard context() == nil else { return false }
+    uuid.withCString { xpc_dictionary_set_string(message, "brew_CODEX_THREAD_ID", $0) }
+    var changedIdentity = identity
+    changedIdentity.start_usec &+= 1
+    guard context(identity: changedIdentity) == nil, context() == expected else { return false }
+    process.terminate()
+    process.waitUntilExit()
+    return context() == nil
+}
+
+private func processEnvironmentValueSelfCheck() -> Bool {
+    let expected = "11111111-2222-3333-4444-555555555555"
+    let process = Process()
+    guard let executableURL = Bundle.main.executableURL else { return false }
+    process.executableURL = executableURL
+    process.arguments = ["--self-check-sleep"]
+    process.environment = ["CODEX_THREAD_ID": expected]
+    do {
+        try process.run()
+    } catch {
+        return false
+    }
+    defer {
+        if process.isRunning { process.terminate() }
+        process.waitUntilExit()
+    }
+    var value = [CChar](repeating: 0, count: 64)
+    var absent = [CChar](repeating: 0, count: 64)
+    var tooSmall = [CChar](repeating: 0, count: 4)
+    let found = av_process_environment_value(
+        process.processIdentifier,
+        "CODEX_THREAD_ID",
+        &value,
+        value.count
+    )
+    let foundAbsent = av_process_environment_value(
+        process.processIdentifier,
+        "CLAUDE_CODE_SESSION_ID",
+        &absent,
+        absent.count
+    )
+    let foundInSmallBuffer = av_process_environment_value(
+        process.processIdentifier,
+        "CODEX_THREAD_ID",
+        &tooSmall,
+        tooSmall.count
+    )
+    let decoded = String(
+        decoding: value.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) },
+        as: UTF8.self
+    )
+    if !found || foundAbsent || foundInSmallBuffer || decoded != expected {
+        print(
+            "peer env values:",
+            found,
+            foundAbsent,
+            foundInSmallBuffer,
+            decoded
+        )
+        return false
+    }
+    return true
+}
+
+private func temporaryAccessGrantCandidate(
+    gate: SecretGate?,
+    classification: SecretGateRequestClassification?,
+    launcher: LauncherIdentity?,
+    agentTaskContext: AgentTaskContext?
+) -> TemporaryAccessGrantCandidate? {
+    guard temporaryAccessGrantUnavailableReason(
+        hasToolSpecificGate: gate != nil,
+        classification: classification,
+        launcherRuntimeProtection: launcher?.runtimeProtection,
+        agentTaskContext: agentTaskContext
+    ) == nil,
+    let gate, let launcher, let agentTaskContext,
+    !gate.isSSHAgentGate,
+    let runtimeRequirement = launcher.runtimeProtection.secretGateAdmissionRequirement
+    else {
+        return nil
+    }
+    let launcherName = temporaryAccessGrantLauncherName(launcher)
+    return TemporaryAccessGrantCandidate(
+        scope: TemporaryAccessGrantScope(
+            authorizationGateID: gate.id,
+            launcherDesignatedRequirement: launcher.designatedRequirement,
+            launcherRuntimeRequirement: runtimeRequirement,
+            agentTaskContext: agentTaskContext
+        ),
+        launcher: launcher,
+        launcherName: launcherName,
+        authorizationGateName: gate.authorizationGateName
+    )
+}
+
+private struct ScriptApproval {
+    let path: String
+    let checksum: String
+}
+
+private struct ActiveScriptAuthority {
+    let blessings: [BlessedScript]
+    let hasEmptyCapabilityCeiling: Bool
+
+    var nearestBlessing: BlessedScript? { blessings.first }
+    var allowsAutomaticAuthority: Bool { !hasEmptyCapabilityCeiling }
+    var inheritsLauncherPolicy: Bool {
+        allowsAutomaticAuthority && blessings.allSatisfy(\.usesCapabilityInheritance)
+    }
+
+    func canUse(_ blessing: BlessedScript) -> Bool {
+        guard allowsAutomaticAuthority else { return false }
+        for active in blessings {
+            if active == blessing { return true }
+            if !active.usesCapabilityInheritance { return false }
+        }
+        return false
+    }
+}
+
+private enum SSHScriptAuthorization {
+    case blessing(BlessedScript)
+    case inheritedPolicy
+
+    func allows(_ authority: ActiveScriptAuthority) -> Bool {
+        switch self {
+        case .blessing(let script): authority.canUse(script)
+        case .inheritedPolicy: authority.inheritsLauncherPolicy
+        }
+    }
+}
+
+private func releaseAfterSSHAuthorizationCheck(
+    _ payload: ApprovedPayload,
+    authorization: SSHScriptAuthorization?,
+    validatePeer: () throws -> Void,
+    currentAuthority: () -> ActiveScriptAuthority?,
+    deliver: (ApprovedPayload) -> Void
+) throws {
+    try validatePeer()
+    if let authorization {
+        guard let authority = currentAuthority(), authorization.allows(authority)
+        else { throw AppError("SSH script authority changed before signing") }
+    }
+    deliver(payload)
+}
+
+private func sshScriptAuthority(
+    ancestors: [AVProcessIdentity],
+    executions: [BlessedExecutionKey: BlessedScript],
+    ceilings: Set<BlessedExecutionKey>,
+    currentBlessings: [BlessedScript]
+) -> ActiveScriptAuthority {
+    let keys = ancestors.map { BlessedExecutionKey(pid: $0.pid, startUsec: $0.start_usec) }
+    return ActiveScriptAuthority(
+        blessings: keys.compactMap { executions[$0] }.filter { currentBlessings.contains($0) },
+        hasEmptyCapabilityCeiling: keys.contains { key in
+            ceilings.contains(key) || (executions[key].map { !currentBlessings.contains($0) } ?? false)
+        }
+    )
+}
+
+private func blessedScriptMatches(
+    _ script: BlessedScript,
+    request: ApprovalRequest,
+    approval: ScriptApproval,
+    launcher: LauncherIdentity
+) -> Bool {
+    request.op == "inject"
+        && request.scriptData != nil
+        && script.allowsExecution(
+            snapshotIncompatibleInterpreter: request.snapshotIncompatibleInterpreter
+        )
+        && script.matchesExecution(
+            path: approval.path,
+            checksum: approval.checksum,
+            keys: request.keys,
+            target: request.target,
+            replaceExistingEnv: request.replaceExistingEnv,
+            allowMissingKeys: request.allowMissingKeys,
+            launcherRequirement: launcher.designatedRequirement
+        )
+}
+
+private func lostBlessingExplanation(
+    for approval: ScriptApproval?,
+    blessedScripts: [BlessedScript]? = nil
+) -> String? {
+    guard let approval else { return nil }
+    guard let script = (blessedScripts ?? loadBlessedScripts()).first(where: { $0.path == approval.path }),
+          script.checksum != approval.checksum
+    else { return nil }
+    return "Blessing lost because the script contents changed."
+}
+
+private func blessedScriptCanAutoApprove(
+    _ script: BlessedScript,
+    request: ApprovalRequest,
+    signing: SigningInfo,
+    descriptors: [SecretGateDescriptor]
+) -> Bool {
+    guard let gate = matchingSecretGateDefinition(
+        request: request,
+        signing: signing,
+        descriptors: descriptors
+    ),
+    let protection = script.capabilities[gate.id]?.normalized(forGateID: gate.id)
+    else { return false }
+    return secretGateProtectionAllows(
+        protection,
+        classification: classifySecretGateRequest(gateID: gate.id, request: request)
+    )
+}
+
+private struct BlessedExecutionKey: Hashable {
+    let pid: Int32
+    let startUsec: UInt64
+}
+
+private struct AWSRegistrationCandidate {
+    let generation: AWSRuntimeGeneration
+    let chain: AWSProfileChain
+    let args: [String]
+    let target: String
+    let interpreter: String
+    let useLongLivedCredentials: Bool
+}
+
+private struct AWSRegistration: Sendable {
+    let generation: AWSRuntimeGeneration
+    let chain: AWSProfileChain
+    let args: [String]
+    let target: String
+    let interpreter: String
+    let useLongLivedCredentials: Bool
+    let secretValues: SelectedSecretValues
+    var credentials: AWSCredentials?
+    var denialGate: SecretGate? = nil
+    var denialClassification: SecretGateRequestClassification = .unknown
+    var launchers: [LauncherIdentity] = []
+    var authorizationRecord: AccessRequestRecord? = nil
+}
+
+private struct GitProcessExecution: Sendable {
+    let pid: pid_t
+    let version: Int32
+    let start: UInt64
+    let uid: uid_t
+    let session: UInt32
+    let path: String
+    let arguments: [String]
+
+    init?(_ identity: AVProcessIdentity) {
+        guard let arguments = processArgumentVector(identity.pid) else { return nil }
+        pid = identity.pid; version = identity.pidversion; start = identity.start_usec
+        uid = identity.euid; session = identity.audit_session_id
+        path = pathString(identity); self.arguments = arguments
+    }
+
+    func matches(_ identity: AVProcessIdentity) -> Bool {
+        pid == identity.pid && version == identity.pidversion && start == identity.start_usec
+            && uid == identity.euid && session == identity.audit_session_id && path == pathString(identity)
+    }
+
+    func live() -> AVProcessIdentity? {
+        var identity = AVProcessIdentity()
+        guard av_process_identity(pid, &identity), matches(identity), processArgumentVector(pid) == arguments else { return nil }
+        return identity
+    }
+}
+
+private struct GitRegistration: Sendable {
+    let root: GitProcessExecution
+    let operation: GitTransportOperation
+    let caller: GitProcessExecution?
+    let projectCWD: String
+    let arguments: [String]
+    let cwd: String
+    let objects: String
+    let nonce: String
+}
+
+private struct GitCredentialContext: Sendable {
+    let registration: GitRegistration
+    let git: GitProcessExecution
+    let dispatcher: GitProcessExecution?
+    let transport: GitProcessExecution
+    let helper: GitProcessExecution
+}
+
+private struct CredentialHelperParent: Sendable {
+    let pid: pid_t
+    let startUsec: UInt64
+    let euid: uid_t
+    let target: String
+    let arguments: [String]
+    var gitContext: GitCredentialContext? = nil
+    var uvNonce: String? = nil
+    var uvCWD: String? = nil
+}
+
+private struct DockerCredentialCandidate: Sendable {
+    let parent: CredentialHelperParent
+    let serverURL: String
+    let secretName: String
+}
+
+private struct StoredDockerCredential {
+    let serverURL: String
+    let username: String
+    let secret: String
+}
+
+private struct ApprovedPayload: Sendable {
+    let secrets: [String: String]
+    let value: String?
+}
+
+private struct ApprovedFulfillmentMaterial: Sendable {
+    let payload: ApprovedPayload
+    let awsRegistration: AWSRegistration?
+}
+
+private let registryHelperProtocolVersion: UInt64 = 3
+
+private enum MetadataDisclosure {
+    case secretNames(globalOnly: Bool)
+    case authorizationHistory(since: Date?)
+}
+
+private func authorizationHistorySinceIsValid(_ since: Date?, now: Date = Date()) -> Bool {
+    since.map { $0 <= now } ?? true
+}
+
+private func validatedAuthorizationHistorySince(
+    operation: ApprovalServiceOperation,
+    message: xpc_object_t,
+    now: Date = Date()
+) -> (valid: Bool, since: Date?) {
+    let value = xpc_dictionary_get_value(message, "since")
+    if operation == .history { return (value == nil, nil) }
+    if operation == .historyRead, value == nil { return (true, nil) }
+    guard operation == .historyWindow || operation == .historyRead, let value,
+          xpc_get_type(value) == XPC_TYPE_UINT64 else { return (false, nil) }
+    let seconds = xpc_dictionary_get_uint64(message, "since")
+    guard seconds > 0 else { return (false, nil) }
+    let since = Date(timeIntervalSince1970: TimeInterval(seconds))
+    return (authorizationHistorySinceIsValid(since, now: now), since)
+}
+
+private func metadataDisclosureHasAutomaticAccess(
+    _ kind: MetadataDisclosure,
+    launchers: [LauncherIdentity],
+    secretNameAccessApps: [BlessedScriptLauncher] = loadSecretNameAccessApps(),
+    authorizationHistoryAccessApps: [BlessedScriptLauncher] = loadAuthorizationHistoryAccessApps()
+) -> Bool {
+    let allowedApps = switch kind {
+    case .secretNames: secretNameAccessApps
+    case .authorizationHistory: authorizationHistoryAccessApps
+    }
+    return launchers.contains { candidate in
+        allowedApps.contains { $0.requirement == candidate.designatedRequirement }
+    }
+}
+
+private func authorizationHistoryDisclosureValue(
+    record: AccessRequestRecord,
+    since: Date?,
+    maximumReplyBytes: Int? = 1_048_576,
+    records: (Date?, Int?, Int?) -> [AccessRequestRecord]? = loadAccessRequestRecordsForDisclosure,
+    isCanceled: () -> Bool = { false },
+    onAccessRequest: (AccessRequestRecord) -> Bool
+) -> String? {
+    // Legacy clients receive one bounded reply; history-read transfers the complete snapshot.
+    let limit = since == nil ? 49 : nil
+    guard !isCanceled(),
+          let previousRecords = records(since, limit, maximumReplyBytes),
+          !isCanceled()
+    else { return nil }
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    encoder.outputFormatting = [.sortedKeys]
+    guard let data = try? encoder.encode(([record] + previousRecords).map(\.redactedForDisclosure)),
+          maximumReplyBytes.map({ data.count <= $0 }) ?? true,
+          let value = String(data: data, encoding: .utf8),
+          !isCanceled(),
+          onAccessRequest(record)
+    else { return nil }
+    return value
+}
+
+private func replyHistoryChunk(
+    _ chunk: AuthorizationHistoryTransfer.Chunk,
+    to message: xpc_object_t,
+    on peer: xpc_connection_t
+) {
+    let response = xpc_dictionary_create_reply(message) ?? xpc_dictionary_create_empty()
+    xpc_dictionary_set_bool(response, "ok", true)
+    xpc_dictionary_set_uint64(response, "offset", UInt64(chunk.offset))
+    xpc_dictionary_set_uint64(response, "total", UInt64(chunk.total))
+    chunk.bytes.withUnsafeBytes { bytes in
+        xpc_dictionary_set_data(response, "history_chunk", bytes.baseAddress!, bytes.count)
+    }
+    xpc_connection_send_message(peer, response)
+}
+
+
+private final class ApprovalServer: @unchecked Sendable {
+    private let serviceName: String
+    private let teamIdentifier: String
+    private let secretGateDescriptors: [SecretGateDescriptor]
+    private let onAutoApproval: @MainActor (AutoApprovalRecord) -> Void
+    private let onAccessRequest: @Sendable (AccessRequestRecord) -> Bool
+    private let onBlessRequest: @MainActor (
+        BlessedScriptReviewRequest,
+        @escaping (BlessedScriptReviewOutcome) -> Void
+    ) -> Void
+    private let onOpenWindow: @MainActor () -> Void
+    private let onTemporaryAccessGrantsChanged: @MainActor () -> Void
+    private let onLiveSecretUsesChanged: @MainActor () -> Void
+    private let canRequestHumanApproval: @MainActor () -> Bool
+    private let temporaryAccessGrants: TemporaryAccessGrantController
+    private let liveSecretUses: LiveSecretUseController<LiveSecretUseProcess>
+    private let secretValueCustody: SecretValueCustody
+    private let canRequestMacInput: @MainActor () -> Bool
+    private var listener: xpc_connection_t?
+    // ponytail: helper-lifetime caches; persistent policy remains the cross-restart trust boundary.
+    private var transientApprovals = AuthorizationDecisionReuseCache()
+    private let retainedProcessProvenanceLock = NSLock()
+    private var retainedProcessProvenance = RetainedProcessProvenanceStore()
+    private let blessedExecutionsLock = NSLock()
+    private var blessedExecutions: [BlessedExecutionKey: BlessedScript] = [:]
+    private var emptyCapabilityCeilings: Set<BlessedExecutionKey> = []
+    private let gitRegistrationsLock = NSLock()
+    private var gitRegistrations: [pid_t: GitRegistration] = [:]
+    private let uvRegistrationsLock = NSLock()
+    private var uvRegistrations: [pid_t: UVRegisteredInvocation] = [:]
+    private let awsRegistrationsLock = NSLock()
+    private var awsRegistrations: [BlessedExecutionKey: AWSRegistration] = [:]
+
+    init(
+        serviceName: String,
+        temporaryAccessGrants: TemporaryAccessGrantController,
+        liveSecretUses: LiveSecretUseController<LiveSecretUseProcess>,
+        secretValueCustody: SecretValueCustody = SecretValueCustody(),
+        onAutoApproval: @escaping @MainActor (AutoApprovalRecord) -> Void = { _ in },
+        onAccessRequest: @escaping @Sendable (AccessRequestRecord) -> Bool = { appendAccessRequestRecord($0) },
+        onBlessRequest: @escaping @MainActor (
+            BlessedScriptReviewRequest,
+            @escaping (BlessedScriptReviewOutcome) -> Void
+        ) -> Void = { _, completion in completion(.failed("script blessing is unavailable")) },
+        onOpenWindow: @escaping @MainActor () -> Void = {},
+        onTemporaryAccessGrantsChanged: @escaping @MainActor () -> Void = {},
+        onLiveSecretUsesChanged: @escaping @MainActor () -> Void = {},
+        canRequestHumanApproval: @escaping @MainActor () -> Bool = { true },
+        canRequestMacInput: @escaping @MainActor () -> Bool = { true }
+    ) throws {
+        guard let teamIdentifier = selfTeamIdentifier() else {
+            throw AppError("missing menu bar signing team identifier")
+        }
+        self.serviceName = serviceName
+        self.temporaryAccessGrants = temporaryAccessGrants
+        self.liveSecretUses = liveSecretUses
+        self.secretValueCustody = secretValueCustody
+        self.teamIdentifier = teamIdentifier
+        self.secretGateDescriptors = try loadSecretGateDescriptors(
+            avExecutableURL: avExecutableURL()
+        )
+        self.onAutoApproval = onAutoApproval
+        self.onAccessRequest = onAccessRequest
+        self.onBlessRequest = onBlessRequest
+        self.onOpenWindow = onOpenWindow
+        self.onTemporaryAccessGrantsChanged = onTemporaryAccessGrantsChanged
+        self.onLiveSecretUsesChanged = onLiveSecretUsesChanged
+        self.canRequestHumanApproval = canRequestHumanApproval
+        self.canRequestMacInput = canRequestMacInput
+    }
+
+    func start() throws {
+        listener = serviceName.withCString {
+            xpc_connection_create_mach_service(
+                $0,
+                nil,
+                UInt64(XPC_CONNECTION_MACH_SERVICE_LISTENER)
+            )
+        }
+        guard let listener else { throw AppError("approval XPC listener failed") }
+
+        let requirement = """
+        anchor apple generic and certificate leaf[subject.OU] = \(teamIdentifier) and \
+        (identifier "com.automicvault" or identifier "com.automicvault.av" or \
+        identifier "com.automicvault.av-brew-stub" or \
+        identifier "com.automicvault.varlock-plugin-helper" or \
+        identifier "com.automicvault.wrangler" or \
+        identifier "gh" or identifier "com.github.cli" or identifier "stripe" or \
+        identifier "supabase" or identifier "supabase-go" or identifier "com.supabase.cli")
+        """
+        let status = requirement.withCString {
+            xpc_connection_set_peer_code_signing_requirement(listener, $0)
+        }
+        guard status == 0 else {
+            throw AppError("approval XPC signing requirement failed")
+        }
+
+        xpc_connection_set_event_handler(listener) { [weak self] event in
+            self?.accept(event)
+        }
+        xpc_connection_activate(listener)
+    }
+
+    func stop() {
+        if let listener {
+            xpc_connection_cancel(listener)
+            self.listener = nil
+        }
+    }
+
+    private func retainedProvenanceMatch(
+        at gate: RetainedAuthorizationGate,
+        in chains: [[RetainedProcessChainNode]]
+    ) -> RetainedProcessProvenanceMatch? {
+        retainedProcessProvenanceLock.withLock {
+            retainedProcessProvenance.match(at: gate, in: chains)
+        }
+    }
+
+    private func rememberRetainedProvenance(
+        at gate: RetainedAuthorizationGate,
+        launcher: LauncherIdentity,
+        chains: [[RetainedProcessChainNode]],
+        retainedMatch: RetainedProcessProvenanceMatch? = nil
+    ) {
+        let executions = retainedMatch.map {
+            retainedExecutions(leadingTo: $0.execution, in: chains)
+        } ?? retainedExecutions(leadingTo: launcher.pid, in: chains)
+        retainedProcessProvenanceLock.withLock {
+            retainedProcessProvenance.remember(executions, at: gate, launcher: launcher)
+        }
+    }
+
+    private func accept(_ event: xpc_object_t) {
+        guard xpc_get_type(event) == XPC_TYPE_CONNECTION else { return }
+        let peer = event
+        let cancellation = ApprovalCancellation()
+        xpc_connection_set_event_handler(peer) { [weak self] message in
+            self?.handle(message, on: peer, cancellation: cancellation)
+        }
+        xpc_connection_activate(peer)
+    }
+
+    private func handle(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation
+    ) {
+        if isApprovalCancellationEvent(message) {
+            cancellation.cancel()
+            return
+        }
+        guard xpc_get_type(message) == XPC_TYPE_DICTIONARY else { return }
+
+        let pid = xpc_connection_get_pid(peer)
+        var identity = AVProcessIdentity()
+        guard av_process_identity(pid, &identity) else {
+            reply(peer, to: message, ok: false, error: "Gate Client identity is unavailable")
+            return
+        }
+
+        let callerPath = pathString(identity)
+        let signing = signingInfo(path: callerPath)
+
+        guard let opPointer = xpc_dictionary_get_string(message, "op") else {
+            reply(peer, to: message, ok: false, error: "invalid XPC request")
+            return
+        }
+        guard let op = ApprovalServiceOperation(rawValue: String(cString: opPointer)) else {
+            reply(peer, to: message, ok: false, error: "invalid XPC operation")
+            return
+        }
+
+        guard isAllowedCaller(path: callerPath, signing: signing) else {
+            reply(peer, to: message, ok: false, error: "Gate Client is not trusted")
+            return
+        }
+        let mutationCaller = MutationCaller(
+            pid: pid,
+            identity: identity,
+            path: callerPath,
+            signing: signing
+        )
+
+        if op.requiresLauncherBundleIntegrity,
+           let error = launcherBundleIntegrityError(for: identity) {
+            reply(peer, to: message, ok: false, error: error)
+            return
+        }
+
+        switch op {
+        case .openWindow where isTrustedMenuHelperCaller(path: callerPath, signing: signing):
+            DispatchQueue.main.async { self.onOpenWindow() }
+            reply(peer, to: message, ok: true, error: nil)
+        case .uvHelperVersion where isTrustedAvCaller(path: callerPath, signing: signing):
+            let supported = xpc_dictionary_get_uint64(message, "requested_version") == 1
+                && av_original_parent_tracking_available()
+            reply(peer, to: message, ok: supported,
+                  error: supported ? nil : "uv helper requires an app or macOS update", value: supported ? "1" : nil)
+        case .gitHelperVersion where isTrustedAvCaller(path: callerPath, signing: signing):
+            let version = xpc_dictionary_get_uint64(message, "requested_version")
+            let supported = [1, 2, 3].contains(version) && av_original_parent_tracking_available()
+            reply(peer, to: message, ok: supported, error: supported ? nil : "protected Git requires an app or macOS update", value: supported ? String(version) : nil)
+        case .gitRegister where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleGitRegistration(message, on: peer, identity: identity)
+        case .gitUnregister where isTrustedAvCaller(path: callerPath, signing: signing):
+            let nonce = xpc_dictionary_get_string(message, "nonce").map { String(cString: $0) }
+            let removed = gitRegistrationsLock.withLock {
+                guard let registration = gitRegistrations[pid], registration.root.matches(identity),
+                      registration.nonce == nonce else { return false }
+                gitRegistrations.removeValue(forKey: pid)
+                return true
+            }
+            reply(peer, to: message, ok: removed, error: removed ? nil : "Git registration is unavailable", value: removed ? "closed" : nil)
+        case .uvRegister where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleUVRegistration(message, on: peer, pid: pid, identity: identity, callerPath: callerPath)
+        case .awsHelperVersion where isTrustedAvCaller(path: callerPath, signing: signing):
+            let requested = xpc_dictionary_get_uint64(message, "requested_version")
+            guard let negotiated = negotiatedAWSHelperProtocolVersion(requested: requested) else {
+                reply(peer, to: message, ok: false, error: "AWS helper protocol upgrade is required")
+                return
+            }
+            reply(peer, to: message, ok: true, error: nil, value: String(negotiated))
+        case .dockerHelperVersion where isTrustedAvCaller(path: callerPath, signing: signing):
+            let requested = xpc_dictionary_get_uint64(message, "requested_version")
+            guard requested == registryHelperProtocolVersion else {
+                reply(peer, to: message, ok: false, error: "Registry helper protocol upgrade is required")
+                return
+            }
+            reply(peer, to: message, ok: true, error: nil, value: String(registryHelperProtocolVersion))
+        case .goatHelperVersion where isTrustedAvCaller(path: callerPath, signing: signing):
+            let requested = xpc_dictionary_get_uint64(message, "requested_version")
+            guard requested == 1 else {
+                reply(peer, to: message, ok: false, error: "goat helper protocol upgrade is required")
+                return
+            }
+            reply(peer, to: message, ok: true, error: nil, value: "1")
+        case .ordercliHelperVersion where isTrustedAvCaller(path: callerPath, signing: signing):
+            let requested = xpc_dictionary_get_uint64(message, "requested_version")
+            guard requested == 1 else {
+                reply(peer, to: message, ok: false, error: "ordercli helper protocol upgrade is required")
+                return
+            }
+            reply(peer, to: message, ok: true, error: nil, value: "1")
+        case .openhueHelperVersion where isTrustedAvCaller(path: callerPath, signing: signing):
+            let requested = xpc_dictionary_get_uint64(message, "requested_version")
+            guard requested == 1 else {
+                reply(peer, to: message, ok: false, error: "OpenHue helper protocol upgrade is required")
+                return
+            }
+            reply(peer, to: message, ok: true, error: nil, value: "1")
+        case .plumberHelperVersion where isTrustedAvCaller(path: callerPath, signing: signing):
+            let requested = xpc_dictionary_get_uint64(message, "requested_version")
+            guard requested == 1 else {
+                reply(peer, to: message, ok: false, error: "Plumber helper protocol upgrade is required")
+                return
+            }
+            reply(peer, to: message, ok: true, error: nil, value: "1")
+        case .uaaHelperVersion where isTrustedAvCaller(path: callerPath, signing: signing):
+            let requested = xpc_dictionary_get_uint64(message, "requested_version")
+            guard requested == 1 else {
+                reply(peer, to: message, ok: false, error: "UAA helper protocol upgrade is required")
+                return
+            }
+            reply(peer, to: message, ok: true, error: nil, value: "1")
+        case .railwayHelperVersion where isTrustedAvCaller(path: callerPath, signing: signing):
+            let requested = xpc_dictionary_get_uint64(message, "requested_version")
+            guard requested == 1 else {
+                reply(peer, to: message, ok: false, error: "Railway helper protocol upgrade is required")
+                return
+            }
+            reply(peer, to: message, ok: true, error: nil, value: "1")
+        case .oxideHelperVersion where isTrustedAvCaller(path: callerPath, signing: signing):
+            let requested = xpc_dictionary_get_uint64(message, "requested_version")
+            guard requested == 1 else {
+                reply(peer, to: message, ok: false, error: "Oxide helper protocol upgrade is required")
+                return
+            }
+            reply(peer, to: message, ok: true, error: nil, value: "1")
+        case .fastlyHelperVersion where isTrustedAvCaller(path: callerPath, signing: signing):
+            let requested = xpc_dictionary_get_uint64(message, "requested_version")
+            guard requested == 1 else {
+                reply(peer, to: message, ok: false, error: "Fastly helper protocol upgrade is required")
+                return
+            }
+            reply(peer, to: message, ok: true, error: nil, value: "1")
+        case .sqlcmdHelperVersion where isTrustedAvCaller(path: callerPath, signing: signing):
+            let requested = xpc_dictionary_get_uint64(message, "requested_version")
+            guard requested == 1 else {
+                reply(peer, to: message, ok: false, error: "sqlcmd helper protocol upgrade is required")
+                return
+            }
+            reply(peer, to: message, ok: true, error: nil, value: "1")
+        case .terraformHelperVersion where isTrustedAvCaller(path: callerPath, signing: signing):
+            let requested = xpc_dictionary_get_uint64(message, "requested_version")
+            guard requested == 1 else {
+                reply(peer, to: message, ok: false, error: "Terraform helper protocol upgrade is required")
+                return
+            }
+            reply(peer, to: message, ok: true, error: nil, value: "1")
+        case .aliyunHelperVersion where isTrustedAvCaller(path: callerPath, signing: signing):
+            let requested = xpc_dictionary_get_uint64(message, "requested_version")
+            guard requested == 1 else {
+                reply(peer, to: message, ok: false, error: "Alibaba Cloud helper protocol upgrade is required")
+                return
+            }
+            reply(peer, to: message, ok: true, error: nil, value: "1")
+        case .wakatimeHelperVersion where isTrustedAvCaller(path: callerPath, signing: signing):
+            let requested = xpc_dictionary_get_uint64(message, "requested_version")
+            guard requested == 1 else {
+                reply(peer, to: message, ok: false, error: "WakaTime helper protocol upgrade is required")
+                return
+            }
+            reply(peer, to: message, ok: true, error: nil, value: "1")
+        case .rcloneHelperVersion where isTrustedAvCaller(path: callerPath, signing: signing):
+            let requested = xpc_dictionary_get_uint64(message, "requested_version")
+            guard requested == 1 else {
+                reply(peer, to: message, ok: false, error: "rclone helper protocol upgrade is required")
+                return
+            }
+            reply(peer, to: message, ok: true, error: nil, value: "1")
+        case .kubectlHelperVersion where isTrustedAvCaller(path: callerPath, signing: signing):
+            let requested = xpc_dictionary_get_uint64(message, "requested_version")
+            guard requested == 1 else {
+                reply(peer, to: message, ok: false, error: "kubectl helper protocol upgrade is required")
+                return
+            }
+            reply(peer, to: message, ok: true, error: nil, value: "1")
+        case .sshIdentities where isTrustedAvCaller(path: callerPath, signing: signing):
+            let config = loadSSHAgentConfiguration()
+            guard config.enabled, config.isValid, !config.credentials.isEmpty else {
+                reply(peer, to: message, ok: false, error: "SSH Agent is disabled or unconfigured")
+                return
+            }
+            guard let data = try? JSONEncoder().encode(config.credentials.map(\.publicKey)) else {
+                reply(peer, to: message, ok: false, error: "SSH key catalog could not be encoded")
+                return
+            }
+            reply(peer, to: message, ok: true, error: nil,
+                  secrets: ["public_keys": String(decoding: data, as: UTF8.self)])
+        case .gpgSign where isTrustedAvCaller(path: callerPath, signing: signing),
+             .sshSign where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleInject(
+                message,
+                on: peer,
+                cancellation: cancellation,
+                pid: pid,
+                identity: identity,
+                callerPath: callerPath,
+                signing: signing
+            )
+        case .injectFd where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleInject(
+                message, on: peer, cancellation: cancellation, pid: pid,
+                identity: identity, callerPath: callerPath, signing: signing
+            )
+        case .inject, .keys, .authorize, .dockerGet, .goatGet, .ordercliGet, .openhueGet, .plumberGet, .uaaGet, .railwayGet,
+             .oxideGet, .fastlyGet, .sqlcmdGet, .terraformGet, .aliyunGet, .wakatimeGet, .rcloneGet, .kubectlGet, .uvGet:
+            handleInject(
+                message,
+                on: peer,
+                cancellation: cancellation,
+                pid: pid,
+                identity: identity,
+                callerPath: callerPath,
+                signing: signing
+            )
+        case .varlock where isTrustedVarlockPluginHelperCaller(path: callerPath, signing: signing):
+            handleVarlock(
+                message,
+                on: peer,
+                cancellation: cancellation,
+                pid: pid,
+                identity: identity,
+                callerPath: callerPath,
+                signing: signing
+            )
+        case .proxyStart where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleProxyStart(
+                message,
+                on: peer,
+                cancellation: cancellation,
+                pid: pid,
+                identity: identity,
+                callerPath: callerPath,
+                signing: signing
+            )
+        case .awsCredentials where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleAWSCredentials(message, on: peer, pid: pid, identity: identity)
+        case .dockerSave where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleDockerSave(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .dockerDelete where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleDockerDelete(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .goatSave where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleGoatSave(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .goatDelete where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleGoatDelete(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .ordercliSave where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleOrdercliSave(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .ordercliDelete where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleOrdercliDelete(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .openhueSave where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleOpenHueSave(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .plumberSave where isTrustedAvCaller(path: callerPath, signing: signing):
+            handlePlumberSave(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .uaaSave where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleUAASave(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .uaaDelete where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleUAADelete(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .railwaySave where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleRailwaySave(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .railwayDelete where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleRailwayDelete(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .oxideSave where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleOxideSave(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .oxideDelete where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleOxideDelete(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .fastlySave where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleFastlySave(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .fastlyDelete where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleFastlyDelete(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .sqlcmdSave where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleSqlcmdSave(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .sqlcmdDelete where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleSqlcmdDelete(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .terraformSave where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleTerraformSave(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .terraformDelete where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleTerraformDelete(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .list where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleMetadataDisclosure(
+                message,
+                on: peer,
+                cancellation: cancellation,
+                pid: pid,
+                identity: identity,
+                callerPath: callerPath,
+                signing: signing,
+                kind: .secretNames(globalOnly: xpc_dictionary_get_bool(message, "global_only"))
+            )
+        case .history where isTrustedAvCaller(path: callerPath, signing: signing),
+             .historyWindow where isTrustedAvCaller(path: callerPath, signing: signing),
+             .historyRead where isTrustedAvCaller(path: callerPath, signing: signing):
+            let window = validatedAuthorizationHistorySince(operation: op, message: message)
+            guard window.valid else {
+                reply(peer, to: message, ok: false, error: "invalid Authorization History time range")
+                return
+            }
+            if op == .historyRead, !cancellation.historyTransfer.begin() {
+                reply(peer, to: message, ok: false, error: "Authorization History read already started")
+                return
+            }
+            handleMetadataDisclosure(
+                message,
+                on: peer,
+                cancellation: cancellation,
+                pid: pid,
+                identity: identity,
+                callerPath: callerPath,
+                signing: signing,
+                kind: .authorizationHistory(since: window.since)
+            )
+        case .historyNext where isTrustedAvCaller(path: callerPath, signing: signing):
+            guard let offset = xpc_dictionary_get_value(message, "offset"),
+                  xpc_get_type(offset) == XPC_TYPE_UINT64,
+                  let offset = Int(exactly: xpc_dictionary_get_uint64(message, "offset")),
+                  let chunk = cancellation.historyTransfer.next(offset: offset) else {
+                reply(peer, to: message, ok: false, error: "Authorization History continuation is unavailable")
+                return
+            }
+            replyHistoryChunk(chunk, to: message, on: peer)
+        case .save where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleSave(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .saveIfAbsentOrEqual where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleSave(
+                message,
+                on: peer,
+                cancellation: cancellation,
+                caller: mutationCaller,
+                ifAbsentOrEqual: true
+            )
+        case .bless where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleBless(message, on: peer, identity: identity)
+        case .delete where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleDelete(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .save where isTrustedGhCaller(path: callerPath, signing: signing):
+            handleGhSave(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .wranglerSave where isTrustedWranglerCaller(path: callerPath, signing: signing):
+            guard let key = xpc_dictionary_get_string(message, "key"), wranglerCredentialMutationIsSupported(key: String(cString: key), hasProjectDirectory: xpc_dictionary_get_value(message, "project_directory") != nil) else {
+                reply(peer, to: message, ok: false, error: "Wrangler mutations require a Global Value in the Wrangler namespace")
+                return
+            }
+            handleSave(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .wranglerDelete where isTrustedWranglerCaller(path: callerPath, signing: signing):
+            guard let key = xpc_dictionary_get_string(message, "key"), wranglerCredentialMutationIsSupported(key: String(cString: key), hasProjectDirectory: xpc_dictionary_get_value(message, "project_directory") != nil) else {
+                reply(peer, to: message, ok: false, error: "Wrangler mutations require a Global Value in the Wrangler namespace")
+                return
+            }
+            handleDelete(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .ghSave where isTrustedGhCaller(path: callerPath, signing: signing):
+            handleGhSave(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .delete where isTrustedGhCaller(path: callerPath, signing: signing):
+            handleGhDelete(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .ghDelete where isTrustedGhCaller(path: callerPath, signing: signing):
+            handleGhDelete(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .stripeSave where isTrustedStripeCaller(path: callerPath, signing: signing):
+            handleStripeSave(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        case .stripeDelete where isTrustedStripeCaller(path: callerPath, signing: signing):
+            handleStripeDelete(message, on: peer, cancellation: cancellation, caller: mutationCaller)
+        default:
+            reply(peer, to: message, ok: false, error: "invalid XPC operation")
+        }
+    }
+
+    private func handleMetadataDisclosure(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        pid: pid_t,
+        identity: AVProcessIdentity,
+        callerPath: String,
+        signing: SigningInfo,
+        kind: MetadataDisclosure
+    ) {
+        let cwd = xpc_dictionary_get_string(message, "cwd")
+            .map { String(cString: $0) } ?? ""
+        var launchers = launcherIdentities(for: identity)
+        let ancestorFallbackPath = launcherFallbackPath(for: identity)
+        if launchers.isEmpty, let caller = launcherIdentity(pid: pid, identity: identity) {
+            launchers.append(caller)
+        }
+        let hasAutomaticAccess = metadataDisclosureHasAutomaticAccess(kind, launchers: launchers)
+        let launcher = executionOrigin(
+            among: launchers,
+            callerPID: pid,
+            ancestorFallbackPath: ancestorFallbackPath
+        )
+        let disclosure: (operation: String, title: String, detail: String, arguments: [String]) = switch kind {
+        case .secretNames(let globalOnly): (
+            "list",
+            "List saved secret names?",
+            globalOnly
+                ? "Secret values will remain hidden. av will receive every saved Global Value name."
+                : "Secret values will remain hidden. av will receive every saved Secret Name.",
+            ["list"]
+        )
+        case .authorizationHistory(let since): (
+            "history",
+            "Read Authorization History?",
+            since.map {
+                "av will receive Authorization History since \(ISO8601DateFormatter().string(from: $0)), including Secret Names and request metadata."
+            } ?? "av will receive the newest 50 Authorization History records, including Secret Names and request metadata.",
+            ["history"] + (since.map { ["--since", String(Int($0.timeIntervalSince1970))] } ?? [])
+        )
+        }
+        let (operation, title, detail, arguments) = disclosure
+        let request = ApprovalRequest(
+            op: operation,
+            keys: [],
+            target: callerPath,
+            args: arguments,
+            cwd: cwd,
+            replaceExistingEnv: false,
+            allowMissingKeys: false,
+            envConflicts: [],
+            shebangScript: nil,
+            scriptData: nil,
+            tool: "av",
+            title: title,
+            detail: detail
+        )
+        if denyRequestIfNeeded(request, signing: signing, launchers: launchers,
+                               callerPath: callerPath, peer: peer, message: message) { return }
+        if hasAutomaticAccess
+        {
+            Task { @MainActor in
+                await discloseMetadata(
+                    request: request,
+                    signing: signing,
+                    callerPath: callerPath,
+                    launcher: launcher,
+                    launchers: launchers,
+                    approvalSource: "Auto",
+                    reason: "Always allowed in Settings",
+                    peer: peer,
+                    message: message,
+                    kind: kind,
+                    cancellation: cancellation
+                )
+            }
+            return
+        }
+        Task { @MainActor in
+            if cancellation.isCanceled {
+                _ = self.onAccessRequest(canceledAccessRequestRecord(
+                    request: request, callerPath: callerPath, launcher: launcher, launchers: launchers
+                ))
+                return
+            }
+            guard self.canRequestHumanApproval() else {
+                _ = self.onAccessRequest(accessRequestRecord(
+                    request: request,
+                    callerPath: callerPath,
+                    decision: "Denied",
+                    approvalSource: "Auto",
+                    reason: "User session is inactive",
+                    launcher: launcher
+                ))
+                self.reply(peer, to: message, ok: false, error: "\(request.op) denied while user session is inactive")
+                return
+            }
+            let decision = await showApprovalAlert(
+                request: request,
+                callerPath: callerPath,
+                pid: pid,
+                signing: signing,
+                scriptApproval: nil,
+                launcher: launcher,
+                denialLaunchers: launchers,
+                launcherFallbackPath: ancestorFallbackPath ?? callerPath,
+                automaticApprovalExplanation: nil,
+                cancellation: cancellation
+            )
+            if decision == .canceled {
+                _ = self.onAccessRequest(canceledAccessRequestRecord(
+                    request: request, callerPath: callerPath, launcher: launcher, launchers: launchers
+                ))
+                return
+            }
+            if decision == .interrupted {
+                _ = self.onAccessRequest(interruptedAccessRequestRecord(
+                    request: request, callerPath: callerPath, launcher: launcher, launchers: launchers
+                ))
+                self.reply(peer, to: message, ok: false, error: "approval presentation interrupted")
+                return
+            }
+            if self.denyRequestIfNeeded(request, signing: signing, launchers: launchers,
+                                       callerPath: callerPath, peer: peer, message: message) { return }
+            guard decision != .denied else {
+                _ = self.onAccessRequest(accessRequestRecord(
+                    request: request,
+                    callerPath: callerPath,
+                    decision: "Denied",
+                    approvalSource: "Manual",
+                    reason: "Denied in prompt",
+                    launcher: launcher
+                ))
+                self.reply(peer, to: message, ok: false, error: "\(request.op) denied")
+                return
+            }
+            await self.discloseMetadata(
+                request: request,
+                signing: signing,
+                callerPath: callerPath,
+                launcher: launcher,
+                launchers: launchers,
+                approvalSource: "Manual",
+                reason: "Allowed once in prompt",
+                peer: peer,
+                message: message,
+                kind: kind,
+                cancellation: cancellation
+            )
+        }
+    }
+
+    @MainActor
+    private func discloseMetadata(
+        request: ApprovalRequest,
+        signing: SigningInfo,
+        callerPath: String,
+        launcher: LauncherIdentity?,
+        launchers: [LauncherIdentity],
+        approvalSource: String,
+        reason: String,
+        peer: xpc_connection_t,
+        message: xpc_object_t,
+        kind: MetadataDisclosure,
+        cancellation: ApprovalCancellation
+    ) async {
+        guard !cancellation.isCanceled else {
+            _ = onAccessRequest(canceledAccessRequestRecord(
+                request: request, callerPath: callerPath, launcher: launcher, launchers: launchers
+            ))
+            return
+        }
+        if denyRequestIfNeeded(request, signing: signing,
+                               launchers: launchers,
+                               callerPath: callerPath, peer: peer, message: message) { return }
+        var names: [String]?
+        if case .secretNames(let globalOnly) = kind {
+            switch loadStoredSecretsResult() {
+            case .success(let secrets):
+                names = secrets.compactMap { secret in
+                    (!globalOnly || secret.values.contains { $0.source == .global })
+                        ? secret.account : nil
+                }
+            case .failure(let status):
+                _ = onAccessRequest(accessRequestRecord(
+                    request: request,
+                    callerPath: callerPath,
+                    decision: "Failed",
+                    approvalSource: approvalSource,
+                    reason: "Stored Secret names are unavailable: \(status)",
+                    launcher: launcher
+                ))
+                reply(peer, to: message, ok: false, error: "stored Secret names are unavailable: \(status)")
+                return
+            }
+        }
+        let record = accessRequestRecord(
+            request: request,
+            callerPath: callerPath,
+            decision: "Approved",
+            approvalSource: approvalSource,
+            reason: reason,
+            launcher: launcher
+        )
+        guard !cancellation.isCanceled else {
+            _ = onAccessRequest(canceledAccessRequestRecord(
+                request: request, callerPath: callerPath, launcher: launcher, launchers: launchers
+            ))
+            return
+        }
+        if case .authorizationHistory(let since) = kind {
+            let chunked = xpc_dictionary_get_string(message, "op").map(String.init(cString:)) == "history-read"
+            let audit = onAccessRequest
+            let value = await Task.detached(priority: .userInitiated, operation: { () -> String? in
+                guard !cancellation.isCanceled else { return nil }
+                return authorizationHistoryDisclosureValue(
+                    record: record,
+                    since: since,
+                    maximumReplyBytes: chunked ? nil : 1_048_576,
+                    isCanceled: { cancellation.isCanceled },
+                    onAccessRequest: audit
+                )
+            }).value
+            guard !cancellation.isCanceled else {
+                _ = onAccessRequest(canceledAccessRequestRecord(
+                    request: request, callerPath: callerPath, launcher: launcher, launchers: launchers
+                ))
+                return
+            }
+            guard let value else {
+                reply(peer, to: message, ok: false, error: chunked ? "Authorization History could not be read, encoded, or recorded"
+                      : "Authorization History is unavailable or exceeds the 1 MiB reply limit; try a narrower --since window")
+                return
+            }
+            if denyRequestIfNeeded(request, signing: signing,
+                                   launchers: launchers,
+                                   callerPath: callerPath, peer: peer, message: message) { return }
+            if chunked {
+                guard cancellation.historyTransfer.prepare(Data(value.utf8)),
+                      let chunk = cancellation.historyTransfer.next(offset: 0) else {
+                    reply(peer, to: message, ok: false, error: "Authorization History transfer was canceled")
+                    return
+                }
+                replyHistoryChunk(chunk, to: message, on: peer)
+            } else {
+                reply(peer, to: message, ok: true, error: nil, value: value)
+            }
+            return
+        }
+        guard onAccessRequest(record) else {
+            reply(peer, to: message, ok: false, error: "Authorization History is unavailable")
+            return
+        }
+        guard !cancellation.isCanceled else {
+            _ = onAccessRequest(canceledAccessRequestRecord(
+                request: request, callerPath: callerPath, launcher: launcher, launchers: launchers
+            ))
+            return
+        }
+        if denyRequestIfNeeded(request, signing: signing,
+                               launchers: launchers,
+                               callerPath: callerPath, peer: peer, message: message) { return }
+        reply(peer, to: message, ok: true, error: nil, names: names)
+    }
+
+    private func launcherDenial(
+        _ request: ApprovalRequest, signing: SigningInfo, launchers: [LauncherIdentity]
+    ) -> LauncherDenialError? {
+        let gate = matchingSecretGateDefinition(
+            request: request, signing: signing, descriptors: secretGateDescriptors
+        )
+        return evaluateLauncherDenial(gate: gate,
+            classification: gate.map { classifySecretGateRequest(gateID: $0.id, request: request) } ?? .unknown,
+            launchers: launchers)
+    }
+
+    private func denyRequestIfNeeded(
+        _ request: ApprovalRequest, signing: SigningInfo, launchers: [LauncherIdentity],
+        callerPath: String, peer: xpc_connection_t, message: xpc_object_t
+    ) -> Bool {
+        guard let denial = launcherDenial(request, signing: signing, launchers: launchers) else { return false }
+        _ = onAccessRequest(accessRequestRecord(
+            request: request, callerPath: callerPath, decision: "Denied",
+            approvalSource: "Auto", reason: denial.reason, launcher: denial.launcher
+        ))
+        reply(peer, to: message, ok: false, error: denial.reason)
+        return true
+    }
+
+    private func handleInject(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        pid: pid_t,
+        identity: AVProcessIdentity,
+        callerPath: String,
+        signing: SigningInfo
+    ) {
+        guard var parsedRequest = approvalRequest(from: message) else {
+            reply(peer, to: message, ok: false, error: "invalid approval request")
+            return
+        }
+        do {
+            parsedRequest = try sshAgentRequest(from: message, request: parsedRequest,
+                                              helperIdentity: identity, helperPath: callerPath)
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+            return
+        }
+        let originIdentity = parsedRequest.sshPeer?.identity ?? identity
+        func requestLaunchers() -> [LauncherIdentity] {
+            var launchers = parsedRequest.sshPeer?.launchers ?? launcherIdentities(for: identity)
+            if launchers.isEmpty, let launcher = launcherIdentity(pid: pid, identity: identity) {
+                launchers.append(launcher)
+            }
+            return launchers
+        }
+        // GPG needs Launchers for credential selection; other requests need them for authorization.
+        var launchers = parsedRequest.op == "gpg-sign" ? requestLaunchers() : []
+        if parsedRequest.op == "gpg-sign" {
+            let migrationStatus = migrateLegacyGPGSigningSecrets()
+            guard migrationStatus == errSecSuccess else {
+                reply(
+                    peer,
+                    to: message,
+                    ok: false,
+                    error: "failed to repair the GPG signing credential: \(migrationStatus)"
+                )
+                return
+            }
+            let storedSecretNames: Set<String>
+            switch loadStoredSecretsForUseResult() {
+            case .success(let secrets):
+                storedSecretNames = Set(secrets.map(\.account))
+            case .failure(let status):
+                reply(
+                    peer,
+                    to: message,
+                    ok: false,
+                    error: SecretValueCustodyError.inventoryUnavailable(status).localizedDescription
+                )
+                return
+            }
+            let names = gpgSigningSecretNames(
+                configuration: loadGPGSigningConfiguration(),
+                launcherRequirements: launchers.map(\.designatedRequirement),
+                storedSecretNames: storedSecretNames
+            )
+            parsedRequest = parsedRequest.requesting(
+                keys: names,
+                title: "Sign this Git operation?",
+                detail: names.first == gpgAlternatePrivateKeySecretName
+                    ? "The Verified Launcher matches your alternate signing-key list. Automic Vault will use the alternate GPG credential."
+                    : "Automic Vault will use your default GPG signing credential."
+            )
+        }
+        let preparedRequest: ApprovalRequest
+        do {
+            let dockerRequest = try dockerCredentialRequest(
+                from: message,
+                request: parsedRequest,
+                helperIdentity: identity,
+                helperPath: callerPath,
+                helperSigning: signing
+            )
+            let goatRequest = try goatCredentialRequest(
+                from: message,
+                request: dockerRequest,
+                helperIdentity: identity,
+                helperPath: callerPath,
+                helperSigning: signing
+            )
+            let ordercliRequest = try ordercliCredentialRequest(
+                from: message,
+                request: goatRequest,
+                helperIdentity: identity,
+                helperPath: callerPath,
+                helperSigning: signing
+            )
+            let openhueRequest = try openhueCredentialRequest(
+                from: message,
+                request: ordercliRequest,
+                helperIdentity: identity,
+                helperPath: callerPath,
+                helperSigning: signing
+            )
+            let plumberRequest = try plumberCredentialRequest(
+                request: openhueRequest,
+                helperIdentity: identity,
+                helperPath: callerPath,
+                helperSigning: signing
+            )
+            let uaaRequest = try uaaCredentialRequest(
+                from: message,
+                request: plumberRequest,
+                helperIdentity: identity,
+                helperPath: callerPath,
+                helperSigning: signing
+            )
+            let railwayRequest = try railwayCredentialRequest(
+                from: message,
+                request: uaaRequest,
+                helperIdentity: identity,
+                helperPath: callerPath,
+                helperSigning: signing
+            )
+            let helperRequest = try terraformCredentialRequest(
+                from: message,
+                request: railwayRequest,
+                helperIdentity: identity,
+                helperPath: callerPath,
+                helperSigning: signing
+            )
+            let aliyunRequest = try aliyunCredentialRequest(
+                from: message,
+                request: helperRequest,
+                helperIdentity: identity,
+                helperPath: callerPath,
+                helperSigning: signing
+            )
+            let oxideRequest = try oxideCredentialRequest(
+                from: message,
+                request: aliyunRequest,
+                helperIdentity: identity,
+                helperPath: callerPath,
+                helperSigning: signing
+            )
+            let fastlyRequest = try fastlyCredentialRequest(
+                from: message,
+                request: oxideRequest,
+                helperIdentity: identity,
+                helperPath: callerPath,
+                helperSigning: signing
+            )
+            let sqlcmdRequest = try sqlcmdCredentialRequest(
+                from: message,
+                request: fastlyRequest,
+                helperIdentity: identity,
+                helperPath: callerPath,
+                helperSigning: signing
+            )
+            let wakatimeRequest = try wakatimeCredentialRequest(
+                from: message,
+                request: sqlcmdRequest,
+                helperIdentity: identity,
+                helperPath: callerPath,
+                helperSigning: signing
+            )
+            let rcloneRequest = try rclonePasswordRequest(
+                request: wakatimeRequest,
+                helperIdentity: identity,
+                helperPath: callerPath,
+                helperSigning: signing
+            )
+            let kubectlRequest = try kubectlCredentialRequest(
+                from: message,
+                request: rcloneRequest,
+                helperIdentity: identity,
+                helperPath: callerPath,
+                helperSigning: signing
+            )
+            let registeredUVRequest = try uvCredentialRequest(from: message, request: kubectlRequest,
+                helperIdentity: identity, helperPath: callerPath, helperSigning: signing)
+            let uvRequest = try gitCredentialRequest(request: registeredUVRequest, helper: identity)
+            let conflicts = Set(uvRequest.envConflicts)
+            let selectionNames = uvRequest.keys.filter {
+                uvRequest.replaceExistingEnv || !conflicts.contains($0)
+            }
+            let selected = try secretValueCustody.bind(
+                names: selectionNames,
+                cwd: uvRequest.cwd,
+                globalOnly: uvRequest.sshPeer != nil
+            )
+            if uvRequest.sshPeer != nil,
+               uvRequest.keys.contains(where: { selected.source(for: $0) != .global }) {
+                throw AppError("SSH Agent requires the Global Value of its credential")
+            }
+            // ponytail: Global Values only until OAuth refresh mutations bind the selected source.
+            if isTrustedWranglerCaller(path: callerPath, signing: signing),
+               !wranglerCredentialSelectionIsSupported(selected) {
+                throw AppError("Wrangler OAuth requires Global Values in the Wrangler namespace")
+            }
+            preparedRequest = approvalRequestWithCredentialContext(uvRequest.selecting(selected))
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+            return
+        }
+        let awsRegistration: AWSRegistrationCandidate?
+        do {
+            awsRegistration = try awsRegistrationCandidate(from: message, request: preparedRequest)
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+            return
+        }
+        let scriptApproval = preparedRequest.sshPeer == nil ? scriptApproval(for: preparedRequest) : nil
+        if preparedRequest.sshPeer == nil, let scriptDeclaration = scriptStartingWithoutApproval(for: preparedRequest) {
+            if scriptDeclaration.manifest.hasEmptyCapabilityCeiling {
+                registerEmptyCapabilityCeiling(pid: pid, identity: identity)
+            }
+            reply(peer, to: message, ok: true, error: nil, secrets: [:])
+            return
+        }
+        if preparedRequest.op != "gpg-sign" {
+            launchers = requestLaunchers()
+        }
+        let processChains = preparedRequest.sshPeer == nil ? retainedProcessChains(for: identity) : []
+        let keepsDetachedProcessAccess = UserDefaults.standard.bool(
+            forKey: keepLauncherAccessForDetachedProcessesDefaultsKey
+        )
+        let ancestorFallbackPath = launcherFallbackPath(for: originIdentity)
+        let launcherFallbackPath = ancestorFallbackPath ?? callerPath
+        let launcher = executionOrigin(
+            among: launchers,
+            callerPID: pid,
+            ancestorFallbackPath: ancestorFallbackPath
+        )
+        let configuredGate = matchingSecretGate(
+            request: preparedRequest,
+            signing: signing,
+            descriptors: secretGateDescriptors
+        )
+        if configuredGate?.id == "hcloud", !hcloudInstalledReleaseValid() {
+            reply(peer, to: message, ok: false, error: "hcloud installation changed; run av harden hcloud")
+            return
+        }
+        if configuredGate?.id == "doctl", !doctlInstalledReleaseValid() || !doctlArgumentsBound(preparedRequest.args) {
+            reply(peer, to: message, ok: false, error: "doctl installation changed; run av harden doctl")
+            return
+        }
+        if preparedRequest.sshPeer != nil, configuredGate?.isSSHAgentGate != true {
+            reply(peer, to: message, ok: false, error: "SSH Agent Gate is unavailable")
+            return
+        }
+        let authorizationGate = configuredGate.map {
+            RetainedAuthorizationGate.secretGate($0.id)
+        } ?? .directSecret
+        let retainedGateProvenance = retainedProvenanceMatch(
+            at: authorizationGate,
+            in: processChains
+        )
+        var policyLaunchers = launchers
+        if keepsDetachedProcessAccess,
+           let retainedLauncher = retainedGateProvenance?.launcher,
+           !policyLaunchers.contains(where: {
+               $0.designatedRequirement == retainedLauncher.designatedRequirement
+           })
+        {
+            policyLaunchers.append(retainedLauncher)
+        }
+        let policyLauncher = executionOrigin(
+            among: policyLaunchers,
+            callerPID: pid,
+            ancestorFallbackPath: ancestorFallbackPath
+        ) ?? launcher
+        let directAccessRules = loadDirectAccessRules()
+        let directAccessLauncher = matchingDirectAccessLauncher(
+            request: preparedRequest,
+            configuredGate: configuredGate,
+            trustedAVGateClient: isTrustedAvCaller(path: callerPath, signing: signing),
+            launchers: policyLaunchers,
+            rules: directAccessRules
+        )
+        let resolvedPolicy = configuredGate.flatMap {
+            resolveSecretGatePolicy(gate: $0, launchers: policyLaunchers)
+        }
+        let classification = configuredGate.map {
+            classifySecretGateRequest(gateID: $0.id, request: preparedRequest)
+        }
+        let request: ApprovalRequest = {
+            var scoped = preparedRequest
+            scoped.gateID = configuredGate?.id
+            scoped.temporaryDenialScope = configuredGate.flatMap {
+                TemporaryLauncherDenialScope(gate: $0, classification: classification ?? .unknown)
+            }
+            return scoped
+        }()
+        if denyRequestIfNeeded(request, signing: signing, launchers: policyLaunchers,
+                               callerPath: callerPath, peer: peer, message: message) { return }
+        let scriptAuthority = if let sshPeer = request.sshPeer {
+            activeSSHScriptAuthority(ancestors: sshPeer.scriptAncestors)
+        } else {
+            ActiveScriptAuthority(
+                blessings: activeBlessedScripts(pid: pid, identity: identity),
+                hasEmptyCapabilityCeiling: activeEmptyCapabilityCeiling(pid: pid, identity: identity)
+            )
+        }
+        let activeBlessing = scriptAuthority.nearestBlessing
+        if scriptAuthority.allowsAutomaticAuthority {
+            for script in scriptAuthority.blessings {
+                if handleBlessedCapability(
+                    script,
+                    request: request,
+                    signing: signing,
+                    descriptors: secretGateDescriptors,
+                    launchers: policyLaunchers,
+                    launcher: launcher,
+                    callerPath: callerPath,
+                    awsRegistration: awsRegistration,
+                    pid: pid,
+                    identity: identity,
+                    peer: peer,
+                    message: message
+                ) {
+                    return
+                }
+                if !script.usesCapabilityInheritance { break }
+            }
+        }
+        let blessingGate = scriptApproval.map {
+            RetainedAuthorizationGate.blessing(path: $0.path, checksum: $0.checksum)
+        }
+        let retainedBlessingProvenance = blessingGate.flatMap {
+            retainedProvenanceMatch(at: $0, in: processChains)
+        }
+        let currentBlessingMatch = scriptApproval.flatMap {
+            matchingBlessedScript(request: request, approval: $0, launchers: launchers)
+        }
+        let retainedBlessingMatch = scriptApproval.flatMap { approval in
+            retainedBlessingProvenance.flatMap {
+                matchingBlessedScript(
+                    request: request,
+                    approval: approval,
+                    launchers: [$0.launcher]
+                )
+            }
+        }
+        let effectiveBlessingMatch = currentBlessingMatch
+            ?? (keepsDetachedProcessAccess ? retainedBlessingMatch : nil)
+        if scriptAuthority.allowsAutomaticAuthority,
+           let scriptApproval,
+           let blessingGate,
+           let (script, matchedLauncher) = effectiveBlessingMatch
+        {
+            do {
+                let accessRequestID = UUID()
+                let record = accessRequestRecord(
+                    id: accessRequestID,
+                    request: request,
+                    callerPath: callerPath,
+                    decision: "Approved",
+                    approvalSource: "Auto",
+                    reason: "Blessed script \(script.path)",
+                    launcher: matchedLauncher
+                )
+                guard try fulfillApprovedRequest(
+                    request: request,
+                    signing: signing,
+                    awsRegistration: awsRegistration,
+                    pid: pid,
+                    identity: identity,
+                    record: record,
+                    launchers: policyLaunchers,
+                    launcher: matchedLauncher,
+                    activateAfterRecording: {
+                        registerBlessedExecution(script, pid: pid, identity: identity)
+                        rememberRetainedProvenance(
+                            at: blessingGate,
+                            launcher: matchedLauncher,
+                            chains: processChains,
+                            retainedMatch: currentBlessingMatch == nil
+                                ? retainedBlessingProvenance
+                                : nil
+                        )
+                        Task { @MainActor in
+                            self.onAutoApproval(autoApprovalRecord(
+                                accessRequestID: accessRequestID,
+                                request: request,
+                                script: scriptApproval,
+                                launcher: matchedLauncher
+                            ))
+                        }
+                    },
+                    release: { payload in
+                        reply(
+                            peer,
+                            to: message,
+                            ok: true,
+                            error: nil,
+                            secrets: payload.secrets,
+                            value: payload.value
+                        )
+                    }
+                ) else {
+                    reply(peer, to: message, ok: false, error: "Authorization History is unavailable")
+                    return
+                }
+            } catch {
+                _ = onAccessRequest(accessRequestRecord(
+                    request: request,
+                    callerPath: callerPath,
+                    decision: error is LauncherDenialError ? "Denied" : "Failed",
+                    approvalSource: "Auto",
+                    reason: error.localizedDescription,
+                    launcher: error is LauncherDenialError ? (error as? LauncherDenialError)?.launcher : matchedLauncher
+                ))
+                reply(peer, to: message, ok: false, error: error.localizedDescription)
+            }
+            return
+        }
+        if let key = missingRequiredSecret(for: request) {
+            reply(peer, to: message, ok: false, error: "failed to load secret \(key): \(errSecItemNotFound)")
+            return
+        }
+        let currentAgentTaskContext = agentTaskContext(
+            for: request, identity: identity, gateID: configuredGate?.id,
+            callerPath: callerPath, signing: signing, message: message
+        )
+        let retainedProcessExplanation: String?
+        if !keepsDetachedProcessAccess,
+           retainedBlessingMatch != nil,
+           let retainedBlessingProvenance
+        {
+            retainedProcessExplanation = retainedProcessApprovalExplanation(
+                match: retainedBlessingProvenance,
+                gateName: "this Blessing"
+            )
+        } else if !keepsDetachedProcessAccess,
+                  activeBlessing == nil,
+                  let retainedGateProvenance,
+                  retainedProvenanceWouldAuthorize(
+                      request: request,
+                      configuredGate: configuredGate,
+                      classification: classification,
+                      launcher: retainedGateProvenance.launcher,
+                      directAccessRules: directAccessRules,
+                      trustedAVGateClient: isTrustedAvCaller(path: callerPath, signing: signing)
+                  )
+        {
+            retainedProcessExplanation = retainedProcessApprovalExplanation(
+                match: retainedGateProvenance,
+                gateName: configuredGate.map { "the \($0.displayName) gate" } ?? "the Direct Secret Gate"
+            )
+        } else {
+            retainedProcessExplanation = nil
+        }
+        let automaticApprovalExplanation: String?
+        if scriptAuthority.hasEmptyCapabilityCeiling {
+            automaticApprovalExplanation = "Script authority in this execution blocks inherited automatic access. Approval applies only to this request."
+        } else if let resolvedPolicy,
+           let classification,
+           let explanation = launcherRuntimeProtectionApprovalExplanation(
+               policy: resolvedPolicy,
+               classification: classification
+           )
+        {
+            automaticApprovalExplanation = explanation
+        } else if let configuredGate,
+           let resolvedPolicy,
+           let classification,
+           !secretGateProtectionAllows(resolvedPolicy.protection, classification: classification),
+           let explanation = secretGateAutomaticApprovalExplanation(
+               gateID: configuredGate.id,
+               request: request
+           )
+        {
+            automaticApprovalExplanation = explanation
+        } else if resolvedPolicy == nil,
+           classification == .readOnly,
+           let failure = launcherAppVerificationFailure(for: identity)
+        {
+            automaticApprovalExplanation = failure.explanation
+        } else {
+            automaticApprovalExplanation = nil
+        }
+        if scriptAuthority.allowsAutomaticAuthority,
+           let configuredGate,
+           let classification,
+           let currentAgentTaskContext,
+           handleTemporaryAccessGrant(
+               request: request,
+               signing: signing,
+               gate: configuredGate,
+               classification: classification,
+               agentTaskContext: currentAgentTaskContext,
+               launchers: launchers,
+               denialLaunchers: policyLaunchers,
+               callerPath: callerPath,
+               awsRegistration: awsRegistration,
+               scriptApproval: scriptApproval,
+               authorizationGate: authorizationGate,
+               processChains: processChains,
+               pid: pid,
+               identity: identity,
+               peer: peer,
+               message: message
+           )
+        {
+            return
+        }
+        if scriptAuthority.inheritsLauncherPolicy, let directAccessLauncher {
+            do {
+                let accessRequestID = UUID()
+                let record = accessRequestRecord(
+                    id: accessRequestID,
+                    request: request,
+                    callerPath: callerPath,
+                    decision: "Approved",
+                    approvalSource: "Auto",
+                    reason: "Direct Access from \(shortAppName(directAccessLauncher.identifier))",
+                    launcher: directAccessLauncher
+                )
+                guard try fulfillApprovedRequest(
+                    request: request,
+                    signing: signing,
+                    awsRegistration: awsRegistration,
+                    pid: pid,
+                    identity: identity,
+                    record: record,
+                    launchers: policyLaunchers,
+                    launcher: directAccessLauncher,
+                    activateAfterRecording: {
+                        rememberRetainedProvenance(
+                            at: authorizationGate,
+                            launcher: directAccessLauncher,
+                            chains: processChains,
+                            retainedMatch: launchers.contains(where: {
+                                $0.designatedRequirement
+                                    == directAccessLauncher.designatedRequirement
+                            }) ? nil : retainedGateProvenance
+                        )
+                        Task { @MainActor in
+                            self.onAutoApproval(autoApprovalRecord(
+                                accessRequestID: accessRequestID,
+                                request: request,
+                                script: scriptApproval,
+                                launcher: directAccessLauncher
+                            ))
+                        }
+                    },
+                    release: { payload in
+                        reply(
+                            peer,
+                            to: message,
+                            ok: true,
+                            error: nil,
+                            secrets: payload.secrets,
+                            value: payload.value
+                        )
+                    }
+                ) else {
+                    reply(peer, to: message, ok: false, error: "Authorization History is unavailable")
+                    return
+                }
+            } catch {
+                _ = onAccessRequest(accessRequestRecord(
+                    request: request,
+                    callerPath: callerPath,
+                    decision: error is LauncherDenialError ? "Denied" : "Failed",
+                    approvalSource: "Auto",
+                    reason: error.localizedDescription,
+                    launcher: error is LauncherDenialError ? (error as? LauncherDenialError)?.launcher : directAccessLauncher
+                ))
+                reply(peer, to: message, ok: false, error: error.localizedDescription)
+            }
+            return
+        }
+        if scriptAuthority.inheritsLauncherPolicy,
+           let configuredGate,
+           let resolvedPolicy,
+           let classification,
+           secretGateProtectionAllows(
+               resolvedPolicy.protection,
+               classification: classification
+           )
+        {
+            let authorizingLauncher = resolvedPolicy.launcher ?? policyLauncher
+            do {
+                let warning = descendantOverrideWarning(policy: resolvedPolicy, gate: configuredGate, classification: classification)
+                let reason = "\(configuredGate.protectionTitle(resolvedPolicy.protection)) from \(resolvedPolicy.source)"
+                    + (warning.map { "; " + $0 } ?? "")
+                let overrideExecutions = try resolvedPolicy.overriddenLaunchers.map { descendant in
+                    var current = AVProcessIdentity()
+                    guard av_process_identity(descendant.pid, &current),
+                          let execution = retainedProcessExecution(pid: descendant.pid, identity: current)
+                    else { throw AppError("Descendant Launcher execution is unavailable") }
+                    return execution
+                }
+                let ancestorExecution: RetainedProcessExecution? = {
+                    guard !overrideExecutions.isEmpty, let authorizingLauncher else { return nil }
+                    var current = AVProcessIdentity()
+                    guard av_process_identity(authorizingLauncher.pid, &current) else { return nil }
+                    return retainedProcessExecution(pid: authorizingLauncher.pid, identity: current)
+                }()
+
+                let accessRequestID = UUID()
+                let record = accessRequestRecord(
+                    id: accessRequestID,
+                    request: request,
+                    callerPath: callerPath,
+                    decision: "Approved",
+                    approvalSource: "Auto",
+                    reason: reason,
+                    launcher: authorizingLauncher
+                )
+                guard try fulfillApprovedRequest(
+                    request: request,
+                    signing: signing,
+                    awsRegistration: awsRegistration,
+                    pid: pid,
+                    identity: identity,
+                    record: record,
+                    launchers: policyLaunchers,
+                    launcher: authorizingLauncher,
+                    sshScriptAuthorization: request.sshPeer == nil ? nil : .inheritedPolicy,
+                    validateAuthority: {
+                        guard !overrideExecutions.isEmpty else { return }
+                        guard let ancestorExecution, retainedProcessExecutionIsLive(ancestorExecution),
+                              overrideExecutions.allSatisfy(retainedProcessExecutionIsLive),
+                              reloadSecretGatePolicy(for: configuredGate) == configuredGate,
+                              let authorizingLauncher,
+                              resolvedPolicy.overriddenLaunchers.allSatisfy({
+                                  verifiedLauncherOverrideAncestry(authorizingLauncher, $0)
+                              }) else { throw AppError("Launcher override authority changed before release") }
+                    },
+                    activateAfterRecording: {
+                        if let authorizingLauncher {
+                            rememberRetainedProvenance(
+                                at: authorizationGate,
+                                launcher: authorizingLauncher,
+                                chains: processChains,
+                                retainedMatch: launchers.contains(where: {
+                                    $0.designatedRequirement
+                                        == authorizingLauncher.designatedRequirement
+                                }) ? nil : retainedGateProvenance
+                            )
+                            Task { @MainActor in
+                                self.onAutoApproval(autoApprovalRecord(
+                                    accessRequestID: accessRequestID,
+                                    request: request,
+                                    script: scriptApproval,
+                                    launcher: authorizingLauncher,
+                                    policyWarning: warning
+                                ))
+                            }
+                        }
+                    },
+                    release: { payload in
+                        reply(
+                            peer,
+                            to: message,
+                            ok: true,
+                            error: nil,
+                            secrets: payload.secrets,
+                            value: payload.value
+                        )
+                    }
+                ) else {
+                    reply(peer, to: message, ok: false, error: "Authorization History is unavailable")
+                    return
+                }
+            } catch {
+                _ = onAccessRequest(accessRequestRecord(
+                    request: request,
+                    callerPath: callerPath,
+                    decision: error is LauncherDenialError ? "Denied" : "Failed",
+                    approvalSource: "Auto",
+                    reason: error.localizedDescription,
+                    launcher: error is LauncherDenialError ? (error as? LauncherDenialError)?.launcher : authorizingLauncher
+                ))
+                reply(peer, to: message, ok: false, error: error.localizedDescription)
+            }
+            return
+        }
+        let promptLauncher = resolvedPolicy?.launcher ?? policyLauncher
+        let temporaryGrantCandidate = scriptAuthority.hasEmptyCapabilityCeiling ? nil : temporaryAccessGrantCandidate(
+            gate: configuredGate,
+            classification: classification,
+            launcher: launcher,
+            agentTaskContext: currentAgentTaskContext
+        )
+        let temporaryGrantUnavailableReason = scriptAuthority.hasEmptyCapabilityCeiling
+            ? "Script authority in this execution blocks automatic access."
+            : temporaryAccessGrantUnavailableReason(
+                hasToolSpecificGate: configuredGate != nil,
+                classification: classification,
+                launcherRuntimeProtection: launcher?.runtimeProtection,
+                agentTaskContext: currentAgentTaskContext
+            )
+        let promptAccessLevel = if let configuredGate, let resolvedPolicy {
+            configuredGate.protectionTitle(resolvedPolicy.protection)
+        } else {
+            SecretGateProtection.noAccess.title
+        }
+        let transientApproval = request.decisionReuseRequest(
+            clientIdentity: identity,
+            callerPath: callerPath,
+            signing: signing
+        )
+        let promptBlessing: BlessedScriptPromptContext?
+        if let activeBlessing {
+            let launcherAllowsOperation = if configuredGate != nil,
+                                             let resolvedPolicy,
+                                             let classification {
+                secretGateProtectionAllows(resolvedPolicy.protection, classification: classification)
+            } else {
+                false
+            }
+            promptBlessing = BlessedScriptPromptContext(
+                script: activeBlessing,
+                explanation: activeBlessedScriptPromptExplanation(
+                    script: activeBlessing,
+                    gateID: configuredGate?.id,
+                    launcherAllowsOperation: launcherAllowsOperation
+                )
+            )
+        } else if let scriptApproval,
+                  let script = matchingBlessedScriptExecution(
+                      request: request,
+                      approval: scriptApproval
+                  )
+        {
+            promptBlessing = BlessedScriptPromptContext(
+                script: script,
+                explanation: "Approval activates this stored authority for one execution."
+            )
+        } else {
+            promptBlessing = nil
+        }
+        RunLoop.main.perform(inModes: [.modalPanel, .default]) {
+            MainActor.assumeIsolated {
+                guard !cancellation.isCanceled,
+                      let event = approvalEvent(
+                          for: approvalDecision(
+                              for: self.transientApprovals.decision(for: transientApproval)
+                          ),
+                          humanApprovalAvailable: self.canRequestHumanApproval()
+                      )
+                else { return }
+                self.sendEvent(event, to: peer)
+            }
+        }
+        Task { @MainActor in
+            if cancellation.isCanceled {
+                _ = self.onAccessRequest(canceledAccessRequestRecord(
+                    request: request, callerPath: callerPath, launcher: promptLauncher, launchers: policyLaunchers
+                ))
+                return
+            }
+            let tryFulfillFromGrantOrCache: @MainActor () -> Bool = {
+                if self.denyRequestIfNeeded(request, signing: signing, launchers: policyLaunchers,
+                                            callerPath: callerPath, peer: peer, message: message) { return true }
+                var currentIdentity = AVProcessIdentity()
+                if av_process_identity(pid, &currentIdentity),
+                   sameProcessIdentity(identity, currentIdentity),
+                   let currentLiveSigning = liveSigningInfo(pid: pid)
+                {
+                    let currentCallerPath = pathString(currentIdentity)
+                    let currentSigning = SigningInfo(
+                        identifier: currentLiveSigning.identifier,
+                        teamIdentifier: currentLiveSigning.teamIdentifier
+                    )
+                    var currentLaunchers = launcherIdentities(for: currentIdentity)
+                    if currentLaunchers.isEmpty,
+                       let currentLauncher = launcherIdentity(pid: pid, identity: currentIdentity)
+                    {
+                        currentLaunchers.append(currentLauncher)
+                    }
+                    if currentLiveSigning.mainExecutable == currentCallerPath,
+                       currentSigning.identifier == signing.identifier,
+                       currentSigning.teamIdentifier == signing.teamIdentifier,
+                       isAllowedCaller(path: currentCallerPath, signing: currentSigning),
+                       !self.activeEmptyCapabilityCeiling(pid: pid, identity: currentIdentity),
+                       let configuredGate,
+                       let classification,
+                       request.sshPeer == nil,
+                       let currentAgentTaskContext = agentTaskContext(
+                           for: request, identity: identity, gateID: configuredGate.id,
+                           callerPath: currentCallerPath, signing: currentSigning, message: message
+                       ),
+                       self.handleTemporaryAccessGrant(
+                           request: request,
+                           signing: signing,
+                           gate: configuredGate,
+                           classification: classification,
+                           agentTaskContext: currentAgentTaskContext,
+                           launchers: currentLaunchers,
+                           denialLaunchers: policyLaunchers + currentLaunchers,
+                           callerPath: currentCallerPath,
+                           awsRegistration: awsRegistration,
+                           scriptApproval: scriptApproval,
+                           authorizationGate: authorizationGate,
+                           processChains: retainedProcessChains(for: currentIdentity),
+                           pid: pid,
+                           identity: currentIdentity,
+                           peer: peer,
+                           message: message
+                       )
+                    {
+                        return true
+                    }
+                }
+                let cachedDecision = self.transientApprovals.decision(for: transientApproval)
+                if let decision = cachedDecision {
+                    if decision == .denied {
+                        _ = self.onAccessRequest(accessRequestRecord(
+                            request: request,
+                            callerPath: callerPath,
+                            decision: "Denied",
+                            approvalSource: "Auto",
+                            reason: "Reused recent denial",
+                            launcher: promptLauncher
+                        ))
+                        self.reply(peer, to: message, ok: false, error: "\(request.op) denied")
+                        return true
+                    }
+                    do {
+                        let record = accessRequestRecord(
+                            request: request,
+                            callerPath: callerPath,
+                            decision: "Approved",
+                            approvalSource: "Auto",
+                            reason: "Reused recent approval",
+                            launcher: promptLauncher
+                        )
+                        guard try self.fulfillApprovedRequest(
+                            request: request,
+                            signing: signing,
+                            awsRegistration: awsRegistration,
+                            pid: pid,
+                            identity: identity,
+                            record: record,
+                            launchers: policyLaunchers,
+                            launcher: promptLauncher,
+                            release: { payload in
+                                self.reply(
+                                    peer,
+                                    to: message,
+                                    ok: true,
+                                    error: nil,
+                                    secrets: payload.secrets,
+                                    value: payload.value
+                                )
+                            }
+                        ) else {
+                            self.reply(peer, to: message, ok: false, error: "Authorization History is unavailable")
+                            return true
+                        }
+                    } catch {
+                        _ = self.onAccessRequest(accessRequestRecord(
+                            request: request,
+                            callerPath: callerPath,
+                            decision: error is LauncherDenialError ? "Denied" : "Failed",
+                            approvalSource: "Auto",
+                            reason: error.localizedDescription,
+                            launcher: error is LauncherDenialError ? (error as? LauncherDenialError)?.launcher : promptLauncher
+                        ))
+                        self.reply(peer, to: message, ok: false, error: error.localizedDescription)
+                    }
+                    return true
+                }
+                return false
+            }
+
+            if tryFulfillFromGrantOrCache() {
+                return
+            }
+
+            guard self.canRequestHumanApproval() else {
+                _ = self.onAccessRequest(accessRequestRecord(
+                    request: request,
+                    callerPath: callerPath,
+                    decision: "Denied",
+                    approvalSource: "Auto",
+                    reason: "Human approval unavailable",
+                    launcher: promptLauncher
+                ))
+                self.reply(
+                    peer,
+                    to: message,
+                    ok: false,
+                    error: "human approval unavailable"
+                )
+                return
+            }
+
+            let approvalPanel = makeApprovalPanel()
+            defer {
+                approvalPanel.orderOut(nil)
+                approvalPanel.contentView = nil
+            }
+            let openReblessingReview: (@MainActor (@escaping @MainActor () -> Void) -> Void)?
+            if lostBlessingExplanation(for: scriptApproval) != nil,
+               let scriptApproval, let scriptData = request.scriptData,
+               let declaration = scriptExecutionDeclaration(for: request) {
+                let review = BlessedScriptReviewRequest(
+                    path: scriptApproval.path,
+                    declaration: declaration,
+                    scriptData: scriptData,
+                    launcher: nil
+                )
+                openReblessingReview = { finished in
+                    presentBlessingReview(review, on: approvalPanel, cancellation: cancellation) {
+                        finished()
+                    }
+                }
+            } else {
+                openReblessingReview = nil
+            }
+            let decision = await approvalWithBlessingReview(
+                cancellation: cancellation,
+                review: openReblessingReview
+            ) {
+                let refreshedBlessing = scriptApproval.flatMap {
+                    self.matchingBlessedScriptExecution(request: request, approval: $0)
+                }.map {
+                    BlessedScriptPromptContext(
+                        script: $0,
+                        explanation: "Approval activates this stored authority for one execution."
+                    )
+                }
+                return await showApprovalAlert(
+                    request: request,
+                    callerPath: callerPath,
+                    pid: pid,
+                    signing: signing,
+                    scriptApproval: scriptApproval,
+                    blessing: activeBlessing == nil ? refreshedBlessing : promptBlessing,
+                    launcher: promptLauncher,
+                    denialLaunchers: policyLaunchers,
+                    launcherFallbackPath: launcherFallbackPath,
+                    automaticApprovalExplanation: lostBlessingExplanation(for: scriptApproval)
+                        ?? retainedProcessExplanation
+                        ?? automaticApprovalExplanation,
+                    accessLevel: promptAccessLevel,
+                    temporaryGrantCandidate: temporaryGrantCandidate,
+                    temporaryGrantUnavailableReason: temporaryGrantUnavailableReason,
+                    classification: classification,
+                    denialGate: configuredGate,
+                    cancellation: cancellation,
+                    reevaluate: tryFulfillFromGrantOrCache,
+                    allowsReblessing: openReblessingReview != nil
+                        && lostBlessingExplanation(for: scriptApproval) != nil,
+                    existingPanel: approvalPanel
+                )
+            }
+            if decision == .reevaluated {
+                return
+            }
+            if decision == .canceled {
+                _ = self.onAccessRequest(canceledAccessRequestRecord(
+                    request: request, callerPath: callerPath, launcher: promptLauncher, launchers: policyLaunchers
+                ))
+                return
+            }
+            if decision == .interrupted {
+                _ = self.onAccessRequest(interruptedAccessRequestRecord(
+                    request: request, callerPath: callerPath, launcher: promptLauncher, launchers: policyLaunchers
+                ))
+                self.reply(peer, to: message, ok: false, error: "approval presentation interrupted")
+                return
+            }
+            // Rule denials must not enter process-scoped reuse: expiry/removal restores normal policy.
+            if self.denyRequestIfNeeded(request, signing: signing, launchers: policyLaunchers,
+                                       callerPath: callerPath, peer: peer, message: message) { return }
+            guard decision != .denied else {
+                self.transientApprovals.remember(.denied, for: transientApproval)
+                _ = self.onAccessRequest(accessRequestRecord(
+                    request: request,
+                    callerPath: callerPath,
+                    decision: "Denied",
+                    approvalSource: "Manual",
+                    reason: "Denied in prompt",
+                    launcher: promptLauncher
+                ))
+                self.reply(
+                    peer,
+                    to: message,
+                    ok: false,
+                    error: "\(request.op) denied",
+                    humanApprovalDecision: "denied"
+                )
+                return
+            }
+            if decision == .temporaryWriteAccess {
+                guard !cancellation.isCanceled,
+                      self.canRequestHumanApproval(),
+                      let originalCandidate = temporaryGrantCandidate,
+                      let liveLauncher = launcherIdentities(for: identity).first(where: {
+                          $0.designatedRequirement
+                              == originalCandidate.scope.launcherDesignatedRequirement
+                      }),
+                      let refreshedCandidate = temporaryAccessGrantCandidate(
+                          gate: configuredGate,
+                          classification: classification,
+                          launcher: liveLauncher,
+                          agentTaskContext: agentTaskContext(
+                              for: request, identity: identity, gateID: configuredGate?.id,
+                              callerPath: callerPath, signing: signing, message: message
+                          )
+                      ),
+                      refreshedCandidate.scope == originalCandidate.scope
+                else {
+                    _ = self.onAccessRequest(accessRequestRecord(
+                        request: request,
+                        callerPath: callerPath,
+                        decision: "Failed",
+                        approvalSource: "Manual",
+                        reason: "Temporary Access Grant eligibility changed before activation",
+                        launcher: temporaryGrantCandidate?.launcher
+                    ))
+                    self.reply(
+                        peer,
+                        to: message,
+                        ok: false,
+                        error: "temporary access grant eligibility changed",
+                        humanApprovalDecision: "approved"
+                    )
+                    return
+                }
+                do {
+                    let record = accessRequestRecord(
+                        request: request,
+                        callerPath: callerPath,
+                        decision: "Approved",
+                        approvalSource: "Manual",
+                        reason: "Temporary Access Grant — Write Access",
+                        launcher: refreshedCandidate.launcher
+                    )
+                    guard try self.fulfillApprovedRequest(
+                        request: request,
+                        signing: signing,
+                        awsRegistration: awsRegistration,
+                        pid: pid,
+                        identity: identity,
+                        record: record,
+                        launchers: policyLaunchers,
+                        launcher: refreshedCandidate.launcher,
+                        release: { payload in
+                            self.temporaryAccessGrants.startWithLease(
+                                scope: refreshedCandidate.scope,
+                                launcherName: refreshedCandidate.launcherName,
+                                authorizationGateName: refreshedCandidate.authorizationGateName
+                            ) { _ in
+                                self.reply(
+                                    peer,
+                                    to: message,
+                                    ok: true,
+                                    error: nil,
+                                    secrets: payload.secrets,
+                                    value: payload.value,
+                                    humanApprovalDecision: "approved"
+                                )
+                            }
+                            self.onTemporaryAccessGrantsChanged()
+                        }
+                    ) else {
+                        self.reply(
+                            peer,
+                            to: message,
+                            ok: false,
+                            error: "Authorization History is unavailable",
+                            humanApprovalDecision: "approved"
+                        )
+                        return
+                    }
+                } catch {
+                    _ = self.onAccessRequest(accessRequestRecord(
+                        request: request,
+                        callerPath: callerPath,
+                        decision: error is LauncherDenialError ? "Denied" : "Failed",
+                        approvalSource: error is LauncherDenialError ? "Auto" : "Manual",
+                        reason: error.localizedDescription,
+                        launcher: error is LauncherDenialError ? (error as? LauncherDenialError)?.launcher : refreshedCandidate.launcher
+                    ))
+                    self.reply(
+                        peer,
+                        to: message,
+                        ok: false,
+                        error: error.localizedDescription,
+                        humanApprovalDecision: "approved"
+                    )
+                }
+                return
+            }
+            let fulfill: @Sendable () -> Void = { [policyLaunchers] in
+                do {
+                    let record = accessRequestRecord(
+                        request: request,
+                        callerPath: callerPath,
+                        decision: "Approved",
+                        approvalSource: "Manual",
+                        reason: "Approved in prompt",
+                        launcher: promptLauncher
+                    )
+                    guard try self.fulfillApprovedRequest(
+                        request: request,
+                        signing: signing,
+                        awsRegistration: awsRegistration,
+                        pid: pid,
+                        identity: identity,
+                        record: record,
+                        launchers: policyLaunchers,
+                        launcher: promptLauncher,
+                        cancellation: cancellation,
+                        activateAfterRecording: {
+                            // SSH has neither decision reuse nor Blessed Script registration.
+                            // Keep the main-actor reuse cache out of the SSH worker.
+                            guard request.sshPeer == nil else { return }
+                            if let scriptApproval,
+                               let script = self.matchingBlessedScriptExecution(
+                                   request: request,
+                                   approval: scriptApproval
+                               )
+                            {
+                                self.registerBlessedExecution(script, pid: pid, identity: identity)
+                            }
+                            self.transientApprovals.remember(
+                                decision.reuseOutcome,
+                                for: transientApproval
+                            )
+                        },
+                        release: { payload in
+                            self.reply(
+                                peer,
+                                to: message,
+                                ok: true,
+                                error: nil,
+                                secrets: payload.secrets,
+                                value: payload.value,
+                                humanApprovalDecision: "approved"
+                            )
+                        }
+                    ) else {
+                        self.reply(
+                            peer,
+                            to: message,
+                            ok: false,
+                            error: "Authorization History is unavailable",
+                            humanApprovalDecision: "approved"
+                        )
+                        return
+                    }
+                } catch is CancellationError {
+                    _ = self.onAccessRequest(canceledAccessRequestRecord(
+                        request: request, callerPath: callerPath,
+                        launcher: promptLauncher, launchers: policyLaunchers
+                    ))
+                    self.reply(
+                        peer, to: message, ok: false, error: "request canceled",
+                        humanApprovalDecision: "approved"
+                    )
+                } catch {
+                    _ = self.onAccessRequest(accessRequestRecord(
+                        request: request,
+                        callerPath: callerPath,
+                        decision: error is LauncherDenialError ? "Denied" : "Failed",
+                        approvalSource: error is LauncherDenialError ? "Auto" : "Manual",
+                        reason: error.localizedDescription,
+                        launcher: error is LauncherDenialError ? (error as? LauncherDenialError)?.launcher : promptLauncher
+                    ))
+                    self.reply(
+                        peer,
+                        to: message,
+                        ok: false,
+                        error: error.localizedDescription,
+                        humanApprovalDecision: "approved"
+                    )
+                }
+            }
+            if request.sshPeer != nil {
+                await performAuthorizationWork(fulfill)
+            } else {
+                fulfill()
+            }
+        }
+    }
+
+    private func handleTemporaryAccessGrant(
+        request: ApprovalRequest,
+        signing: SigningInfo,
+        gate: SecretGate,
+        classification: SecretGateRequestClassification,
+        agentTaskContext: AgentTaskContext,
+        launchers: [LauncherIdentity],
+        denialLaunchers: [LauncherIdentity],
+        callerPath: String,
+        awsRegistration: AWSRegistrationCandidate?,
+        scriptApproval: ScriptApproval?,
+        authorizationGate: RetainedAuthorizationGate,
+        processChains: [[RetainedProcessChainNode]],
+        pid: pid_t,
+        identity: AVProcessIdentity,
+        peer: xpc_connection_t,
+        message: xpc_object_t
+    ) -> Bool {
+        for launcher in launchers {
+            do {
+                let handled = try temporaryAccessGrants.withActiveLease(
+                    authorizationGateID: gate.id,
+                    launcherDesignatedRequirement: launcher.designatedRequirement,
+                    launcherRuntimeProtection: launcher.runtimeProtection,
+                    agentTaskContext: agentTaskContext,
+                    classification: classification
+                ) { _ in
+                    let accessRequestID = UUID()
+                    let record = accessRequestRecord(
+                        id: accessRequestID,
+                        request: request,
+                        callerPath: callerPath,
+                        decision: "Approved",
+                        approvalSource: "Auto",
+                        reason: "Temporary Access Grant — Write Access",
+                        launcher: launcher
+                    )
+                    let committed = try fulfillApprovedRequest(
+                        request: request,
+                        signing: signing,
+                        awsRegistration: awsRegistration,
+                        pid: pid,
+                        identity: identity,
+                        record: record,
+                        launchers: denialLaunchers,
+                        launcher: launcher,
+                        activateAfterRecording: {
+                            rememberRetainedProvenance(
+                                at: authorizationGate,
+                                launcher: launcher,
+                                chains: processChains,
+                                retainedMatch: nil
+                            )
+                            Task { @MainActor in
+                                self.onAutoApproval(autoApprovalRecord(
+                                    accessRequestID: accessRequestID,
+                                    request: request,
+                                    script: scriptApproval,
+                                    launcher: launcher
+                                ))
+                            }
+                        },
+                        release: { payload in
+                            reply(
+                                peer,
+                                to: message,
+                                ok: true,
+                                error: nil,
+                                secrets: payload.secrets,
+                                value: payload.value
+                            )
+                        }
+                    )
+                    if !committed {
+                        reply(peer, to: message, ok: false, error: "Authorization History is unavailable")
+                        return true
+                    }
+                    return true
+                }
+                if handled == true { return true }
+            } catch {
+                _ = onAccessRequest(accessRequestRecord(
+                    request: request,
+                    callerPath: callerPath,
+                    decision: error is LauncherDenialError ? "Denied" : "Failed",
+                    approvalSource: "Auto",
+                    reason: error.localizedDescription,
+                    launcher: error is LauncherDenialError ? (error as? LauncherDenialError)?.launcher : launcher
+                ))
+                reply(peer, to: message, ok: false, error: error.localizedDescription)
+                return true
+            }
+        }
+        return false
+    }
+
+    private func handleVarlock(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        pid: pid_t,
+        identity: AVProcessIdentity,
+        callerPath: String,
+        signing: SigningInfo
+    ) {
+        guard supportsVarlockProtocol(xpc_dictionary_get_uint64(message, "protocol_version")) else {
+            reply(peer, to: message, ok: false, error: "unsupported Varlock plugin protocol")
+            return
+        }
+        guard let requestedKeys = stringArray(message, "keys"),
+              let cwdPointer = xpc_dictionary_get_string(message, "cwd"),
+              let schemaDigestPointer = xpc_dictionary_get_string(message, "schema_sha256")
+        else {
+            reply(peer, to: message, ok: false, error: "invalid Varlock plugin request")
+            return
+        }
+        let keys = requestedKeys.sorted()
+        let cwd = String(cString: cwdPointer)
+        let schemaDigest = String(cString: schemaDigestPointer)
+        guard 1...64 ~= keys.count,
+              Set(keys).count == keys.count,
+              keys.allSatisfy(validSecretKeyName),
+              schemaDigest.utf8.count == 64,
+              schemaDigest.utf8.allSatisfy({ 48...57 ~= $0 || 97...102 ~= $0 })
+        else {
+            reply(peer, to: message, ok: false, error: "invalid Varlock Secret declaration")
+            return
+        }
+        var resolutionIdentity = AVProcessIdentity()
+        guard identity.ppid > 1,
+              av_process_identity(identity.ppid, &resolutionIdentity),
+              let resolutionExecution = retainedProcessExecution(
+                  pid: identity.ppid, identity: resolutionIdentity
+              )
+        else {
+            reply(peer, to: message, ok: false, error: "Varlock resolution process is unavailable")
+            return
+        }
+        var applicationIdentity = AVProcessIdentity()
+        guard resolutionIdentity.ppid > 1,
+              av_process_identity(resolutionIdentity.ppid, &applicationIdentity),
+              let applicationExecution = retainedProcessExecution(
+                  pid: resolutionIdentity.ppid, identity: applicationIdentity
+              )
+        else {
+            reply(peer, to: message, ok: false, error: "Varlock application process is unavailable")
+            return
+        }
+        let applicationPath = pathString(applicationIdentity)
+        guard !applicationPath.isEmpty else {
+            reply(peer, to: message, ok: false, error: "Varlock application path is unavailable")
+            return
+        }
+        let launchers = launcherIdentities(for: identity)
+        let ancestorFallbackPath = launcherFallbackPath(for: identity)
+        guard let launcher = executionOrigin(
+            among: launchers,
+            callerPID: pid,
+            ancestorFallbackPath: ancestorFallbackPath
+        ) else {
+            reply(peer, to: message, ok: false, error: "Verified Launcher is unavailable")
+            return
+        }
+        var launcherProcessIdentity = AVProcessIdentity()
+        guard av_process_identity(launcher.pid, &launcherProcessIdentity),
+              let launcherExecution = retainedProcessExecution(
+                  pid: launcher.pid, identity: launcherProcessIdentity
+              )
+        else {
+            reply(peer, to: message, ok: false, error: "Verified Launcher process is unavailable")
+            return
+        }
+        let selected: SelectedSecretValues
+        do {
+            selected = try secretValueCustody.bind(names: keys, cwd: cwd)
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+            return
+        }
+        guard let missingKey = keys.first(where: { !selected.contains($0) }) else {
+            let title = keys.count == 1
+                ? "Allow the Varlock plugin to receive \(keys[0])?"
+                : "Allow the Varlock plugin to receive \(keys.count) Secrets?"
+            let request = ApprovalRequest(
+                op: ApprovalServiceOperation.varlock.rawValue,
+                keys: keys,
+                target: applicationPath,
+                args: Array((processArguments(resolutionIdentity.ppid) ?? []).dropFirst()),
+                cwd: cwd,
+                replaceExistingEnv: false,
+                allowMissingKeys: false,
+                envConflicts: [],
+                shebangScript: nil,
+                scriptData: nil,
+                tool: "Varlock plugin",
+                title: title,
+                detail: "This Secret Disclosure returns the selected Secret Values to Varlock for one application process. Schema SHA-256: \(schemaDigest).",
+                selectedSecretValues: selected
+            )
+            if denyRequestIfNeeded(request, signing: signing, launchers: launchers,
+                                   callerPath: callerPath, peer: peer, message: message) { return }
+            RunLoop.main.perform(inModes: [.modalPanel, .default]) {
+                MainActor.assumeIsolated {
+                    guard !cancellation.isCanceled, self.canRequestHumanApproval() else { return }
+                    self.sendEvent(humanApprovalRequiredEvent, to: peer)
+                }
+            }
+            Task { @MainActor in
+                if cancellation.isCanceled {
+                    _ = self.onAccessRequest(canceledAccessRequestRecord(
+                        request: request, callerPath: callerPath, launcher: launcher, launchers: launchers
+                    ))
+                    return
+                }
+                guard self.canRequestHumanApproval() else {
+                    _ = self.onAccessRequest(accessRequestRecord(
+                        request: request,
+                        callerPath: callerPath,
+                        decision: "Denied",
+                        approvalSource: "Auto",
+                        reason: "Human approval unavailable",
+                        launcher: launcher
+                    ))
+                    self.reply(peer, to: message, ok: false, error: "human approval unavailable")
+                    return
+                }
+                let decision = await showApprovalAlert(
+                    request: request,
+                    callerPath: callerPath,
+                    pid: pid,
+                    targetPID: applicationIdentity.pid,
+                    signing: signing,
+                    scriptApproval: nil,
+                    launcher: launcher,
+                    denialLaunchers: launchers,
+                    launcherFallbackPath: ancestorFallbackPath ?? applicationPath,
+                    automaticApprovalExplanation: nil,
+                    cancellation: cancellation
+                )
+                if self.denyRequestIfNeeded(request, signing: signing, launchers: launchers,
+                                           callerPath: callerPath, peer: peer, message: message) { return }
+                if decision == .canceled {
+                    _ = self.onAccessRequest(canceledAccessRequestRecord(
+                        request: request, callerPath: callerPath, launcher: launcher, launchers: launchers
+                    ))
+                    return
+                }
+                if decision == .interrupted {
+                    _ = self.onAccessRequest(interruptedAccessRequestRecord(
+                        request: request, callerPath: callerPath, launcher: launcher, launchers: launchers
+                    ))
+                    self.reply(peer, to: message, ok: false, error: "approval presentation interrupted")
+                    return
+                }
+                guard decision == .approved else {
+                    _ = self.onAccessRequest(accessRequestRecord(
+                        request: request,
+                        callerPath: callerPath,
+                        decision: "Denied",
+                        approvalSource: "Manual",
+                        reason: "Denied in prompt",
+                        launcher: launcher
+                    ))
+                    self.reply(
+                        peer,
+                        to: message,
+                        ok: false,
+                        error: "Varlock plugin request denied",
+                        humanApprovalDecision: "denied"
+                    )
+                    return
+                }
+                do {
+                    guard retainedProcessExecutionIsLive(resolutionExecution),
+                          retainedProcessExecutionIsLive(applicationExecution),
+                          retainedProcessExecutionIsLive(launcherExecution)
+                    else {
+                        throw AppError(
+                            "Varlock, its application, or its Verified Launcher changed before Secret release"
+                        )
+                    }
+                    let secrets = try self.approvedSecrets(for: request)
+                    guard secrets.count == keys.count,
+                          keys.allSatisfy({ secrets[$0] != nil })
+                    else {
+                        throw AppError("Automic Vault returned an incomplete Secret set")
+                    }
+                    let transaction = AuthorizationFulfillmentTransaction(material: secrets)
+                    guard transaction.commit(
+                        record: {
+                            self.onAccessRequest(accessRequestRecord(
+                                request: request,
+                                callerPath: callerPath,
+                                decision: "Approved",
+                                approvalSource: "Manual",
+                                reason: "Approved in prompt",
+                                launcher: launcher
+                            ))
+                        },
+                        activate: { _ in },
+                        observe: { secrets in
+                            self.recordLiveSecretUse(
+                                request: request,
+                                secretNames: Set(secrets.keys),
+                                launcher: launcher,
+                                execution: applicationExecution
+                            )
+                        },
+                        release: { secrets in
+                            if self.denyRequestIfNeeded(request, signing: signing, launchers: launchers,
+                                                       callerPath: callerPath, peer: peer, message: message) { return }
+                            self.reply(
+                                peer,
+                                to: message,
+                                ok: true,
+                                error: nil,
+                                secrets: secrets,
+                                protocolVersion: varlockProtocolVersion,
+                                humanApprovalDecision: "approved"
+                            )
+                        }
+                    ) else {
+                        throw AppError("Authorization History is unavailable")
+                    }
+                } catch {
+                    _ = self.onAccessRequest(accessRequestRecord(
+                        request: request,
+                        callerPath: callerPath,
+                        decision: error is LauncherDenialError ? "Denied" : "Failed",
+                        approvalSource: error is LauncherDenialError ? "Auto" : "Manual",
+                        reason: error.localizedDescription,
+                        launcher: error is LauncherDenialError ? (error as? LauncherDenialError)?.launcher : launcher
+                    ))
+                    self.reply(
+                        peer,
+                        to: message,
+                        ok: false,
+                        error: error.localizedDescription,
+                        humanApprovalDecision: "approved"
+                    )
+                }
+            }
+            return
+        }
+        reply(
+            peer,
+            to: message,
+            ok: false,
+            error: "failed to load secret \(missingKey): \(errSecItemNotFound)"
+        )
+    }
+
+    private func handleProxyStart(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        pid: pid_t,
+        identity: AVProcessIdentity,
+        callerPath: String,
+        signing: SigningInfo
+    ) {
+        guard let parsed = approvalRequest(from: message),
+              parsed.op == "proxy-start",
+              !parsed.keys.isEmpty,
+              Set(parsed.keys).count == parsed.keys.count,
+              parsed.target.hasPrefix("/"),
+              parsed.envConflicts.isEmpty || parsed.replaceExistingEnv,
+              identity.pidversion > 0,
+              identity.start_usec > 0,
+              identity.euid == geteuid()
+        else {
+            reply(peer, to: message, ok: false, error: "invalid Proxy Session request")
+            return
+        }
+        let selectedSecretValues: SelectedSecretValues
+        do {
+            selectedSecretValues = try secretValueCustody.bind(
+                names: parsed.keys,
+                cwd: parsed.cwd
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+            return
+        }
+        if let missingName = parsed.keys.first(where: { !selectedSecretValues.contains($0) }) {
+            reply(
+                peer,
+                to: message,
+                ok: false,
+                error: "failed to load secret \(missingName): \(errSecItemNotFound)"
+            )
+            return
+        }
+        let request = ApprovalRequest(
+            op: parsed.op,
+            keys: parsed.keys.sorted(),
+            target: parsed.target,
+            args: parsed.args,
+            cwd: parsed.cwd,
+            replaceExistingEnv: parsed.replaceExistingEnv,
+            allowMissingKeys: false,
+            envConflicts: parsed.envConflicts,
+            shebangScript: nil,
+            scriptData: nil,
+            tool: "Secret Proxy",
+            title: "Start this Proxy Session?",
+            detail: "The target receives random Secret References. Automic Vault will ask before releasing secrets to each new destination.",
+            selectedSecretValues: selectedSecretValues
+        )
+        let launchers = launcherIdentities(for: identity)
+        let ancestorFallbackPath = launcherFallbackPath(for: identity)
+        let launcher = executionOrigin(
+            among: launchers,
+            callerPID: pid,
+            ancestorFallbackPath: ancestorFallbackPath
+        )
+        let historyLauncher = denialActionLauncher(displayedLauncher: launcher, attributedLaunchers: launchers) ?? launcher
+        if denyRequestIfNeeded(request, signing: signing, launchers: launchers,
+                               callerPath: callerPath, peer: peer, message: message) { return }
+        let targetProtection = executableSigningInfo(path: request.target)?.runtimeProtection
+        let targetCodeIdentity = proxyExecutableCodeIdentity(path: request.target)
+        let warning = targetProtection?.allowsSecretGateAccess == true ? nil :
+            "The target does not meet Automic Vault’s Hardened Runtime requirements. Code injected into it may steal this Proxy Session’s references and credential, then reuse destinations you allow for the session."
+
+        Task { @MainActor in
+            guard !cancellation.isCanceled else {
+                _ = self.onAccessRequest(canceledAccessRequestRecord(
+                    request: request, callerPath: callerPath, launcher: launcher, launchers: launchers
+                ))
+                return
+            }
+            guard self.canRequestHumanApproval() else {
+                self.reply(peer, to: message, ok: false, error: "Proxy Session approval unavailable")
+                return
+            }
+            let decision = await showApprovalAlert(
+                request: request,
+                callerPath: callerPath,
+                pid: pid,
+                signing: signing,
+                scriptApproval: nil,
+                launcher: launcher,
+                denialLaunchers: launchers,
+                launcherFallbackPath: ancestorFallbackPath ?? callerPath,
+                automaticApprovalExplanation: warning,
+                cancellation: cancellation
+            )
+            if self.denyRequestIfNeeded(request, signing: signing, launchers: launchers,
+                                       callerPath: callerPath, peer: peer, message: message) { return }
+            if decision == .interrupted {
+                _ = self.onAccessRequest(interruptedAccessRequestRecord(
+                    request: request, callerPath: callerPath, launcher: launcher, launchers: launchers
+                ))
+                self.reply(peer, to: message, ok: false, error: "approval presentation interrupted")
+                return
+            }
+            guard decision == .approved else {
+                let canceled = decision == .canceled
+                _ = self.onAccessRequest(accessRequestRecord(
+                    request: request,
+                    callerPath: callerPath,
+                    decision: canceled ? "Canceled" : "Denied",
+                    approvalSource: "Manual",
+                    reason: canceled ? "Approval canceled" : "Denied in prompt",
+                    launcher: historyLauncher
+                ))
+                if !canceled {
+                    self.reply(
+                        peer,
+                        to: message,
+                        ok: false,
+                        error: "Proxy Session denied",
+                        humanApprovalDecision: "denied"
+                    )
+                }
+                return
+            }
+            guard self.onAccessRequest(accessRequestRecord(
+                request: request,
+                callerPath: callerPath,
+                decision: "Approved",
+                approvalSource: "Manual",
+                reason: "Proxy Session approved once",
+                launcher: historyLauncher
+            )) else {
+                self.reply(peer, to: message, ok: false, error: "Authorization History is unavailable")
+                return
+            }
+            let launch = ProxySessionLaunch(
+                keys: request.keys,
+                target: request.target,
+                arguments: request.args,
+                cwd: request.cwd,
+                selectedSecretValues: request.selectedSecretValues,
+                targetCodeIdentity: targetCodeIdentity,
+                launchers: launchers,
+                launcher: launcher,
+                identity: ProxyTargetIdentity(
+                    pid: identity.pid,
+                    pidVersion: identity.pidversion,
+                    startUsec: identity.start_usec,
+                    effectiveUserID: identity.euid,
+                    auditSessionID: identity.audit_session_id
+                )
+            )
+            Task {
+                do {
+                    let material = try await SecretProxyCoordinator.shared.start(
+                        launch: launch,
+                        secretValueCustody: self.secretValueCustody,
+                        approveDestination: { destination, cancellation in
+                            let destinationRequest = ApprovalRequest(
+                                op: "proxy-destination",
+                                keys: destination.secretNames,
+                                target: destination.target,
+                                args: [destination.method, destination.origin + destination.path],
+                                cwd: destination.cwd,
+                                replaceExistingEnv: false,
+                                allowMissingKeys: false,
+                                envConflicts: [],
+                                shebangScript: nil,
+                                scriptData: nil,
+                                tool: "Secret Proxy",
+                                title: "Allow secrets for \(destination.origin)?",
+                                detail: destination.queryNames.isEmpty
+                                    ? "The proxy will request these secrets on demand for this URL."
+                                    : "The proxy will request these secrets on demand. Query values remain hidden; names: \(destination.queryNames.sorted().joined(separator: ", ")).",
+                                selectedSecretValues: destination.selectedSecretValues
+                            )
+                            return switch await showApprovalAlert(
+                                request: destinationRequest,
+                                callerPath: callerPath,
+                                pid: pid,
+                                signing: signing,
+                                scriptApproval: nil,
+                                launcher: launcher,
+                                denialLaunchers: launchers,
+                                launcherFallbackPath: ancestorFallbackPath ?? callerPath,
+                                automaticApprovalExplanation: warning,
+                                allowsPersistentApproval: true,
+                                persistentApprovalLabel: "Allow for Session",
+                                cancellation: cancellation
+                            ) {
+                            case .approved: ProxyDestinationDecision.allowOnce
+                            case .alwaysApproved: ProxyDestinationDecision.allowForSession
+                            case .canceled, .interrupted, .denied, .temporaryWriteAccess, .rebless:
+                                ProxyDestinationDecision.deny
+                            case .reevaluated:
+                                preconditionFailure("proxy destination approval cannot be reevaluated")
+                            }
+                        }
+                    )
+                    self.reply(
+                        peer,
+                        to: message,
+                        ok: true,
+                        error: nil,
+                        proxySession: material,
+                        humanApprovalDecision: "approved"
+                    )
+                } catch {
+                    self.reply(peer, to: message, ok: false, error: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func matchingBlessedScript(
+        request: ApprovalRequest,
+        approval: ScriptApproval,
+        launchers: [LauncherIdentity]
+    ) -> (BlessedScript, LauncherIdentity)? {
+        let scripts = loadBlessedScripts()
+        for launcher in launchers {
+            if let script = scripts.first(where: {
+                blessedScriptMatches($0, request: request, approval: approval, launcher: launcher)
+            }) {
+                return (script, launcher)
+            }
+        }
+        return nil
+    }
+
+    private func matchingBlessedScriptExecution(
+        request: ApprovalRequest,
+        approval: ScriptApproval
+    ) -> BlessedScript? {
+        guard request.op == "inject", request.scriptData != nil else { return nil }
+        return loadBlessedScripts().first {
+            $0.allowsExecution(
+                snapshotIncompatibleInterpreter: request.snapshotIncompatibleInterpreter
+            )
+                && $0.matchesExecution(
+                path: approval.path,
+                checksum: approval.checksum,
+                keys: request.keys,
+                target: request.target,
+                replaceExistingEnv: request.replaceExistingEnv,
+                allowMissingKeys: request.allowMissingKeys
+            )
+        }
+    }
+
+    private func registerBlessedExecution(
+        _ script: BlessedScript,
+        pid: pid_t,
+        identity: AVProcessIdentity
+    ) {
+        blessedExecutionsLock.lock()
+        blessedExecutions[BlessedExecutionKey(pid: pid, startUsec: identity.start_usec)] = script
+        blessedExecutionsLock.unlock()
+    }
+
+    private func activeBlessedScripts(pid: pid_t, identity: AVProcessIdentity) -> [BlessedScript] {
+        let currentBlessings = loadBlessedScripts()
+        blessedExecutionsLock.lock()
+        let executions = blessedExecutions
+        blessedExecutionsLock.unlock()
+
+        let staleExecutions = executions.keys.filter { !executionIsLive($0) }
+        blessedExecutionsLock.lock()
+        for key in staleExecutions where blessedExecutions[key] == executions[key] {
+            blessedExecutions.removeValue(forKey: key)
+        }
+        let activeExecutions = blessedExecutions
+        blessedExecutionsLock.unlock()
+
+        var scripts: [BlessedScript] = []
+        var currentPID = pid
+        var currentIdentity = identity
+        for _ in 0..<64 {
+            if let script = activeExecutions[BlessedExecutionKey(
+                pid: currentPID,
+                startUsec: currentIdentity.start_usec
+            )], currentBlessings.contains(script) {
+                scripts.append(script)
+            }
+            guard currentIdentity.ppid > 1 else { return scripts }
+            currentPID = currentIdentity.ppid
+            guard av_process_identity(currentPID, &currentIdentity) else { return scripts }
+        }
+        return scripts
+    }
+
+    private func activeSSHScriptAuthority(ancestors: [AVProcessIdentity]) -> ActiveScriptAuthority {
+        pruneInactiveScriptExecutions()
+        let currentBlessings = loadBlessedScripts()
+        blessedExecutionsLock.lock()
+        let executions = blessedExecutions
+        let ceilings = emptyCapabilityCeilings
+        blessedExecutionsLock.unlock()
+        return sshScriptAuthority(
+            ancestors: ancestors,
+            executions: executions,
+            ceilings: ceilings,
+            currentBlessings: currentBlessings
+        )
+    }
+
+    private func pruneInactiveScriptExecutions() {
+        blessedExecutionsLock.lock()
+        let executions = blessedExecutions
+        let ceilings = emptyCapabilityCeilings
+        blessedExecutionsLock.unlock()
+        let deadExecutions = executions.keys.filter { !executionIsLive($0) }
+        let deadCeilings = ceilings.filter { !executionIsLive($0) }
+        blessedExecutionsLock.lock()
+        for key in deadExecutions where blessedExecutions[key] == executions[key] {
+            blessedExecutions.removeValue(forKey: key)
+        }
+        emptyCapabilityCeilings.subtract(deadCeilings)
+        blessedExecutionsLock.unlock()
+    }
+
+    private func registerEmptyCapabilityCeiling(pid: pid_t, identity: AVProcessIdentity) {
+        blessedExecutionsLock.lock()
+        emptyCapabilityCeilings.insert(BlessedExecutionKey(pid: pid, startUsec: identity.start_usec))
+        blessedExecutionsLock.unlock()
+    }
+
+    private func activeEmptyCapabilityCeiling(pid: pid_t, identity: AVProcessIdentity) -> Bool {
+        let currentBlessings = loadBlessedScripts()
+        blessedExecutionsLock.lock()
+        let ceilings = emptyCapabilityCeilings
+        let executions = blessedExecutions
+        blessedExecutionsLock.unlock()
+
+        let staleCeilings = ceilings.filter { !executionIsLive($0) }
+        blessedExecutionsLock.lock()
+        emptyCapabilityCeilings.subtract(staleCeilings)
+        let activeCeilings = emptyCapabilityCeilings
+        blessedExecutionsLock.unlock()
+
+        var currentPID = pid
+        var currentIdentity = identity
+        for _ in 0..<64 {
+            let key = BlessedExecutionKey(
+                pid: currentPID,
+                startUsec: currentIdentity.start_usec
+            )
+            if activeCeilings.contains(key)
+                || (executions[key].map { !currentBlessings.contains($0) } ?? false)
+            {
+                return true
+            }
+            guard currentIdentity.ppid > 1 else { return false }
+            currentPID = currentIdentity.ppid
+            guard av_process_identity(currentPID, &currentIdentity) else { return false }
+        }
+        return false
+    }
+
+    private func executionIsLive(_ key: BlessedExecutionKey) -> Bool {
+        var identity = AVProcessIdentity()
+        return av_process_identity(key.pid, &identity) && identity.start_usec == key.startUsec
+    }
+
+    private func handleBlessedCapability(
+        _ script: BlessedScript,
+        request: ApprovalRequest,
+        signing: SigningInfo,
+        descriptors: [SecretGateDescriptor],
+        launchers: [LauncherIdentity],
+        launcher: LauncherIdentity?,
+        callerPath: String,
+        awsRegistration: AWSRegistrationCandidate?,
+        pid: pid_t,
+        identity: AVProcessIdentity,
+        peer: xpc_connection_t,
+        message: xpc_object_t
+    ) -> Bool {
+        guard blessedScriptCanAutoApprove(
+            script,
+            request: request,
+            signing: signing,
+            descriptors: descriptors
+        ) else { return false }
+
+        do {
+            let accessRequestID = UUID()
+            let record = accessRequestRecord(
+                id: accessRequestID,
+                request: request,
+                callerPath: callerPath,
+                decision: "Approved",
+                approvalSource: "Auto",
+                reason: "Blessed script \(script.path)",
+                launcher: launcher
+            )
+            guard try fulfillApprovedRequest(
+                request: request,
+                signing: signing,
+                awsRegistration: awsRegistration,
+                pid: pid,
+                identity: identity,
+                record: record,
+                launchers: launchers,
+                launcher: launcher,
+                sshScriptAuthorization: request.sshPeer == nil ? nil : .blessing(script),
+                activateAfterRecording: {
+                    if let launcher {
+                        Task { @MainActor in
+                            self.onAutoApproval(autoApprovalRecord(
+                                accessRequestID: accessRequestID,
+                                request: request,
+                                script: ScriptApproval(
+                                    path: script.path,
+                                    checksum: script.checksum
+                                ),
+                                launcher: launcher
+                            ))
+                        }
+                    }
+                },
+                release: { payload in
+                    reply(
+                        peer,
+                        to: message,
+                        ok: true,
+                        error: nil,
+                        secrets: payload.secrets,
+                        value: payload.value
+                    )
+                }
+            ) else {
+                reply(peer, to: message, ok: false, error: "Authorization History is unavailable")
+                return true
+            }
+        } catch {
+            _ = onAccessRequest(accessRequestRecord(
+                request: request,
+                callerPath: callerPath,
+                decision: error is LauncherDenialError ? "Denied" : "Failed",
+                approvalSource: "Auto",
+                reason: error.localizedDescription,
+                launcher: error is LauncherDenialError ? (error as? LauncherDenialError)?.launcher : launcher
+            ))
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+        return true
+    }
+
+    private func handleSave(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller,
+        ifAbsentOrEqual: Bool = false
+    ) {
+        guard let pendingNames = pendingSecretMutationNames() else {
+            reply(peer, to: message, ok: false, error: "pending Secret mutation state is unavailable")
+            return
+        }
+        if !pendingNames.isEmpty {
+            let status = resumePendingSecretMutation()
+            reply(
+                peer,
+                to: message,
+                ok: false,
+                error: status == errSecSuccess
+                    ? "a previous Secret mutation was repaired; retry this save"
+                    : "a previous Secret mutation still requires repair: \(status)"
+            )
+            return
+        }
+        guard let keyPointer = xpc_dictionary_get_string(message, "key"),
+              let valuePointer = xpc_dictionary_get_string(message, "value")
+        else {
+            reply(peer, to: message, ok: false, error: "invalid save request")
+            return
+        }
+        let key = String(cString: keyPointer)
+        guard validSecretKeyName(key) else {
+            reply(peer, to: message, ok: false, error: "invalid secret name: \(key)")
+            return
+        }
+        let value = String(cString: valuePointer)
+        let projectDirectory = xpc_dictionary_get_string(message, "project_directory")
+            .map(String.init(cString:))
+        if ifAbsentOrEqual, projectDirectory != nil {
+            reply(peer, to: message, ok: false, error: "conditional save does not support Project Values")
+            return
+        }
+        let directAccessRules: [DirectAccessRule]
+        switch loadDirectAccessRulesResult() {
+        case .success(let loaded): directAccessRules = loaded
+        case .failure(let status):
+            reply(peer, to: message, ok: false, error: "Direct Access policy is unavailable: \(status)")
+            return
+        }
+        let storedSecrets: [StoredSecret]
+        switch loadStoredSecretsResult(directAccessRules: directAccessRules) {
+        case .success(let loaded): storedSecrets = loaded
+        case .failure(let status):
+            reply(peer, to: message, ok: false, error: SecretValueCustodyError.inventoryUnavailable(status).localizedDescription)
+            return
+        }
+        let storedSecret = storedSecrets.first { $0.account == key }
+        if let storedSecret, !storedSecret.hasConsistentAccessibility {
+            reply(peer, to: message, ok: false, error: "secret \(key) must be repaired before it can be changed")
+            return
+        }
+        let accessibility = storedSecret?.accessibility ?? .whenUnlocked
+        let directAccessWarning: String
+        if let launchers = storedSecret?.directAccessLaunchers, !launchers.isEmpty {
+            directAccessWarning = "Direct Access Launchers already authorized for \(key) can use this value immediately: "
+                + launchers.map(\.bundleIdentifier).joined(separator: ", ") + "."
+        } else {
+            directAccessWarning = ""
+        }
+        let mutation: SecretMutation
+        if ifAbsentOrEqual {
+            mutation = .saveIfAbsentOrEqual(
+                account: key,
+                value: value,
+                warning: directAccessWarning
+            )
+        } else if let projectDirectory {
+            do {
+                _ = try validateCanonicalProjectDirectory(projectDirectory)
+            } catch {
+                reply(peer, to: message, ok: false, error: error.localizedDescription)
+                return
+            }
+            var warning = "This will create or replace a Project Value for \(escapedSecurityPath(projectDirectory))."
+            if !directAccessWarning.isEmpty { warning += " \(directAccessWarning)" }
+            let source: StoredSecretValueSource = .projectDirectory(projectDirectory)
+            if storedSecret?.values.contains(where: { $0.source == source }) != true,
+               let inherited = try? resolveStoredSecretValues(
+                   names: [key], cwd: projectDirectory, secrets: storedSecret.map { [$0] } ?? []
+               )[key]
+            {
+                warning += " It will mask the inherited \(escapedSecurityPath(inherited.source.displayName))."
+            }
+            mutation = .saveProject(
+                account: key,
+                value: value,
+                directory: projectDirectory,
+                accessibility: accessibility,
+                warning: warning
+            )
+        } else {
+            mutation = .save(
+                account: key,
+                value: value,
+                accessibility: accessibility,
+                warning: directAccessWarning
+            )
+        }
+        handleMutation(
+            mutation,
+            on: peer,
+            message: message,
+            cancellation: cancellation,
+            caller: caller
+        )
+    }
+
+    private func handleBless(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        identity: AVProcessIdentity
+    ) {
+        guard let pathPointer = xpc_dictionary_get_string(message, "path") else {
+            reply(peer, to: message, ok: false, error: "invalid bless request")
+            return
+        }
+        let path = String(cString: pathPointer)
+        guard path.hasPrefix("/"),
+              URL(fileURLWithPath: path).standardizedFileURL.path == path,
+              URL(fileURLWithPath: path).resolvingSymlinksInPath().path == path
+        else {
+            reply(peer, to: message, ok: false, error: "script path must be canonical")
+            return
+        }
+        let scriptData: Data
+        let declaration: BlessedScriptDeclaration
+        do {
+            scriptData = try readBlessedScript(path: path)
+            declaration = try blessedScriptDeclaration(data: scriptData)
+        } catch {
+            reply(peer, to: message, ok: false, error: "script cannot be blessed: \(error.localizedDescription)")
+            return
+        }
+        for (id, protection) in declaration.manifest.capabilities {
+            guard let descriptor = secretGateDescriptors.first(where: { $0.id == id }) else {
+                reply(peer, to: message, ok: false, error: "unknown script capability: \(id)")
+                return
+            }
+            let gate = SecretGate(
+                id: descriptor.id,
+                keyPatterns: descriptor.keyPatterns,
+                routes: descriptor.routes,
+                defaultProtection: .noAccess,
+                appPolicies: []
+            )
+            guard gate.availableProtections.contains(gate.normalizedProtection(protection)) else {
+                reply(peer, to: message, ok: false, error: "unsupported access level for \(id)")
+                return
+            }
+        }
+        if loadBlessedScripts().contains(where: {
+            $0.matchesBlessing(path: path, checksum: declaration.checksum)
+                && $0.allowsExecution(
+                    snapshotIncompatibleInterpreter: declaration.snapshotIncompatibleInterpreter
+                )
+        }) {
+            reply(peer, to: message, ok: true, error: nil, value: "already blessed")
+            return
+        }
+        let launcher = xpc_dictionary_get_bool(message, "endorse_caller")
+            ? launcherIdentities(for: identity).first { !$0.isStandalone }
+            : nil
+        let request = BlessedScriptReviewRequest(
+            path: path,
+            declaration: declaration,
+            scriptData: scriptData,
+            launcher: launcher.map {
+                BlessedScriptLauncher(
+                    bundleIdentifier: $0.identifier,
+                    requirement: $0.designatedRequirement
+                )
+            }
+        )
+        DispatchQueue.main.async {
+            guard self.canRequestHumanApproval() else {
+                self.reply(peer, to: message, ok: false, error: "user approval is unavailable")
+                return
+            }
+            self.sendEvent(humanApprovalRequiredEvent, to: peer)
+            self.onBlessRequest(request) { outcome in
+                let reply = blessingReply(for: outcome)
+                self.reply(
+                    peer,
+                    to: message,
+                    ok: reply.ok,
+                    error: reply.error,
+                    humanApprovalDecision: reply.humanApprovalDecision
+                )
+            }
+        }
+    }
+
+    private func handleGhSave(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let keyPointer = xpc_dictionary_get_string(message, "key"),
+              isGhTokenKey(String(cString: keyPointer))
+        else {
+            reply(peer, to: message, ok: false, error: "invalid GitHub token key")
+            return
+        }
+        handleSave(message, on: peer, cancellation: cancellation, caller: caller)
+    }
+
+    private func handleGhDelete(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let keyPointer = xpc_dictionary_get_string(message, "key"),
+              isGhTokenKey(String(cString: keyPointer))
+        else {
+            reply(peer, to: message, ok: false, error: "invalid GitHub token key")
+            return
+        }
+        handleDelete(message, on: peer, cancellation: cancellation, caller: caller)
+    }
+
+    private func handleStripeSave(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let keyPointer = xpc_dictionary_get_string(message, "key"),
+              isStripeCredentialKey(String(cString: keyPointer))
+        else {
+            reply(peer, to: message, ok: false, error: "invalid Stripe credential key")
+            return
+        }
+        handleSave(message, on: peer, cancellation: cancellation, caller: caller)
+    }
+
+    private func handleStripeDelete(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let keyPointer = xpc_dictionary_get_string(message, "key"),
+              isStripeCredentialKey(String(cString: keyPointer))
+        else {
+            reply(peer, to: message, ok: false, error: "invalid Stripe credential key")
+            return
+        }
+        handleDelete(message, on: peer, cancellation: cancellation, caller: caller)
+    }
+
+    private func handleDockerSave(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let keyPointer = xpc_dictionary_get_string(message, "key"),
+              let valuePointer = xpc_dictionary_get_string(message, "value")
+        else {
+            reply(peer, to: message, ok: false, error: "invalid registry credential store request")
+            return
+        }
+        let key = String(cString: keyPointer)
+        let value = String(cString: valuePointer)
+        guard let credential = parseDockerCredential(value),
+              key == dockerCredentialSecretName(credential.serverURL)
+        else {
+            reply(peer, to: message, ok: false, error: "invalid registry credential")
+            return
+        }
+        do {
+            let parent = try dockerCredentialParent(for: caller.identity)
+            let mutation: SecretMutation = credentialHelperTool(parent) == "podman"
+                ? .podmanSave(account: key, value: value, serverURL: credential.serverURL, username: credential.username)
+                : .dockerSave(account: key, value: value, serverURL: credential.serverURL, username: credential.username)
+            handleMutation(
+                mutation,
+                on: peer,
+                message: message,
+                cancellation: cancellation,
+                caller: caller,
+                requiredCredentialParent: parent
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+    }
+
+    private func handleDockerDelete(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let keyPointer = xpc_dictionary_get_string(message, "key"),
+              let serverPointer = xpc_dictionary_get_string(message, "docker_server_url")
+        else {
+            reply(peer, to: message, ok: false, error: "invalid registry credential erase request")
+            return
+        }
+        let key = String(cString: keyPointer)
+        let serverURL = String(cString: serverPointer)
+        guard validDockerServerURL(serverURL), key == dockerCredentialSecretName(serverURL) else {
+            reply(peer, to: message, ok: false, error: "invalid registry credential")
+            return
+        }
+        do {
+            let parent = try dockerCredentialParent(for: caller.identity)
+            let mutation: SecretMutation = credentialHelperTool(parent) == "podman"
+                ? .podmanDelete(account: key, serverURL: serverURL)
+                : .dockerDelete(account: key, serverURL: serverURL)
+            handleMutation(
+                mutation,
+                on: peer,
+                message: message,
+                cancellation: cancellation,
+                caller: caller,
+                requiredCredentialParent: parent
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+    }
+
+    private func handleDelete(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let keyPointer = xpc_dictionary_get_string(message, "key") else {
+            reply(peer, to: message, ok: false, error: "invalid delete request")
+            return
+        }
+        let key = String(cString: keyPointer)
+        guard validSecretKeyName(key) else {
+            reply(peer, to: message, ok: false, error: "invalid secret name: \(key)")
+            return
+        }
+        handleMutation(
+            .delete(account: key),
+            on: peer,
+            message: message,
+            cancellation: cancellation,
+            caller: caller
+        )
+    }
+
+    private func handleGoatSave(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let scopePointer = xpc_dictionary_get_string(message, "goat_scope"),
+              let valuePointer = xpc_dictionary_get_string(message, "value"),
+              let scope = parseGoatCredentialScope(String(cString: scopePointer)),
+              let value = parseGoatCredential(String(cString: valuePointer))
+        else {
+            reply(peer, to: message, ok: false, error: "invalid goat credential store request")
+            return
+        }
+        do {
+            let parent = try goatCredentialParent(for: caller.identity)
+            handleMutation(
+                .goatSave(account: scope.secretName, value: value, scope: scope.canonical),
+                on: peer, message: message, cancellation: cancellation, caller: caller,
+                requiredCredentialParent: parent
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+    }
+
+    private func handleGoatDelete(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let scopePointer = xpc_dictionary_get_string(message, "goat_scope"),
+              let scope = parseGoatCredentialScope(String(cString: scopePointer))
+        else {
+            reply(peer, to: message, ok: false, error: "invalid goat credential forget request")
+            return
+        }
+        do {
+            let parent = try goatCredentialParent(for: caller.identity)
+            handleMutation(
+                .goatDelete(account: scope.secretName, scope: scope.canonical),
+                on: peer, message: message, cancellation: cancellation, caller: caller,
+                requiredCredentialParent: parent
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+    }
+
+    private func handleRailwaySave(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let scopePointer = xpc_dictionary_get_string(message, "railway_scope"),
+              let valuePointer = xpc_dictionary_get_string(message, "value"),
+              let scope = parseRailwayCredentialScope(String(cString: scopePointer)),
+              let value = parseRailwayCredential(String(cString: valuePointer))
+        else {
+            reply(peer, to: message, ok: false, error: "invalid Railway credential store request")
+            return
+        }
+        do {
+            let parent = try railwayCredentialParent(for: caller.identity)
+            handleMutation(
+                .railwaySave(account: scope.secretName, value: value, scope: scope.canonical),
+                on: peer, message: message, cancellation: cancellation, caller: caller,
+                requiredCredentialParent: parent
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+    }
+
+    private func handleOrdercliSave(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let scopePointer = xpc_dictionary_get_string(message, "ordercli_scope"),
+              let valuePointer = xpc_dictionary_get_string(message, "value"),
+              let scope = parseOrdercliCredentialScope(String(cString: scopePointer)),
+              let value = parseOrdercliCredential(String(cString: valuePointer))
+        else {
+            reply(peer, to: message, ok: false, error: "invalid ordercli credential store request")
+            return
+        }
+        do {
+            let parent = try ordercliCredentialParent(for: caller.identity)
+            handleMutation(
+                .ordercliSave(account: scope.secretName, value: value, scope: scope.canonical),
+                on: peer, message: message, cancellation: cancellation, caller: caller,
+                requiredCredentialParent: parent
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+    }
+
+    private func handleOrdercliDelete(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let scopePointer = xpc_dictionary_get_string(message, "ordercli_scope"),
+              let scope = parseOrdercliCredentialScope(String(cString: scopePointer))
+        else {
+            reply(peer, to: message, ok: false, error: "invalid ordercli credential forget request")
+            return
+        }
+        do {
+            let parent = try ordercliCredentialParent(for: caller.identity)
+            handleMutation(
+                .ordercliDelete(account: scope.secretName, scope: scope.canonical),
+                on: peer, message: message, cancellation: cancellation, caller: caller,
+                requiredCredentialParent: parent
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+    }
+
+    private func handleOpenHueSave(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let scopePointer = xpc_dictionary_get_string(message, "openhue_scope"),
+              let valuePointer = xpc_dictionary_get_string(message, "value"),
+              let scope = parseOpenHueCredentialScope(String(cString: scopePointer)),
+              let value = parseOpenHueCredential(String(cString: valuePointer))
+        else {
+            reply(peer, to: message, ok: false, error: "invalid OpenHue credential store request")
+            return
+        }
+        do {
+            let parent = try openhueCredentialParent(for: caller.identity)
+            handleMutation(
+                .openhueSave(account: scope.secretName, value: value, scope: scope.canonical),
+                on: peer, message: message, cancellation: cancellation, caller: caller,
+                requiredCredentialParent: parent
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+    }
+
+    private func handlePlumberSave(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let valuePointer = xpc_dictionary_get_string(message, "value"),
+              let value = parsePlumberCredential(String(cString: valuePointer)),
+              let scope = parsePlumberCredentialScope(plumberCredentialScope)
+        else {
+            reply(peer, to: message, ok: false, error: "invalid Plumber config store request")
+            return
+        }
+        do {
+            let parent = try plumberCredentialParent(for: caller.identity)
+            handleMutation(
+                .plumberSave(account: scope.secretName, value: value, scope: scope.canonical),
+                on: peer, message: message, cancellation: cancellation, caller: caller,
+                requiredCredentialParent: parent
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+    }
+
+    private func handleUAASave(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let scopePointer = xpc_dictionary_get_string(message, "uaa_scope"),
+              let valuePointer = xpc_dictionary_get_string(message, "value"),
+              let scope = parseUAACredentialScope(String(cString: scopePointer)),
+              let value = parseUAACredential(String(cString: valuePointer))
+        else {
+            reply(peer, to: message, ok: false, error: "invalid UAA credential store request")
+            return
+        }
+        do {
+            let parent = try uaaCredentialParent(for: caller.identity)
+            handleMutation(
+                .uaaSave(account: scope.secretName, value: value, scope: scope.canonical),
+                on: peer, message: message, cancellation: cancellation, caller: caller,
+                requiredCredentialParent: parent
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+    }
+
+    private func handleUAADelete(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let scopePointer = xpc_dictionary_get_string(message, "uaa_scope"),
+              let scope = parseUAACredentialScope(String(cString: scopePointer))
+        else {
+            reply(peer, to: message, ok: false, error: "invalid UAA credential forget request")
+            return
+        }
+        do {
+            let parent = try uaaCredentialParent(for: caller.identity)
+            handleMutation(
+                .uaaDelete(account: scope.secretName, scope: scope.canonical),
+                on: peer, message: message, cancellation: cancellation, caller: caller,
+                requiredCredentialParent: parent
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+    }
+
+    private func handleRailwayDelete(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let scopePointer = xpc_dictionary_get_string(message, "railway_scope"),
+              let scope = parseRailwayCredentialScope(String(cString: scopePointer))
+        else {
+            reply(peer, to: message, ok: false, error: "invalid Railway credential forget request")
+            return
+        }
+        do {
+            let parent = try railwayCredentialParent(for: caller.identity)
+            handleMutation(
+                .railwayDelete(account: scope.secretName, scope: scope.canonical),
+                on: peer, message: message, cancellation: cancellation, caller: caller,
+                requiredCredentialParent: parent
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+    }
+
+    private func handleOxideSave(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let scopePointer = xpc_dictionary_get_string(message, "oxide_scope"),
+              let valuePointer = xpc_dictionary_get_string(message, "value"),
+              let scope = parseOxideCredentialScope(String(cString: scopePointer)),
+              let value = parseOxideCredential(String(cString: valuePointer))
+        else {
+            reply(peer, to: message, ok: false, error: "invalid Oxide credential store request")
+            return
+        }
+        do {
+            let parent = try oxideCredentialParent(for: caller.identity)
+            handleMutation(
+                .oxideSave(account: scope.secretName, value: value, scope: scope.canonical),
+                on: peer,
+                message: message,
+                cancellation: cancellation,
+                caller: caller,
+                requiredCredentialParent: parent
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+    }
+
+    private func handleOxideDelete(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let scopePointer = xpc_dictionary_get_string(message, "oxide_scope"),
+              let scope = parseOxideCredentialScope(String(cString: scopePointer))
+        else {
+            reply(peer, to: message, ok: false, error: "invalid Oxide credential forget request")
+            return
+        }
+        do {
+            let parent = try oxideCredentialParent(for: caller.identity)
+            handleMutation(
+                .oxideDelete(account: scope.secretName, scope: scope.canonical),
+                on: peer,
+                message: message,
+                cancellation: cancellation,
+                caller: caller,
+                requiredCredentialParent: parent
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+    }
+
+    private func handleFastlySave(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let scopePointer = xpc_dictionary_get_string(message, "fastly_scope"),
+              let valuePointer = xpc_dictionary_get_string(message, "value"),
+              let scope = parseFastlyCredentialScope(String(cString: scopePointer)),
+              let value = parseFastlyCredential(String(cString: valuePointer))
+        else {
+            reply(peer, to: message, ok: false, error: "invalid Fastly credential store request")
+            return
+        }
+        do {
+            let parent = try fastlyCredentialParent(for: caller.identity)
+            handleMutation(
+                .fastlySave(account: scope.secretName, value: value, scope: scope.canonical),
+                on: peer, message: message, cancellation: cancellation, caller: caller,
+                requiredCredentialParent: parent
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+    }
+
+    private func handleFastlyDelete(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let scopePointer = xpc_dictionary_get_string(message, "fastly_scope"),
+              let scope = parseFastlyCredentialScope(String(cString: scopePointer))
+        else {
+            reply(peer, to: message, ok: false, error: "invalid Fastly credential forget request")
+            return
+        }
+        do {
+            let parent = try fastlyCredentialParent(for: caller.identity)
+            handleMutation(
+                .fastlyDelete(account: scope.secretName, scope: scope.canonical),
+                on: peer, message: message, cancellation: cancellation, caller: caller,
+                requiredCredentialParent: parent
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+    }
+
+    private func handleSqlcmdSave(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let scopePointer = xpc_dictionary_get_string(message, "sqlcmd_scope"),
+              let valuePointer = xpc_dictionary_get_string(message, "value"),
+              let scope = parseSqlcmdCredentialScope(String(cString: scopePointer)),
+              scope.address.isEmpty, scope.port == 0,
+              let value = parseSqlcmdPassword(String(cString: valuePointer))
+        else {
+            reply(peer, to: message, ok: false, error: "invalid sqlcmd credential store request")
+            return
+        }
+        do {
+            let parent = try sqlcmdCredentialParent(for: caller.identity)
+            handleMutation(
+                .sqlcmdSave(account: scope.secretName, value: value, scope: scope.canonical),
+                on: peer, message: message, cancellation: cancellation, caller: caller,
+                requiredCredentialParent: parent
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+    }
+
+    private func handleSqlcmdDelete(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let scopePointer = xpc_dictionary_get_string(message, "sqlcmd_scope"),
+              let scope = parseSqlcmdCredentialScope(String(cString: scopePointer)),
+              scope.address.isEmpty, scope.port == 0
+        else {
+            reply(peer, to: message, ok: false, error: "invalid sqlcmd credential forget request")
+            return
+        }
+        do {
+            let parent = try sqlcmdCredentialParent(for: caller.identity)
+            handleMutation(
+                .sqlcmdDelete(account: scope.secretName, scope: scope.canonical),
+                on: peer, message: message, cancellation: cancellation, caller: caller,
+                requiredCredentialParent: parent
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+    }
+
+    private func handleTerraformSave(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let hostnamePointer = xpc_dictionary_get_string(message, "terraform_hostname"),
+              let valuePointer = xpc_dictionary_get_string(message, "value")
+        else {
+            reply(peer, to: message, ok: false, error: "invalid Terraform credential store request")
+            return
+        }
+        let hostname = String(cString: hostnamePointer)
+        let value = String(cString: valuePointer)
+        guard let normalized = normalizeTerraformHostname(hostname),
+              normalized == hostname,
+              parseTerraformCredential(value) != nil
+        else {
+            reply(peer, to: message, ok: false, error: "invalid Terraform credential")
+            return
+        }
+        do {
+            let parent = try terraformCredentialParent(for: caller.identity)
+            handleMutation(
+                .terraformSave(
+                    account: terraformCredentialSecretName(hostname),
+                    value: value,
+                    hostname: hostname
+                ),
+                on: peer,
+                message: message,
+                cancellation: cancellation,
+                caller: caller,
+                requiredCredentialParent: parent
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+    }
+
+    private func handleTerraformDelete(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller
+    ) {
+        guard let hostnamePointer = xpc_dictionary_get_string(message, "terraform_hostname") else {
+            reply(peer, to: message, ok: false, error: "invalid Terraform credential forget request")
+            return
+        }
+        let hostname = String(cString: hostnamePointer)
+        guard normalizeTerraformHostname(hostname) == hostname else {
+            reply(peer, to: message, ok: false, error: "invalid Terraform hostname")
+            return
+        }
+        do {
+            let parent = try terraformCredentialParent(for: caller.identity)
+            handleMutation(
+                .terraformDelete(
+                    account: terraformCredentialSecretName(hostname),
+                    hostname: hostname
+                ),
+                on: peer,
+                message: message,
+                cancellation: cancellation,
+                caller: caller,
+                requiredCredentialParent: parent
+            )
+        } catch {
+            reply(peer, to: message, ok: false, error: error.localizedDescription)
+        }
+    }
+
+    private func handleMutation(
+        _ mutation: SecretMutation,
+        on peer: xpc_connection_t,
+        message: xpc_object_t,
+        cancellation: ApprovalCancellation,
+        caller: MutationCaller,
+        requiredCredentialParent: CredentialHelperParent? = nil
+    ) {
+        guard let cwdPointer = xpc_dictionary_get_string(message, "cwd") else {
+            reply(peer, to: message, ok: false, error: "secret mutation is missing its working directory")
+            return
+        }
+        let cwd = String(cString: cwdPointer)
+        let launchers = launcherIdentities(for: caller.identity)
+        let launcher = requiredCredentialParent.flatMap { parent in
+            var identity = AVProcessIdentity()
+            guard av_process_identity(parent.pid, &identity) else { return nil }
+            return launcherIdentity(pid: parent.pid, identity: identity)
+        } ?? launchers.first
+        let launcherFallbackPath = launcherFallbackPath(for: caller.identity) ?? caller.path
+        let request = mutation.approvalRequest(callerPath: caller.path, requestCWD: cwd)
+        let requestOverride = requiredCredentialParent.map { parent in
+            let tool = credentialHelperTool(parent)
+            return ApprovalRequest(
+                op: request.op,
+                keys: request.keys,
+                target: parent.target,
+                args: Array(parent.arguments.dropFirst()),
+                cwd: request.cwd,
+                replaceExistingEnv: request.replaceExistingEnv,
+                allowMissingKeys: request.allowMissingKeys,
+                envConflicts: request.envConflicts,
+                shebangScript: request.shebangScript,
+                scriptData: request.scriptData,
+                snapshotIncompatibleInterpreter: request.snapshotIncompatibleInterpreter,
+                tool: tool,
+                title: request.title,
+                detail: request.detail,
+                credentialScope: request.credentialScope,
+                credentialParent: parent,
+                selectedSecretValues: request.selectedSecretValues
+            )
+        } ?? request
+        Task { @MainActor in
+            let result = await performApprovedSecretMutation(
+                mutation,
+                callerPath: caller.path,
+                pid: caller.pid,
+                signing: caller.signing,
+                launcher: launcher,
+                launchers: launchers,
+                launcherFallbackPath: launcherFallbackPath,
+                canRequestHumanApproval: self.canRequestHumanApproval,
+                onAccessRequest: self.onAccessRequest,
+                cancellation: cancellation,
+                preflight: requiredCredentialParent.map { parent in
+                    {
+                        self.credentialHelperParentValid(parent, tool: self.credentialHelperTool(parent))
+                            ? nil
+                            : "Credential-helper Target changed before the approved mutation"
+                    }
+                },
+                requestOverride: requestOverride
+            )
+            guard let status = result.status else {
+                self.reply(peer, to: message, ok: false, error: result.error)
+                return
+            }
+            switch mutation {
+            case .save(let account, _, _, _),
+                 .saveProject(let account, _, _, _, _),
+                 .saveIfAbsentOrEqual(let account, _, _),
+                 .dockerSave(let account, _, _, _),
+                 .podmanSave(let account, _, _, _),
+                 .goatSave(let account, _, _),
+                 .ordercliSave(let account, _, _),
+                 .openhueSave(let account, _, _),
+                 .plumberSave(let account, _, _),
+                 .uaaSave(let account, _, _),
+                 .railwaySave(let account, _, _),
+                 .oxideSave(let account, _, _),
+                 .fastlySave(let account, _, _),
+                 .sqlcmdSave(let account, _, _),
+                 .terraformSave(let account, _, _):
+                if status == errSecSuccess {
+                    self.reply(peer, to: message, ok: true, error: nil)
+                } else {
+                    self.reply(
+                        peer,
+                        to: message,
+                        ok: false,
+                        error: "failed to store secret \(account): \(status)"
+                    )
+                }
+            case .delete(let account), .dockerDelete(let account, _),
+                 .podmanDelete(let account, _),
+                 .goatDelete(let account, _),
+                 .ordercliDelete(let account, _),
+                 .uaaDelete(let account, _),
+                 .railwayDelete(let account, _),
+                 .oxideDelete(let account, _), .fastlyDelete(let account, _),
+                 .sqlcmdDelete(let account, _),
+                 .terraformDelete(let account, _):
+                if status == errSecSuccess || status == errSecItemNotFound {
+                    self.reply(peer, to: message, ok: true, error: nil)
+                } else {
+                    self.reply(
+                        peer,
+                        to: message,
+                        ok: false,
+                        error: "failed to delete secret \(account): \(status)"
+                    )
+                }
+            case .deleteValue, .rename, .setAccessibility:
+                self.reply(peer, to: message, ok: false, error: "invalid XPC mutation")
+            }
+        }
+    }
+
+    private func approvedSecrets(for request: ApprovalRequest) throws -> [String: String] {
+        let conflicts = Set(request.envConflicts)
+        let names = request.keys.filter {
+            request.replaceExistingEnv || !conflicts.contains($0)
+        }
+        return try secretValueCustody.load(
+            request.selectedSecretValues,
+            names: names,
+            allowMissing: request.allowMissingKeys
+        )
+    }
+
+    private func gitRuntimeProtected() -> Bool {
+        let directories = ["/opt", "/opt/av", gitTransportRoot, gitTransportRoot + "/bin", gitTransportRoot + "/empty",
+            gitTransportRepository, gitTransportRepository + "/refs", gitTransportRepository + "/refs/heads",
+            gitTransportRepository + "/objects", "/private", "/private/etc", "/private/etc/ssl"]
+        let files = [gitTransportBinary, gitTransportHTTPS, gitTransportGH, gitTransportRepository + "/config",
+            gitTransportRepository + "/HEAD", "/private/etc/ssl/cert.pem"]
+        for path in directories + files {
+            var info = stat()
+            let directory = directories.contains(path)
+            guard lstat(path, &info) == 0, info.st_uid == 0, info.st_mode & 0o022 == 0, gitTransportPathHasNoACL(path),
+                  info.st_mode & S_IFMT == (directory ? S_IFDIR : S_IFREG), directory || info.st_nlink == 1 else { return false }
+        }
+        for (path, names) in [(gitTransportRepository, ["HEAD", "config", "objects", "refs"]),
+            (gitTransportRepository + "/refs", ["heads"]), (gitTransportRepository + "/refs/heads", []),
+            (gitTransportRepository + "/objects", [])] {
+            guard (try? FileManager.default.contentsOfDirectory(atPath: path).sorted()) == names else { return false }
+        }
+        return (try? String(contentsOfFile: gitTransportRepository + "/config", encoding: .utf8)) == gitTransportConfig
+            && (try? String(contentsOfFile: gitTransportRepository + "/HEAD", encoding: .utf8)) == "ref: refs/heads/main\n"
+            && (try? FileManager.default.contentsOfDirectory(atPath: gitTransportRoot + "/empty")) == []
+    }
+
+    private func gitLiveCode(_ process: GitProcessExecution, requirement: String) -> Bool {
+        guard process.live() != nil, let signing = liveSigningInfo(pid: process.pid),
+              signing.mainExecutable == process.path, signing.runtimeProtection == .hardened,
+              liveProcessHasNoEntitlements(pid: process.pid) else { return false }
+        var code: SecCode?
+        var parsed: SecRequirement?
+        return SecRequirementCreateWithString(requirement as CFString, [], &parsed) == errSecSuccess
+            && SecCodeCopyGuestWithAttributes(nil, [kSecGuestAttributePid as String: NSNumber(value: process.pid)] as CFDictionary, [], &code) == errSecSuccess
+            && code.map { SecCodeCheckValidity($0, [], parsed) == errSecSuccess } == true
+    }
+
+    private func gitOriginalParent(_ child: AVProcessIdentity) -> AVProcessIdentity? {
+        var child = child, original = AVProcessIdentity(), current = AVProcessIdentity()
+        guard av_original_parent_identity(&child, &original), av_process_identity(child.ppid, &current),
+              sameProcessIdentity(original, current), child.euid == current.euid,
+              child.audit_session_id == current.audit_session_id else { return nil }
+        return current
+    }
+
+    private func handleGitRegistration(_ message: xpc_object_t, on peer: xpc_connection_t, identity: AVProcessIdentity) {
+        guard let args = stringArray(message, "args"), args.count <= GitRemotePlan.maxWireArguments,
+              args.reduce(0, { $0 + $1.utf8.count }) <= 1024 * 1024 + 16_384,
+              let operation = GitTransportOperation(args),
+              let cwd = xpc_dictionary_get_string(message, "cwd").map({ String(cString: $0) }),
+              let objects = xpc_dictionary_get_string(message, "objects").map({ String(cString: $0) }),
+              let phase = xpc_dictionary_get_string(message, "phase").map({ String(cString: $0) }),
+              let oid = xpc_dictionary_get_string(message, "oid").map({ String(cString: $0) }),
+              let arguments = operation.arguments(phase: phase, oid: oid),
+              let root = GitProcessExecution(identity), identity.euid != 0,
+              (operation.remotePlan == nil
+                ? Array(root.arguments.dropFirst()) == ["git"] + args
+                : root.arguments.count == 4 && root.arguments[1] == "__git-remote" && root.arguments[3] == operation.url),
+              cwd == sshAgentPeerCWD(identity.pid),
+              objects.hasPrefix("/"), objects.utf8.count < 4096, !objects.contains("\0"),
+              gitRuntimeProtected(), av_original_parent_tracking_available(),
+              gitLiveCode(root, requirement: #"anchor apple generic and certificate leaf[subject.OU] = ZU76A67LGU and identifier "com.automicvault.av""#)
+        else { reply(peer, to: message, ok: false, error: "invalid protected Git registration"); return }
+        let caller = operation.remotePlan == nil ? nil : gitOriginalParent(identity).flatMap(GitProcessExecution.init)
+        let projectCWD = caller.flatMap { sshAgentPeerCWD($0.pid) } ?? cwd
+        guard operation.remotePlan == nil || caller != nil else {
+            reply(peer, to: message, ok: false, error: "Git original caller is unavailable"); return
+        }
+        var random = [UInt8](repeating: 0, count: 32)
+        guard SecRandomCopyBytes(kSecRandomDefault, random.count, &random) == errSecSuccess else {
+            reply(peer, to: message, ok: false, error: "cannot create Git registration"); return
+        }
+        let nonce = random.map { String(format: "%02x", $0) }.joined()
+        let registered = gitRegistrationsLock.withLock {
+            gitRegistrations = gitRegistrations.filter { $0.value.root.live() != nil }
+            guard gitRegistrations.count < 1024, gitRegistrations[identity.pid] == nil else { return false }
+            gitRegistrations[identity.pid] = GitRegistration(root: root, operation: operation, caller: caller, projectCWD: projectCWD, arguments: arguments,
+                cwd: cwd, objects: objects, nonce: nonce)
+            return true
+        }
+        reply(peer, to: message, ok: registered, error: registered ? nil : "Git registration unavailable", value: registered ? nonce : nil)
+    }
+
+    private func gitCredentialContextValid(_ context: GitCredentialContext) -> Bool {
+        let registration = context.registration
+        guard gitRuntimeProtected(), let root = registration.root.live(),
+              let helper = context.helper.live(), let transport = gitOriginalParent(helper), context.transport.matches(transport),
+              let transportParent = gitOriginalParent(transport), let git = context.git.live(),
+              let actualRoot = gitOriginalParent(git), registration.root.matches(actualRoot),
+              sshAgentPeerCWD(root.pid) == registration.cwd,
+              sshAgentPeerCWD(git.pid) == gitTransportRoot,
+              sshAgentPeerCWD(transport.pid) == gitTransportRoot,
+              sshAgentPeerCWD(helper.pid) == gitTransportRoot,
+              context.git.path == gitTransportBinary, context.transport.path == gitTransportHTTPS,
+              context.helper.path == gitTransportGH,
+              context.git.arguments == [gitTransportBinary] + registration.arguments,
+              ["git-remote-https", gitTransportHTTPS].contains(context.transport.arguments.first ?? ""),
+              Array(context.transport.arguments.dropFirst()) == [registration.operation.url, registration.operation.url],
+              context.helper.arguments == [gitTransportGH, "auth", "git-credential", "get"],
+              gitLiveCode(registration.root, requirement: #"anchor apple generic and certificate leaf[subject.OU] = ZU76A67LGU and identifier "com.automicvault.av""#),
+              gitLiveCode(context.git, requirement: "anchor apple and identifier com.apple.git"),
+              gitLiveCode(context.transport, requirement: #"anchor apple and identifier "com.apple.git-remote-http""#),
+              gitLiveCode(context.helper, requirement: "anchor apple generic and certificate leaf[subject.OU] = ZU76A67LGU and identifier gh") else { return false }
+        if registration.operation.remotePlan != nil {
+            guard context.dispatcher == nil, context.git.matches(transportParent),
+                  let caller = registration.caller, caller.live() != nil,
+                  let original = gitOriginalParent(root), caller.matches(original),
+                  sshAgentPeerCWD(caller.pid) == registration.projectCWD else { return false }
+        } else {
+            guard let dispatcher = context.dispatcher, dispatcher.matches(transportParent),
+                  let parent = gitOriginalParent(transportParent), context.git.matches(parent),
+                  dispatcher.path == gitTransportBinary, sshAgentPeerCWD(dispatcher.pid) == gitTransportRoot,
+                  dispatcher.arguments == [gitTransportBinary, "remote-https", registration.operation.url, registration.operation.url],
+                  gitLiveCode(dispatcher, requirement: "anchor apple and identifier com.apple.git") else { return false }
+        }
+        // Verified native av constructs the entire environment with env_clear and
+        // owns the child's complete stdin; no untrusted process receives that pipe.
+        for (key, expected) in gitTransportEnvironment(objects: registration.objects, nonce: registration.nonce) {
+            var value = [CChar](repeating: 0, count: expected.utf8.count + 1)
+            guard av_process_environment_value(git.pid, key, &value, value.count),
+                  String(decoding: value.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self) == expected else { return false }
+        }
+        return gitRegistrationsLock.withLock {
+            guard let current = gitRegistrations[root.pid] else { return false }
+            return current.nonce == registration.nonce && current.root.matches(root)
+        }
+    }
+
+    private func gitCredentialRequest(request: ApprovalRequest, helper: AVProcessIdentity) throws -> ApprovalRequest {
+        // Only the installed, protected provider can enter this route. Ordinary
+        // gh credential requests retain their existing Secret Disclosure policy.
+        guard pathString(helper) == gitTransportGH else { return request }
+        guard request.op == "keys", request.tool == "gh", request.target == gitTransportGH,
+              request.args == ["auth", "git-credential", "get"], request.keys == ["GH_TOKEN_GITHUB_COM"],
+              request.replaceExistingEnv, !request.allowMissingKeys, request.envConflicts.isEmpty,
+              request.shebangScript == nil, request.scriptData == nil, request.snapshotIncompatibleInterpreter == nil,
+              request.cwd == gitTransportRoot,
+              let transport = gitOriginalParent(helper), let transportParent = gitOriginalParent(transport),
+              let next = gitOriginalParent(transportParent),
+              let transportExecution = GitProcessExecution(transport), let helperExecution = GitProcessExecution(helper)
+        else { throw AppError("gh is not bound to a protected Git transport") }
+        let direct = gitRegistrationsLock.withLock { gitRegistrations[next.pid] }
+        let git: AVProcessIdentity
+        let root: AVProcessIdentity
+        let dispatcher: GitProcessExecution?
+        if direct?.operation.remotePlan != nil {
+            git = transportParent; root = next; dispatcher = nil
+        } else {
+            guard let ancestor = gitOriginalParent(next), let execution = GitProcessExecution(transportParent) else {
+                throw AppError("Git original process chain is unavailable")
+            }
+            git = next; root = ancestor; dispatcher = execution
+        }
+        guard let registration = gitRegistrationsLock.withLock({ gitRegistrations[root.pid] }),
+              let gitExecution = GitProcessExecution(git) else { throw AppError("Git transport is not registered") }
+        let context = GitCredentialContext(registration: registration, git: gitExecution,
+            dispatcher: dispatcher, transport: transportExecution, helper: helperExecution)
+        guard gitCredentialContextValid(context) else { throw AppError("protected Git process chain changed") }
+        let parent = CredentialHelperParent(pid: root.pid, startUsec: root.start_usec, euid: root.euid,
+            target: pathString(root), arguments: registration.root.arguments, gitContext: context)
+        let scope = String(decoding: try JSONSerialization.data(withJSONObject: [
+            "url": registration.operation.url, "transportArguments": registration.arguments, "objects": registration.objects,
+            "remotePlan": registration.operation.remotePlan?.wire ?? [],
+        ]), as: UTF8.self)
+        return ApprovalRequest(op: request.op, keys: request.keys, target: request.target, args: request.args,
+            cwd: registration.projectCWD, replaceExistingEnv: request.replaceExistingEnv, allowMissingKeys: false,
+            envConflicts: [], shebangScript: nil, scriptData: nil, tool: "gh",
+            title: "Allow Git \(registration.operation.command)?",
+            detail: registration.operation.remotePlan.map { $0.approvalDetail }
+                ?? "Git \(registration.operation.command): \(registration.operation.url), main branch. Transport selection: \(registration.arguments.last ?? "").",
+            credentialScope: scope, credentialParent: parent)
+    }
+
+    private func handleUVRegistration(_ message: xpc_object_t, on peer: xpc_connection_t,
+                                      pid: pid_t, identity: AVProcessIdentity, callerPath: String) {
+        guard let args = stringArray(message, "args"), args.count <= 4096,
+              args.reduce(0, { $0 + $1.utf8.count }) <= 1024 * 1024,
+              uvCredentialCommand(args) != nil,
+              let target = xpc_dictionary_get_string(message, "target"), String(cString: target) == uvOfficialTarget,
+              let cwdPointer = xpc_dictionary_get_string(message, "cwd"),
+              let entryPointer = xpc_dictionary_get_string(message, "entry") else {
+            reply(peer, to: message, ok: false, error: "invalid uv registration"); return
+        }
+        let entry = String(cString: entryPointer)
+        let cwd = String(cString: cwdPointer)
+        let originalArgs: [String]
+        if entry == "uv" { originalArgs = args }
+        else if entry == "uvx", Array(args.prefix(2)) == ["tool", "run"] { originalArgs = Array(args.dropFirst(2)) }
+        else { reply(peer, to: message, ok: false, error: "invalid uv entry point"); return }
+        guard identity.euid != 0, cwd == sshAgentPeerCWD(pid),
+              processArguments(pid).map({ Array($0.dropFirst()) }) == [entry, "/usr/local/bin/\(entry)"] + originalArgs,
+              readProtectedAWSStub(path: "/usr/local/bin/\(entry)") == (entry == "uv" ? uvLauncherStub : uvxLauncherStub),
+              readProtectedAWSStub(path: uvKeyringHelper) == uvKeyringStub,
+              uvProtectedTargetPath(), let signing = executableSigningInfo(path: uvOfficialTarget),
+              signing.teamIdentifier == "2DC432GLL2", signing.isDeveloperID,
+              signing.runtimeProtection == .hardened else {
+            reply(peer, to: message, ok: false, error: "uv launcher or official distribution is invalid"); return
+        }
+        var random = [UInt8](repeating: 0, count: 32)
+        guard SecRandomCopyBytes(kSecRandomDefault, random.count, &random) == errSecSuccess else {
+            reply(peer, to: message, ok: false, error: "cannot create uv registration nonce"); return
+        }
+        let nonce = random.map { String(format: "%02x", $0) }.joined()
+        let registered = uvRegistrationsLock.withLock {
+            uvRegistrations = uvRegistrations.filter { pid, registration in
+                var current = AVProcessIdentity()
+                return av_process_identity(pid, &current) && current.start_usec == registration.processStart
+            }
+            guard uvRegistrations.count < 1024, uvRegistrations[pid] == nil else { return false }
+            uvRegistrations[pid] = UVRegisteredInvocation(nonce: nonce, arguments: args, cwd: cwd,
+                processStart: identity.start_usec, effectiveUID: identity.euid, auditSession: identity.audit_session_id)
+            return true
+        }
+        reply(peer, to: message, ok: registered, error: registered ? nil : "uv registration unavailable",
+              value: registered ? nonce : nil)
+    }
+
+    private func uvProtectedTargetPath() -> Bool {
+        for path in ["/opt", "/opt/av", "/opt/av/uv", "/opt/av/uv/0.12.12", "/opt/av/uv/bin", "/usr/local", "/usr/local/bin", uvOfficialTarget] {
+            var info = stat()
+            guard lstat(path, &info) == 0, info.st_uid == 0, info.st_mode & 0o022 == 0,
+                  info.st_mode & S_IFMT == (path == uvOfficialTarget ? S_IFREG : S_IFDIR),
+                  path != uvOfficialTarget || (info.st_gid == 0 && info.st_nlink == 1 && info.st_mode & 0o7777 == 0o755) else { return false }
+        }
+        return true
+    }
+
+    private func uvTargetIdentityValid(pid: pid_t, path: String) -> Bool {
+        guard path == uvOfficialTarget, uvProtectedTargetPath(),
+              let signing = liveSigningInfo(pid: pid), signing.mainExecutable == path,
+              signing.teamIdentifier == "2DC432GLL2", signing.isDeveloperID,
+              signing.runtimeProtection == .hardened, liveProcessHasNoEntitlements(pid: pid) else { return false }
+        var code: SecCode?
+        var requirement: SecRequirement?
+        let pinned = #"cdhash H"19c4931ecd1637e20766d20722cde6487b71d21d" or cdhash H"529007b01f1033613082339dedd66fedce26a34f""#
+        return SecRequirementCreateWithString(pinned as CFString, [], &requirement) == errSecSuccess
+            && SecCodeCopyGuestWithAttributes(nil, [kSecGuestAttributePid as String: NSNumber(value: pid)] as CFDictionary, [], &code) == errSecSuccess
+            && code.map { SecCodeCheckValidity($0, [], requirement) == errSecSuccess } == true
+    }
+
+    private func uvCredentialRequest(from message: xpc_object_t, request: ApprovalRequest,
+                                     helperIdentity: AVProcessIdentity, helperPath: String,
+                                     helperSigning: SigningInfo) throws -> ApprovalRequest {
+        guard request.op == "uv-get" else {
+            guard request.tool != "uv" else { throw AppError("uv requires the registered keyring protocol") }
+            return request
+        }
+        guard request.tool == "uv", isTrustedAvCaller(path: helperPath, signing: helperSigning),
+              request.target.isEmpty, request.args.isEmpty, request.cwd.isEmpty,
+              request.keys == [uvCredentialSecretName], !request.replaceExistingEnv, !request.allowMissingKeys,
+              request.envConflicts.isEmpty, request.shebangScript == nil, request.scriptData == nil,
+              request.snapshotIncompatibleInterpreter == nil,
+              let noncePointer = xpc_dictionary_get_string(message, "uv_nonce"),
+              let servicePointer = xpc_dictionary_get_string(message, "uv_service") else { throw AppError("invalid uv credential request") }
+        let nonce = String(cString: noncePointer)
+        let service = String(cString: servicePointer)
+        let username = xpc_dictionary_get_string(message, "uv_username").map { String(cString: $0) }
+        guard nonce.utf8.count == 64, validUVKeyringScope(service: service, username: username) else {
+            throw AppError("invalid uv credential scope")
+        }
+        var helper = helperIdentity
+        var originalParent = AVProcessIdentity()
+        var parent = AVProcessIdentity()
+        guard av_original_parent_identity(&helper, &originalParent),
+              av_process_identity(helper.ppid, &parent), originalParent.pid == parent.pid,
+              originalParent.start_usec == parent.start_usec, originalParent.pidversion == parent.pidversion,
+              parent.euid == helper.euid, parent.audit_session_id == helper.audit_session_id,
+              let arguments = processArguments(parent.pid), !arguments.isEmpty,
+              uvTargetIdentityValid(pid: parent.pid, path: pathString(parent)),
+              readProtectedAWSStub(path: uvKeyringHelper) == uvKeyringStub,
+              let cwd = sshAgentPeerCWD(parent.pid) else { throw AppError("uv helper has no eligible original parent") }
+        let matched = uvRegistrationsLock.withLock {
+            guard var registration = uvRegistrations[parent.pid], registration.matches(nonce: nonce,
+                arguments: Array(arguments.dropFirst()), processStart: parent.start_usec, effectiveUID: parent.euid,
+                auditSession: parent.audit_session_id, pidVersion: parent.pidversion) else { return false }
+            registration.targetPIDVersion = parent.pidversion
+            uvRegistrations[parent.pid] = registration
+            return true
+        }
+        guard matched else { throw AppError("uv helper is not bound to this registered operation") }
+        let credentialParent = CredentialHelperParent(pid: parent.pid, startUsec: parent.start_usec,
+            euid: parent.euid, target: pathString(parent), arguments: arguments,
+            uvNonce: nonce, uvCWD: cwd)
+        let scope = String(decoding: try JSONSerialization.data(withJSONObject: ["service": service, "username": username ?? ""]), as: UTF8.self)
+        return ApprovalRequest(op: "uv-get", keys: [uvCredentialSecretName], target: uvOfficialTarget,
+            args: Array(arguments.dropFirst()), cwd: cwd, replaceExistingEnv: false, allowMissingKeys: false,
+            envConflicts: [], shebangScript: nil, scriptData: nil, tool: "uv",
+            title: "Use uv credential for \(service)?",
+            detail: "Apply the selected credential within this registered uv operation. Python and package code launched directly by uv can invoke the helper; the nonce does not isolate that code.",
+            credentialScope: scope, credentialParent: credentialParent)
+    }
+
+    private func uvCredentialParentValid(_ parent: CredentialHelperParent) -> Bool {
+        var identity = AVProcessIdentity()
+        guard let nonce = parent.uvNonce, let cwd = parent.uvCWD,
+              av_process_identity(parent.pid, &identity), cwd == sshAgentPeerCWD(parent.pid),
+              uvTargetIdentityValid(pid: parent.pid, path: pathString(identity)),
+              processArguments(parent.pid) == parent.arguments else { return false }
+        return uvRegistrationsLock.withLock {
+            guard let registration = uvRegistrations[parent.pid], registration.targetPIDVersion != nil else { return false }
+            return registration.matches(nonce: nonce, arguments: Array(parent.arguments.dropFirst()),
+                processStart: identity.start_usec, effectiveUID: identity.euid,
+                auditSession: identity.audit_session_id, pidVersion: identity.pidversion)
+        }
+    }
+
+    private func awsRegistrationCandidate(
+        from message: xpc_object_t,
+        request: ApprovalRequest
+    ) throws -> AWSRegistrationCandidate? {
+        guard request.tool == "aws" else { return nil }
+        guard let profilePointer = xpc_dictionary_get_string(message, "aws_profile"),
+              let config = xpcData(message, key: "aws_config"),
+              let configText = String(data: config, encoding: .utf8)
+        else { throw AWSCredentialError.invalidConfig("registration is incomplete") }
+        let generation: AWSRuntimeGeneration
+        if let generationPointer = xpc_dictionary_get_string(message, "aws_generation") {
+            guard let parsed = AWSRuntimeGeneration(rawValue: String(cString: generationPointer)) else {
+                throw AWSCredentialError.unsupportedRuntime("unknown AWS launcher generation")
+            }
+            generation = parsed
+        } else {
+            generation = .homebrewV1
+        }
+        let installedStub = readProtectedAWSStub(path: "/usr/local/bin/aws")
+        guard installedStub.map({
+            awsGenerationMatchesInstalledStub(generation, target: request.target, stub: $0)
+        }) == true else {
+            throw AWSCredentialError.unsupportedRuntime("installed AWS launcher does not match the requested generation")
+        }
+        let chain = try AWSProfileChain.parse(
+            configText,
+            selectedProfile: String(cString: profilePointer)
+        )
+        let interpreter: String
+        switch generation {
+        case .homebrewV1:
+            let firstLine = try String(contentsOfFile: request.target, encoding: .utf8)
+                .split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)[0]
+            interpreter = try awsInterpreter(fromShebang: String(firstLine))
+        case .officialV2:
+            guard let signing = executableSigningInfo(path: request.target),
+                  signing.teamIdentifier == "94KV3E626L",
+                  signing.isDeveloperID,
+                  signing.runtimeProtection.allowsSecretGateAccess
+            else { throw AWSCredentialError.unsupportedRuntime("official AWS CLI identity or Hardened Runtime is invalid") }
+            interpreter = request.target
+        }
+        return AWSRegistrationCandidate(
+            generation: generation,
+            chain: chain,
+            args: request.args,
+            target: request.target,
+            interpreter: interpreter,
+            useLongLivedCredentials: awsRequestMayUseLongLivedCredentials(request)
+                && chain.selected.roleARN == nil
+                && chain.selected.mfaSerial == nil
+        )
+    }
+
+    private func sshAgentRequest(
+        from message: xpc_object_t, request: ApprovalRequest,
+        helperIdentity: AVProcessIdentity, helperPath: String
+    ) throws -> ApprovalRequest {
+        guard request.op == "ssh-sign" else {
+            guard request.tool != "ssh-agent" else { throw AppError("SSH requires the agent protocol") }
+            return request
+        }
+        guard request.tool == "ssh-agent", request.target == helperPath,
+              request.keys.isEmpty, validSSHSigningArguments(request.args),
+              !request.replaceExistingEnv, !request.allowMissingKeys,
+              request.envConflicts.isEmpty, request.shebangScript == nil, request.scriptData == nil,
+              request.snapshotIncompatibleInterpreter == nil,
+              let signing = liveSigningInfo(pid: helperIdentity.pid),
+              signing.mainExecutable == helperPath, signing.runtimeProtection == .hardened,
+              signing.identifier == "com.automicvault.av",
+              xpc_dictionary_get_value(message, "ssh_socket") != nil
+        else { throw AppError("Invalid SSH agent signing request") }
+        let fd = xpc_dictionary_dup_fd(message, "ssh_socket")
+        guard fd >= 0 else { throw AppError("SSH socket evidence is unavailable") }
+        let socket = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        var origin = AVProcessIdentity()
+        guard av_socket_peer_identity(fd, &origin), origin.euid == helperIdentity.euid,
+              origin.audit_session_id == helperIdentity.audit_session_id,
+              launcherBundleIntegrityError(for: origin) == nil,
+              let arguments = processArgumentVector(origin.pid), !arguments.isEmpty
+        else { throw AppError("SSH socket peer cannot be verified") }
+        let config = loadSSHAgentConfiguration()
+        guard let credential = config.credential(publicKeyDigest: String(request.args[1].dropFirst("public-key-sha256=".count)))
+        else { throw AppError("SSH Agent is disabled or the requested key does not match") }
+        guard let ancestry = sshAgentAncestry(for: origin) else {
+            throw AppError("SSH authentication requires a live Verified Launcher ancestor with verifiable original process ancestry")
+        }
+        guard let cwd = sshAgentPeerCWD(origin.pid) else {
+            throw AppError("SSH peer working directory is unavailable")
+        }
+        let originPeer = SSHAgentPeer(socket: socket, identity: origin, configuration: config,
+                                     launchers: ancestry.launchers, ancestors: ancestry.ancestors,
+                                     arguments: arguments, cwd: cwd,
+                                     helperIdentity: helperIdentity)
+        try originPeer.validate()
+        return ApprovalRequest(
+            op: "ssh-sign", keys: [credential.secretName], target: helperPath,
+            args: request.args + ["socket-peer=\(pathString(origin))"] + arguments,
+            cwd: cwd, replaceExistingEnv: false, allowMissingKeys: false,
+            envConflicts: [], shebangScript: nil, scriptData: nil, tool: "ssh-agent",
+            title: "Authenticate using \(credential.name)?",
+            detail: "SSH key: \(credential.name) · \(credential.fingerprint). Authentication can grant remote access, including writes, wherever this key is accepted. Key names do not restrict destinations. Shared or forwarded connections inherit the local client’s Launcher attribution.",
+            sshPeer: originPeer
+        )
+    }
+
+    private func dockerCredentialRequest(
+        from message: xpc_object_t,
+        request: ApprovalRequest,
+        helperIdentity: AVProcessIdentity,
+        helperPath: String,
+        helperSigning: SigningInfo
+    ) throws -> ApprovalRequest {
+        guard request.op == "docker-get" else {
+            guard request.tool != "docker" && request.tool != "podman" else {
+                throw AppError("registry credentials require the credential-helper protocol")
+            }
+            return request
+        }
+        guard request.tool == "docker" || request.tool == "podman",
+              isTrustedAvCaller(path: helperPath, signing: helperSigning),
+              request.target.isEmpty,
+              request.args.isEmpty,
+              request.keys.count == 1,
+              !request.replaceExistingEnv,
+              !request.allowMissingKeys,
+              request.envConflicts.isEmpty,
+              request.shebangScript == nil,
+              request.scriptData == nil,
+              let serverPointer = xpc_dictionary_get_string(message, "docker_server_url")
+        else { throw AppError("invalid registry credential request") }
+        let serverURL = String(cString: serverPointer)
+        let secretName = dockerCredentialSecretName(serverURL)
+        guard validDockerServerURL(serverURL), request.keys == [secretName] else {
+            throw AppError("registry Secret Name does not match its address")
+        }
+        let parent = try dockerCredentialParent(for: helperIdentity)
+        let tool = credentialHelperTool(parent)
+        guard (tool == "docker" || tool == "podman"), request.tool == tool else {
+            throw AppError("registry credential helper parent is not a supported Target")
+        }
+        let displayName = tool == "podman" ? "Podman" : "Docker"
+        return ApprovalRequest(
+            op: request.op,
+            keys: [secretName],
+            target: parent.target,
+            args: Array(parent.arguments.dropFirst()),
+            cwd: request.cwd,
+            replaceExistingEnv: false,
+            allowMissingKeys: false,
+            envConflicts: [],
+            shebangScript: nil,
+            scriptData: nil,
+            tool: tool,
+            title: "Use \(displayName) credential for \(serverURL)?",
+            detail: "The verified \(displayName) Target will receive the usable registry credential in plaintext, as required by the credential-helper protocol.",
+            credentialScope: serverURL,
+            credentialParent: parent
+        )
+    }
+
+    private func dockerCredentialParent(
+        for helperIdentity: AVProcessIdentity
+    ) throws -> CredentialHelperParent {
+        let parentPID = helperIdentity.ppid
+        var parentIdentity = AVProcessIdentity()
+        guard parentPID > 1,
+              av_process_identity(parentPID, &parentIdentity),
+              parentIdentity.euid == helperIdentity.euid,
+              let arguments = processArguments(parentPID),
+              !arguments.isEmpty
+        else { throw AppError("registry credential helper has no live parent") }
+        let target = pathString(parentIdentity)
+        guard dockerTargetIdentityValid(pid: parentPID, path: target)
+                || podmanTargetIdentityValid(pid: parentPID, path: target)
+        else {
+            throw AppError("registry credential helper parent is not an eligible Docker or Podman Target")
+        }
+        return CredentialHelperParent(
+            pid: parentPID,
+            startUsec: parentIdentity.start_usec,
+            euid: parentIdentity.euid,
+            target: target,
+            arguments: arguments
+        )
+    }
+
+    private func dockerCredentialParentValid(_ parent: CredentialHelperParent) -> Bool {
+        var identity = AVProcessIdentity()
+        return av_process_identity(parent.pid, &identity)
+            && identity.start_usec == parent.startUsec
+            && identity.euid == parent.euid
+            && pathString(identity) == parent.target
+            && processArguments(parent.pid) == parent.arguments
+            && dockerTargetIdentityValid(pid: parent.pid, path: parent.target)
+    }
+
+    private func dockerTargetIdentityValid(pid: pid_t, path: String) -> Bool {
+        let identifiers = [
+            "/Applications/Docker.app/Contents/Resources/bin/docker": "docker",
+            "/Applications/Docker.app/Contents/Resources/cli-plugins/docker-compose": "docker-compose",
+            "/Applications/Docker.app/Contents/Resources/cli-plugins/docker-buildx": "docker-buildx",
+        ]
+        guard let identifier = identifiers[path],
+              let signing = liveSigningInfo(pid: pid),
+              signing.mainExecutable == path
+        else { return false }
+        return signing.identifier == identifier
+            && signing.teamIdentifier == "9BNSXJN65R"
+            && signing.isDeveloperID
+            && signing.runtimeProtection.allowsSecretGateAccess
+    }
+
+    private func podmanTargetIdentityValid(pid: pid_t, path: String) -> Bool {
+        guard configuredSecretGateTarget("podman", matches: path),
+              let signing = liveSigningInfo(pid: pid),
+              signing.mainExecutable == path
+        else { return false }
+        return signing.identifier == "podman"
+            && signing.teamIdentifier == "HYSCB8KRL2"
+            && signing.isDeveloperID
+            && signing.runtimeProtection == .hardened
+            && liveProcessHasNoEntitlements(pid: pid)
+    }
+
+    private func goatCredentialRequest(
+        from message: xpc_object_t,
+        request: ApprovalRequest,
+        helperIdentity: AVProcessIdentity,
+        helperPath: String,
+        helperSigning: SigningInfo
+    ) throws -> ApprovalRequest {
+        guard request.op == "goat-get" else { return request }
+        guard request.tool == "goat",
+              isTrustedAvCaller(path: helperPath, signing: helperSigning),
+              request.target.isEmpty, request.args.isEmpty, request.keys.count == 1,
+              !request.replaceExistingEnv, !request.allowMissingKeys,
+              request.envConflicts.isEmpty, request.shebangScript == nil, request.scriptData == nil,
+              let scopePointer = xpc_dictionary_get_string(message, "goat_scope"),
+              let scope = parseGoatCredentialScope(String(cString: scopePointer)),
+              request.keys == [scope.secretName]
+        else { throw AppError("invalid goat credential request") }
+        let parent = try goatCredentialParent(for: helperIdentity)
+        return ApprovalRequest(
+            op: request.op, keys: request.keys, target: parent.target,
+            args: Array(parent.arguments.dropFirst()), cwd: request.cwd,
+            replaceExistingEnv: false, allowMissingKeys: false, envConflicts: [],
+            shebangScript: nil, scriptData: nil, tool: "goat",
+            title: "Use goat auth session for \(scope.did)?",
+            detail: "The verified goat Target will receive the password and session tokens for \(scope.pds).",
+            credentialScope: scope.canonical, credentialParent: parent
+        )
+    }
+
+    private func goatCredentialParent(for helperIdentity: AVProcessIdentity) throws -> CredentialHelperParent {
+        let parentPID = helperIdentity.ppid
+        var parentIdentity = AVProcessIdentity()
+        guard parentPID > 1, av_process_identity(parentPID, &parentIdentity),
+              parentIdentity.euid == helperIdentity.euid,
+              let arguments = processArguments(parentPID), !arguments.isEmpty
+        else { throw AppError("goat credential helper has no live parent") }
+        let target = pathString(parentIdentity)
+        guard goatTargetIdentityValid(pid: parentPID, path: target) else {
+            throw AppError("credential helper parent is not an eligible goat Target")
+        }
+        return CredentialHelperParent(
+            pid: parentPID, startUsec: parentIdentity.start_usec,
+            euid: parentIdentity.euid, target: target, arguments: arguments
+        )
+    }
+
+    private func ordercliCredentialRequest(
+        from message: xpc_object_t,
+        request: ApprovalRequest,
+        helperIdentity: AVProcessIdentity,
+        helperPath: String,
+        helperSigning: SigningInfo
+    ) throws -> ApprovalRequest {
+        guard request.op == "ordercli-get" else { return request }
+        guard request.tool == "ordercli",
+              isTrustedAvCaller(path: helperPath, signing: helperSigning),
+              request.target.isEmpty, request.args.isEmpty,
+              request.keys == [ordercliCredentialSecretName],
+              !request.replaceExistingEnv, !request.allowMissingKeys,
+              request.envConflicts.isEmpty, request.shebangScript == nil, request.scriptData == nil,
+              let scopePointer = xpc_dictionary_get_string(message, "ordercli_scope"),
+              let scope = parseOrdercliCredentialScope(String(cString: scopePointer))
+        else { throw AppError("invalid ordercli credential request") }
+        let parent = try ordercliCredentialParent(for: helperIdentity)
+        return ApprovalRequest(
+            op: request.op, keys: request.keys, target: parent.target,
+            args: Array(parent.arguments.dropFirst()), cwd: request.cwd,
+            replaceExistingEnv: false, allowMissingKeys: false, envConflicts: [],
+            shebangScript: nil, scriptData: nil, tool: "ordercli",
+            title: "Use ordercli Foodora session?",
+            detail: "The verified ordercli Target will receive its reusable Foodora session bundle.",
+            credentialScope: scope.canonical, credentialParent: parent
+        )
+    }
+
+    private func ordercliCredentialParent(for helperIdentity: AVProcessIdentity) throws -> CredentialHelperParent {
+        let parentPID = helperIdentity.ppid
+        var parentIdentity = AVProcessIdentity()
+        guard parentPID > 1, av_process_identity(parentPID, &parentIdentity),
+              parentIdentity.euid == helperIdentity.euid,
+              let arguments = processArguments(parentPID), !arguments.isEmpty
+        else { throw AppError("ordercli credential helper has no live parent") }
+        let target = pathString(parentIdentity)
+        guard ordercliTargetIdentityValid(pid: parentPID, path: target) else {
+            throw AppError("credential helper parent is not an eligible ordercli Target")
+        }
+        return CredentialHelperParent(
+            pid: parentPID, startUsec: parentIdentity.start_usec,
+            euid: parentIdentity.euid, target: target, arguments: arguments
+        )
+    }
+
+    private func openhueCredentialRequest(
+        from message: xpc_object_t,
+        request: ApprovalRequest,
+        helperIdentity: AVProcessIdentity,
+        helperPath: String,
+        helperSigning: SigningInfo
+    ) throws -> ApprovalRequest {
+        guard request.op == "openhue-get" else { return request }
+        guard request.tool == "openhue-cli",
+              isTrustedAvCaller(path: helperPath, signing: helperSigning),
+              request.target.isEmpty, request.args.isEmpty,
+              request.keys == [openhueCredentialSecretName],
+              !request.replaceExistingEnv, !request.allowMissingKeys,
+              request.envConflicts.isEmpty, request.shebangScript == nil, request.scriptData == nil,
+              let scopePointer = xpc_dictionary_get_string(message, "openhue_scope"),
+              let scope = parseOpenHueCredentialScope(String(cString: scopePointer))
+        else { throw AppError("invalid OpenHue credential request") }
+        let parent = try openhueCredentialParent(for: helperIdentity)
+        return ApprovalRequest(
+            op: request.op, keys: request.keys, target: parent.target,
+            args: Array(parent.arguments.dropFirst()), cwd: request.cwd,
+            replaceExistingEnv: false, allowMissingKeys: false, envConflicts: [],
+            shebangScript: nil, scriptData: nil, tool: "openhue-cli",
+            title: "Use Hue application key?",
+            detail: "The verified OpenHue Target will authenticate to bridge \(scope.bridge).",
+            credentialScope: scope.canonical, credentialParent: parent
+        )
+    }
+
+    private func openhueCredentialParent(for helperIdentity: AVProcessIdentity) throws -> CredentialHelperParent {
+        let parentPID = helperIdentity.ppid
+        var parentIdentity = AVProcessIdentity()
+        guard parentPID > 1, av_process_identity(parentPID, &parentIdentity),
+              parentIdentity.euid == helperIdentity.euid,
+              let arguments = processArguments(parentPID), !arguments.isEmpty
+        else { throw AppError("OpenHue credential helper has no live parent") }
+        let target = pathString(parentIdentity)
+        guard openhueTargetIdentityValid(pid: parentPID, path: target) else {
+            throw AppError("credential helper parent is not an eligible OpenHue Target")
+        }
+        return CredentialHelperParent(
+            pid: parentPID, startUsec: parentIdentity.start_usec,
+            euid: parentIdentity.euid, target: target, arguments: arguments
+        )
+    }
+
+    private func plumberCredentialRequest(
+        request: ApprovalRequest,
+        helperIdentity: AVProcessIdentity,
+        helperPath: String,
+        helperSigning: SigningInfo
+    ) throws -> ApprovalRequest {
+        guard request.op == "plumber-get" else { return request }
+        guard request.tool == "plumber",
+              isTrustedAvCaller(path: helperPath, signing: helperSigning),
+              request.target.isEmpty, request.args.isEmpty,
+              request.keys == [plumberCredentialSecretName],
+              !request.replaceExistingEnv, !request.allowMissingKeys,
+              request.envConflicts.isEmpty, request.shebangScript == nil, request.scriptData == nil,
+              let scope = parsePlumberCredentialScope(plumberCredentialScope)
+        else { throw AppError("invalid Plumber config request") }
+        let parent = try plumberCredentialParent(for: helperIdentity)
+        return ApprovalRequest(
+            op: request.op, keys: request.keys, target: parent.target,
+            args: Array(parent.arguments.dropFirst()), cwd: request.cwd,
+            replaceExistingEnv: false, allowMissingKeys: false, envConflicts: [],
+            shebangScript: nil, scriptData: nil, tool: "plumber",
+            title: "Use Plumber local config?",
+            detail: "The verified Plumber Target will receive its local config in memory.",
+            credentialScope: scope.canonical, credentialParent: parent
+        )
+    }
+
+    private func plumberCredentialParent(for helperIdentity: AVProcessIdentity) throws -> CredentialHelperParent {
+        let parentPID = helperIdentity.ppid
+        var parentIdentity = AVProcessIdentity()
+        guard parentPID > 1, av_process_identity(parentPID, &parentIdentity),
+              parentIdentity.euid == helperIdentity.euid,
+              let arguments = processArguments(parentPID), !arguments.isEmpty
+        else { throw AppError("Plumber config helper has no live parent") }
+        let target = pathString(parentIdentity)
+        guard plumberTargetIdentityValid(pid: parentPID, path: target) else {
+            throw AppError("credential helper parent is not an eligible Plumber Target")
+        }
+        return CredentialHelperParent(
+            pid: parentPID, startUsec: parentIdentity.start_usec,
+            euid: parentIdentity.euid, target: target, arguments: arguments
+        )
+    }
+
+    private func uaaCredentialRequest(
+        from message: xpc_object_t,
+        request: ApprovalRequest,
+        helperIdentity: AVProcessIdentity,
+        helperPath: String,
+        helperSigning: SigningInfo
+    ) throws -> ApprovalRequest {
+        guard request.op == "uaa-get" else { return request }
+        guard request.tool == "uaa-cli",
+              isTrustedAvCaller(path: helperPath, signing: helperSigning),
+              request.target.isEmpty, request.args.isEmpty,
+              request.keys == [uaaCredentialSecretName],
+              !request.replaceExistingEnv, !request.allowMissingKeys,
+              request.envConflicts.isEmpty, request.shebangScript == nil, request.scriptData == nil,
+              let scopePointer = xpc_dictionary_get_string(message, "uaa_scope"),
+              let scope = parseUAACredentialScope(String(cString: scopePointer))
+        else { throw AppError("invalid UAA credential request") }
+        let parent = try uaaCredentialParent(for: helperIdentity)
+        return ApprovalRequest(
+            op: request.op, keys: request.keys, target: parent.target,
+            args: Array(parent.arguments.dropFirst()), cwd: request.cwd,
+            replaceExistingEnv: false, allowMissingKeys: false, envConflicts: [],
+            shebangScript: nil, scriptData: nil, tool: "uaa-cli",
+            title: "Use UAA OAuth contexts?",
+            detail: "The verified UAA CLI Target will receive its stored OAuth tokens.",
+            credentialScope: scope.canonical, credentialParent: parent
+        )
+    }
+
+    private func uaaCredentialParent(for helperIdentity: AVProcessIdentity) throws -> CredentialHelperParent {
+        let parentPID = helperIdentity.ppid
+        var parentIdentity = AVProcessIdentity()
+        guard parentPID > 1, av_process_identity(parentPID, &parentIdentity),
+              parentIdentity.euid == helperIdentity.euid,
+              let arguments = processArguments(parentPID), !arguments.isEmpty
+        else { throw AppError("UAA credential helper has no live parent") }
+        let target = pathString(parentIdentity)
+        guard uaaTargetIdentityValid(pid: parentPID, path: target) else {
+            throw AppError("credential helper parent is not an eligible UAA CLI Target")
+        }
+        return CredentialHelperParent(
+            pid: parentPID, startUsec: parentIdentity.start_usec,
+            euid: parentIdentity.euid, target: target, arguments: arguments
+        )
+    }
+
+    private func railwayCredentialRequest(
+        from message: xpc_object_t,
+        request: ApprovalRequest,
+        helperIdentity: AVProcessIdentity,
+        helperPath: String,
+        helperSigning: SigningInfo
+    ) throws -> ApprovalRequest {
+        guard request.op == "railway-get" else { return request }
+        guard request.tool == "railway",
+              isTrustedAvCaller(path: helperPath, signing: helperSigning),
+              request.target.isEmpty, request.args.isEmpty, request.keys.count == 1,
+              !request.replaceExistingEnv, !request.allowMissingKeys,
+              request.envConflicts.isEmpty, request.shebangScript == nil, request.scriptData == nil,
+              let scopePointer = xpc_dictionary_get_string(message, "railway_scope"),
+              let scope = parseRailwayCredentialScope(String(cString: scopePointer)),
+              request.keys == [scope.secretName]
+        else { throw AppError("invalid Railway credential request") }
+        let parent = try railwayCredentialParent(for: helperIdentity)
+        return ApprovalRequest(
+            op: request.op, keys: request.keys, target: parent.target,
+            args: Array(parent.arguments.dropFirst()), cwd: request.cwd,
+            replaceExistingEnv: false, allowMissingKeys: false, envConflicts: [],
+            shebangScript: nil, scriptData: nil, tool: "railway",
+            title: "Use Railway credential for \(scope.environment)?",
+            detail: "The verified Railway Target will receive its reusable credential for \(scope.host).",
+            credentialScope: scope.canonical, credentialParent: parent
+        )
+    }
+
+    private func railwayCredentialParent(for helperIdentity: AVProcessIdentity) throws -> CredentialHelperParent {
+        let parentPID = helperIdentity.ppid
+        var parentIdentity = AVProcessIdentity()
+        guard parentPID > 1, av_process_identity(parentPID, &parentIdentity),
+              parentIdentity.euid == helperIdentity.euid,
+              let arguments = processArguments(parentPID), !arguments.isEmpty
+        else { throw AppError("Railway credential helper has no live parent") }
+        let target = pathString(parentIdentity)
+        guard railwayTargetIdentityValid(pid: parentPID, path: target) else {
+            throw AppError("credential helper parent is not an eligible Railway Target")
+        }
+        return CredentialHelperParent(
+            pid: parentPID, startUsec: parentIdentity.start_usec,
+            euid: parentIdentity.euid, target: target, arguments: arguments
+        )
+    }
+
+    private func oxideCredentialRequest(
+        from message: xpc_object_t,
+        request: ApprovalRequest,
+        helperIdentity: AVProcessIdentity,
+        helperPath: String,
+        helperSigning: SigningInfo
+    ) throws -> ApprovalRequest {
+        guard request.op == "oxide-get" else { return request }
+        guard request.tool == "oxide-cli",
+              isTrustedAvCaller(path: helperPath, signing: helperSigning),
+              request.target.isEmpty,
+              request.args.isEmpty,
+              request.keys.count == 1,
+              !request.replaceExistingEnv,
+              !request.allowMissingKeys,
+              request.envConflicts.isEmpty,
+              request.shebangScript == nil,
+              request.scriptData == nil,
+              let scopePointer = xpc_dictionary_get_string(message, "oxide_scope"),
+              let scope = parseOxideCredentialScope(String(cString: scopePointer)),
+              request.keys == [scope.secretName]
+        else { throw AppError("invalid Oxide credential request") }
+        let parent = try oxideCredentialParent(for: helperIdentity)
+        return ApprovalRequest(
+            op: request.op,
+            keys: request.keys,
+            target: parent.target,
+            args: Array(parent.arguments.dropFirst()),
+            cwd: request.cwd,
+            replaceExistingEnv: false,
+            allowMissingKeys: false,
+            envConflicts: [],
+            shebangScript: nil,
+            scriptData: nil,
+            tool: "oxide-cli",
+            title: "Use Oxide credential for profile \(scope.profile)?",
+            detail: "The verified Oxide Target will receive this profile token in plaintext for \(scope.host).",
+            credentialScope: scope.canonical,
+            credentialParent: parent
+        )
+    }
+
+    private func oxideCredentialParent(
+        for helperIdentity: AVProcessIdentity
+    ) throws -> CredentialHelperParent {
+        let parentPID = helperIdentity.ppid
+        var parentIdentity = AVProcessIdentity()
+        guard parentPID > 1,
+              av_process_identity(parentPID, &parentIdentity),
+              parentIdentity.euid == helperIdentity.euid,
+              let arguments = processArguments(parentPID),
+              !arguments.isEmpty
+        else { throw AppError("Oxide credential helper has no live parent") }
+        let target = pathString(parentIdentity)
+        guard oxideTargetIdentityValid(pid: parentPID, path: target) else {
+            throw AppError("credential helper parent is not an eligible Oxide Target")
+        }
+        return CredentialHelperParent(
+            pid: parentPID,
+            startUsec: parentIdentity.start_usec,
+            euid: parentIdentity.euid,
+            target: target,
+            arguments: arguments
+        )
+    }
+
+    private func fastlyCredentialRequest(
+        from message: xpc_object_t,
+        request: ApprovalRequest,
+        helperIdentity: AVProcessIdentity,
+        helperPath: String,
+        helperSigning: SigningInfo
+    ) throws -> ApprovalRequest {
+        guard request.op == "fastly-get" else { return request }
+        guard request.tool == "fastly-cli",
+              isTrustedAvCaller(path: helperPath, signing: helperSigning),
+              request.target.isEmpty,
+              request.args.isEmpty,
+              request.keys.count == 1,
+              !request.replaceExistingEnv,
+              !request.allowMissingKeys,
+              request.envConflicts.isEmpty,
+              request.shebangScript == nil,
+              request.scriptData == nil,
+              let scopePointer = xpc_dictionary_get_string(message, "fastly_scope"),
+              let scope = parseFastlyCredentialScope(String(cString: scopePointer)),
+              request.keys == [scope.secretName]
+        else { throw AppError("invalid Fastly credential request") }
+        let parent = try fastlyCredentialParent(for: helperIdentity)
+        return ApprovalRequest(
+            op: request.op,
+            keys: request.keys,
+            target: parent.target,
+            args: Array(parent.arguments.dropFirst()),
+            cwd: request.cwd,
+            replaceExistingEnv: false,
+            allowMissingKeys: false,
+            envConflicts: [],
+            shebangScript: nil,
+            scriptData: nil,
+            tool: "fastly-cli",
+            title: "Use Fastly API token \(scope.name)?",
+            detail: "The verified Fastly Target will receive this named token in plaintext for \(scope.endpoint).",
+            credentialScope: scope.canonical,
+            credentialParent: parent
+        )
+    }
+
+    private func fastlyCredentialParent(
+        for helperIdentity: AVProcessIdentity
+    ) throws -> CredentialHelperParent {
+        let parentPID = helperIdentity.ppid
+        var parentIdentity = AVProcessIdentity()
+        guard parentPID > 1,
+              av_process_identity(parentPID, &parentIdentity),
+              parentIdentity.euid == helperIdentity.euid,
+              let arguments = processArguments(parentPID),
+              !arguments.isEmpty
+        else { throw AppError("Fastly credential helper has no live parent") }
+        let target = pathString(parentIdentity)
+        guard fastlyTargetIdentityValid(pid: parentPID, path: target) else {
+            throw AppError("credential helper parent is not an eligible Fastly Target")
+        }
+        return CredentialHelperParent(
+            pid: parentPID,
+            startUsec: parentIdentity.start_usec,
+            euid: parentIdentity.euid,
+            target: target,
+            arguments: arguments
+        )
+    }
+
+    private func sqlcmdCredentialRequest(
+        from message: xpc_object_t,
+        request: ApprovalRequest,
+        helperIdentity: AVProcessIdentity,
+        helperPath: String,
+        helperSigning: SigningInfo
+    ) throws -> ApprovalRequest {
+        guard request.op == "sqlcmd-get" else { return request }
+        guard request.tool == "sqlcmd",
+              isTrustedAvCaller(path: helperPath, signing: helperSigning),
+              request.target.isEmpty,
+              request.args.isEmpty,
+              request.keys.count == 1,
+              !request.replaceExistingEnv,
+              !request.allowMissingKeys,
+              request.envConflicts.isEmpty,
+              request.shebangScript == nil,
+              request.scriptData == nil,
+              let scopePointer = xpc_dictionary_get_string(message, "sqlcmd_scope"),
+              let scope = parseSqlcmdCredentialScope(String(cString: scopePointer)),
+              request.keys == [scope.secretName]
+        else { throw AppError("invalid sqlcmd credential request") }
+        let parent = try sqlcmdCredentialParent(for: helperIdentity)
+        if scope.address.isEmpty && sqlcmdRequestClassification(Array(parent.arguments.dropFirst())) != .secretDump {
+            throw AppError("sqlcmd endpoint-free credential requests require an explicit Secret Disclosure command")
+        }
+        let destination = scope.address.isEmpty ? "raw configuration output" : "\(scope.address):\(scope.port)"
+        return ApprovalRequest(
+            op: request.op,
+            keys: request.keys,
+            target: parent.target,
+            args: Array(parent.arguments.dropFirst()),
+            cwd: request.cwd,
+            replaceExistingEnv: false,
+            allowMissingKeys: false,
+            envConflicts: [],
+            shebangScript: nil,
+            scriptData: nil,
+            tool: "sqlcmd",
+            title: "Use sqlcmd password for \(scope.profile)?",
+            detail: "The verified sqlcmd Target will receive this password in plaintext for \(destination).",
+            credentialScope: scope.canonical,
+            credentialParent: parent
+        )
+    }
+
+    private func sqlcmdCredentialParent(
+        for helperIdentity: AVProcessIdentity
+    ) throws -> CredentialHelperParent {
+        let parentPID = helperIdentity.ppid
+        var parentIdentity = AVProcessIdentity()
+        guard parentPID > 1,
+              av_process_identity(parentPID, &parentIdentity),
+              parentIdentity.euid == helperIdentity.euid,
+              let arguments = processArguments(parentPID),
+              !arguments.isEmpty
+        else { throw AppError("sqlcmd credential helper has no live parent") }
+        let target = pathString(parentIdentity)
+        guard sqlcmdTargetIdentityValid(pid: parentPID, path: target) else {
+            throw AppError("credential helper parent is not an eligible sqlcmd Target")
+        }
+        return CredentialHelperParent(
+            pid: parentPID,
+            startUsec: parentIdentity.start_usec,
+            euid: parentIdentity.euid,
+            target: target,
+            arguments: arguments
+        )
+    }
+
+    private func terraformCredentialRequest(
+        from message: xpc_object_t,
+        request: ApprovalRequest,
+        helperIdentity: AVProcessIdentity,
+        helperPath: String,
+        helperSigning: SigningInfo
+    ) throws -> ApprovalRequest {
+        guard request.op == "terraform-get" else { return request }
+        guard request.tool == "terraform",
+              isTrustedAvCaller(path: helperPath, signing: helperSigning),
+              request.target.isEmpty,
+              request.args.isEmpty,
+              request.keys.count == 1,
+              !request.replaceExistingEnv,
+              !request.allowMissingKeys,
+              request.envConflicts.isEmpty,
+              request.shebangScript == nil,
+              request.scriptData == nil,
+              let hostnamePointer = xpc_dictionary_get_string(message, "terraform_hostname")
+        else { throw AppError("invalid Terraform credential request") }
+        let hostname = String(cString: hostnamePointer)
+        guard normalizeTerraformHostname(hostname) == hostname,
+              request.keys == [terraformCredentialSecretName(hostname)]
+        else { throw AppError("Terraform host Secret Name does not match its hostname") }
+        let parent = try terraformCredentialParent(for: helperIdentity)
+        let tool = credentialHelperTool(parent)
+        return ApprovalRequest(
+            op: request.op,
+            keys: request.keys,
+            target: parent.target,
+            args: Array(parent.arguments.dropFirst()),
+            cwd: request.cwd,
+            replaceExistingEnv: false,
+            allowMissingKeys: false,
+            envConflicts: [],
+            shebangScript: nil,
+            scriptData: nil,
+            tool: tool,
+            title: "Use \(tool == "opentofu" ? "OpenTofu" : "Terraform") credential for \(hostname)?",
+            detail: "The verified \(tool == "opentofu" ? "OpenTofu" : "Terraform") Target will receive the API token in plaintext, as required by the credential-helper protocol.",
+            credentialScope: hostname,
+            credentialParent: parent
+        )
+    }
+
+    private func wakatimeCredentialRequest(
+        from message: xpc_object_t,
+        request: ApprovalRequest,
+        helperIdentity: AVProcessIdentity,
+        helperPath: String,
+        helperSigning: SigningInfo
+    ) throws -> ApprovalRequest {
+        guard request.op == "wakatime-get" else { return request }
+        guard request.tool == "wakatime-cli",
+              isTrustedAvCaller(path: helperPath, signing: helperSigning),
+              request.target.isEmpty,
+              request.args.isEmpty,
+              request.keys == [wakatimeCredentialSecretName],
+              !request.replaceExistingEnv,
+              !request.allowMissingKeys,
+              request.envConflicts.isEmpty,
+              request.shebangScript == nil,
+              request.scriptData == nil,
+              let urlPointer = xpc_dictionary_get_string(message, "wakatime_api_url"),
+              String(cString: urlPointer) == wakatimeOfficialAPIURL
+        else { throw AppError("invalid WakaTime credential request") }
+        let parent = try wakatimeCredentialParent(for: helperIdentity)
+        return ApprovalRequest(
+            op: request.op,
+            keys: request.keys,
+            target: parent.target,
+            args: Array(parent.arguments.dropFirst()),
+            cwd: request.cwd,
+            replaceExistingEnv: false,
+            allowMissingKeys: false,
+            envConflicts: [],
+            shebangScript: nil,
+            scriptData: nil,
+            tool: "wakatime-cli",
+            title: "Use the WakaTime API key?",
+            detail: "The verified WakaTime Target will receive the global API key for WakaTime's official API endpoint.",
+            credentialScope: wakatimeOfficialAPIURL,
+            credentialParent: parent
+        )
+    }
+
+    private func wakatimeCredentialParent(
+        for helperIdentity: AVProcessIdentity
+    ) throws -> CredentialHelperParent {
+        let parentPID = helperIdentity.ppid
+        var parentIdentity = AVProcessIdentity()
+        guard parentPID > 1,
+              av_process_identity(parentPID, &parentIdentity),
+              parentIdentity.euid == helperIdentity.euid,
+              let arguments = processArguments(parentPID),
+              !arguments.isEmpty
+        else { throw AppError("WakaTime credential helper has no live parent") }
+        let target = pathString(parentIdentity)
+        guard wakatimeTargetIdentityValid(pid: parentPID, path: target) else {
+            throw AppError("credential helper parent is not an eligible WakaTime Target")
+        }
+        return CredentialHelperParent(
+            pid: parentPID,
+            startUsec: parentIdentity.start_usec,
+            euid: parentIdentity.euid,
+            target: target,
+            arguments: arguments
+        )
+    }
+
+    private func rclonePasswordRequest(
+        request: ApprovalRequest,
+        helperIdentity: AVProcessIdentity,
+        helperPath: String,
+        helperSigning: SigningInfo
+    ) throws -> ApprovalRequest {
+        guard request.op == "rclone-get" else { return request }
+        guard request.tool == "rclone",
+              isTrustedAvCaller(path: helperPath, signing: helperSigning),
+              request.target.isEmpty,
+              request.args.isEmpty,
+              request.keys == [rcloneConfigPasswordSecretName],
+              !request.replaceExistingEnv,
+              !request.allowMissingKeys,
+              request.envConflicts.isEmpty,
+              request.shebangScript == nil,
+              request.scriptData == nil
+        else { throw AppError("invalid rclone password request") }
+        let parent = try rcloneCredentialParent(for: helperIdentity)
+        return ApprovalRequest(
+            op: request.op,
+            keys: request.keys,
+            target: parent.target,
+            args: Array(parent.arguments.dropFirst()),
+            cwd: "/",
+            replaceExistingEnv: false,
+            allowMissingKeys: false,
+            envConflicts: [],
+            shebangScript: nil,
+            scriptData: nil,
+            tool: "rclone",
+            title: "Unlock the rclone configuration?",
+            detail: "The verified rclone Target will receive one wrapping password that unlocks every configured remote for this process.",
+            credentialScope: rcloneAllRemotesScope,
+            credentialParent: parent
+        )
+    }
+
+    private func rcloneCredentialParent(
+        for helperIdentity: AVProcessIdentity
+    ) throws -> CredentialHelperParent {
+        let parentPID = helperIdentity.ppid
+        var parentIdentity = AVProcessIdentity()
+        guard parentPID > 1,
+              av_process_identity(parentPID, &parentIdentity),
+              parentIdentity.euid == helperIdentity.euid,
+              let arguments = processArguments(parentPID),
+              !arguments.isEmpty
+        else { throw AppError("rclone password helper has no live parent") }
+        let target = pathString(parentIdentity)
+        guard rcloneTargetIdentityValid(pid: parentPID, path: target) else {
+            throw AppError("credential helper parent is not an eligible rclone Target")
+        }
+        return CredentialHelperParent(
+            pid: parentPID,
+            startUsec: parentIdentity.start_usec,
+            euid: parentIdentity.euid,
+            target: target,
+            arguments: arguments
+        )
+    }
+
+    private func kubectlCredentialRequest(
+        from message: xpc_object_t,
+        request: ApprovalRequest,
+        helperIdentity: AVProcessIdentity,
+        helperPath: String,
+        helperSigning: SigningInfo
+    ) throws -> ApprovalRequest {
+        guard request.op == "kubectl-get" else { return request }
+        guard request.tool == "kubectl",
+              isTrustedAvCaller(path: helperPath, signing: helperSigning),
+              request.target.isEmpty,
+              request.args.isEmpty,
+              request.keys.count == 1,
+              !request.replaceExistingEnv,
+              !request.allowMissingKeys,
+              request.envConflicts.isEmpty,
+              request.shebangScript == nil,
+              request.scriptData == nil,
+              let scopePointer = xpc_dictionary_get_string(message, "kubectl_scope"),
+              let scope = parseKubectlCredentialScope(String(cString: scopePointer)),
+              request.keys == [scope.secretName]
+        else { throw AppError("invalid kubectl credential request") }
+        let parent = try kubectlCredentialParent(for: helperIdentity)
+        return ApprovalRequest(
+            op: request.op,
+            keys: request.keys,
+            target: parent.target,
+            args: Array(parent.arguments.dropFirst()),
+            cwd: "/",
+            replaceExistingEnv: false,
+            allowMissingKeys: false,
+            envConflicts: [],
+            shebangScript: nil,
+            scriptData: nil,
+            tool: "kubectl",
+            title: "Use Kubernetes credential for \(scope.user)?",
+            detail: "The verified kubectl Target will receive this credential for \(scope.server).",
+            credentialScope: scope.canonical,
+            credentialParent: parent
+        )
+    }
+
+    private func kubectlCredentialParent(
+        for helperIdentity: AVProcessIdentity
+    ) throws -> CredentialHelperParent {
+        let parentPID = helperIdentity.ppid
+        var parentIdentity = AVProcessIdentity()
+        guard parentPID > 1,
+              av_process_identity(parentPID, &parentIdentity),
+              parentIdentity.euid == helperIdentity.euid,
+              let arguments = processArguments(parentPID),
+              !arguments.isEmpty
+        else { throw AppError("kubectl credential helper has no live parent") }
+        let target = pathString(parentIdentity)
+        guard kubectlTargetIdentityValid(pid: parentPID, path: target) else {
+            throw AppError("credential helper parent is not an eligible kubectl Target")
+        }
+        return CredentialHelperParent(
+            pid: parentPID,
+            startUsec: parentIdentity.start_usec,
+            euid: parentIdentity.euid,
+            target: target,
+            arguments: arguments
+        )
+    }
+
+    private func terraformCredentialParent(
+        for helperIdentity: AVProcessIdentity
+    ) throws -> CredentialHelperParent {
+        let parentPID = helperIdentity.ppid
+        var parentIdentity = AVProcessIdentity()
+        guard parentPID > 1,
+              av_process_identity(parentPID, &parentIdentity),
+              parentIdentity.euid == helperIdentity.euid,
+              let arguments = processArguments(parentPID),
+              !arguments.isEmpty
+        else { throw AppError("Terraform credential helper has no live parent") }
+        let target = pathString(parentIdentity)
+        guard terraformTargetIdentityValid(pid: parentPID, path: target) else {
+            throw AppError("credential helper parent is not an eligible Terraform or OpenTofu Target")
+        }
+        return CredentialHelperParent(
+            pid: parentPID,
+            startUsec: parentIdentity.start_usec,
+            euid: parentIdentity.euid,
+            target: target,
+            arguments: arguments
+        )
+    }
+
+    private func aliyunCredentialRequest(
+        from message: xpc_object_t,
+        request: ApprovalRequest,
+        helperIdentity: AVProcessIdentity,
+        helperPath: String,
+        helperSigning: SigningInfo
+    ) throws -> ApprovalRequest {
+        guard request.op == "aliyun-get" else { return request }
+        guard request.tool == "aliyun-cli",
+              isTrustedAvCaller(path: helperPath, signing: helperSigning),
+              request.target.isEmpty,
+              request.args.isEmpty,
+              request.keys.count == 1,
+              !request.replaceExistingEnv,
+              !request.allowMissingKeys,
+              request.envConflicts.isEmpty,
+              request.shebangScript == nil,
+              request.scriptData == nil,
+              let profilePointer = xpc_dictionary_get_string(message, "aliyun_profile")
+        else { throw AppError("invalid Alibaba Cloud credential request") }
+        let profile = String(cString: profilePointer)
+        guard normalizeAliyunProfile(profile) == profile,
+              request.keys == [aliyunCredentialSecretName(profile)]
+        else { throw AppError("Alibaba Cloud Secret Name does not match its profile") }
+        let parent = try aliyunCredentialParent(for: helperIdentity)
+        return ApprovalRequest(
+            op: request.op,
+            keys: request.keys,
+            target: parent.target,
+            args: Array(parent.arguments.dropFirst()),
+            cwd: request.cwd,
+            replaceExistingEnv: false,
+            allowMissingKeys: false,
+            envConflicts: [],
+            shebangScript: nil,
+            scriptData: nil,
+            tool: "aliyun-cli",
+            title: "Use Alibaba Cloud credential for profile \(profile)?",
+            detail: "The verified Alibaba Cloud CLI Target will receive the credential in plaintext, as required by the External credential-provider protocol.",
+            credentialScope: profile,
+            credentialParent: parent
+        )
+    }
+
+    private func aliyunCredentialParent(
+        for helperIdentity: AVProcessIdentity
+    ) throws -> CredentialHelperParent {
+        let parentPID = helperIdentity.ppid
+        var parentIdentity = AVProcessIdentity()
+        guard parentPID > 1,
+              av_process_identity(parentPID, &parentIdentity),
+              parentIdentity.euid == helperIdentity.euid,
+              let arguments = processArguments(parentPID),
+              !arguments.isEmpty
+        else { throw AppError("Alibaba Cloud credential helper has no live parent") }
+        let target = pathString(parentIdentity)
+        guard aliyunTargetIdentityValid(pid: parentPID, path: target) else {
+            throw AppError("credential helper parent is not an eligible Alibaba Cloud CLI Target")
+        }
+        return CredentialHelperParent(
+            pid: parentPID,
+            startUsec: parentIdentity.start_usec,
+            euid: parentIdentity.euid,
+            target: target,
+            arguments: arguments
+        )
+    }
+
+    private func credentialHelperTool(_ parent: CredentialHelperParent) -> String {
+        if parent.gitContext != nil { return "gh" }
+        return switch URL(fileURLWithPath: parent.target).lastPathComponent {
+        case "aliyun": "aliyun-cli"
+        case "docker": "docker"
+        case "goat": "goat"
+        case "openhue": "openhue-cli"
+        case "ordercli": "ordercli"
+        case "oxide": "oxide-cli"
+        case "fastly": "fastly-cli"
+        case "sqlcmd": "sqlcmd"
+        case "plumber": "plumber"
+        case "podman": "podman"
+        case "railway": "railway"
+        case "rclone": "rclone"
+        case "kubectl": "kubectl"
+        case "uv": "uv"
+        case "tofu": "opentofu"
+        case "terraform": "terraform"
+        case "uaa": "uaa-cli"
+        case "wakatime-cli": "wakatime-cli"
+        default: ""
+        }
+    }
+
+    private func credentialHelperParentValid(
+        _ parent: CredentialHelperParent,
+        tool: String
+    ) -> Bool {
+        if let context = parent.gitContext { return tool == "gh" && gitCredentialContextValid(context) }
+        var identity = AVProcessIdentity()
+        guard av_process_identity(parent.pid, &identity),
+              identity.start_usec == parent.startUsec,
+              identity.euid == parent.euid,
+              pathString(identity) == parent.target,
+              processArguments(parent.pid) == parent.arguments
+        else { return false }
+        switch tool {
+        case "aliyun-cli":
+            return credentialHelperTool(parent) == tool
+                && aliyunTargetIdentityValid(pid: parent.pid, path: parent.target)
+        case "uv": return uvCredentialParentValid(parent)
+        case "docker": return dockerTargetIdentityValid(pid: parent.pid, path: parent.target)
+        case "podman": return podmanTargetIdentityValid(pid: parent.pid, path: parent.target)
+        case "goat":
+            return credentialHelperTool(parent) == tool
+                && goatTargetIdentityValid(pid: parent.pid, path: parent.target)
+        case "ordercli":
+            return credentialHelperTool(parent) == tool
+                && ordercliTargetIdentityValid(pid: parent.pid, path: parent.target)
+        case "openhue-cli":
+            return credentialHelperTool(parent) == tool
+                && openhueTargetIdentityValid(pid: parent.pid, path: parent.target)
+        case "plumber":
+            return credentialHelperTool(parent) == tool
+                && plumberTargetIdentityValid(pid: parent.pid, path: parent.target)
+        case "uaa-cli":
+            return credentialHelperTool(parent) == tool
+                && uaaTargetIdentityValid(pid: parent.pid, path: parent.target)
+        case "railway":
+            return credentialHelperTool(parent) == tool
+                && railwayTargetIdentityValid(pid: parent.pid, path: parent.target)
+        case "oxide-cli":
+            return credentialHelperTool(parent) == tool
+                && oxideTargetIdentityValid(pid: parent.pid, path: parent.target)
+        case "fastly-cli":
+            return credentialHelperTool(parent) == tool
+                && fastlyTargetIdentityValid(pid: parent.pid, path: parent.target)
+        case "sqlcmd":
+            return credentialHelperTool(parent) == tool
+                && sqlcmdTargetIdentityValid(pid: parent.pid, path: parent.target)
+        case "terraform", "opentofu":
+            return credentialHelperTool(parent) == tool
+                && terraformTargetIdentityValid(pid: parent.pid, path: parent.target)
+        case "wakatime-cli":
+            return credentialHelperTool(parent) == tool
+                && wakatimeTargetIdentityValid(pid: parent.pid, path: parent.target)
+        case "rclone":
+            return credentialHelperTool(parent) == tool
+                && rcloneTargetIdentityValid(pid: parent.pid, path: parent.target)
+        case "kubectl":
+            return credentialHelperTool(parent) == tool
+                && kubectlTargetIdentityValid(pid: parent.pid, path: parent.target)
+        default: return false
+        }
+    }
+
+    private func goatTargetIdentityValid(pid: pid_t, path: String) -> Bool {
+        guard configuredSecretGateTarget("goat", matches: path),
+              let signing = liveSigningInfo(pid: pid), signing.mainExecutable == path
+        else { return false }
+        return signing.identifier == "goat"
+            && signing.teamIdentifier == "ZU76A67LGU"
+            && signing.isDeveloperID
+            && signing.runtimeProtection.allowsSecretGateAccess
+    }
+
+    private func aliyunTargetIdentityValid(pid: pid_t, path: String) -> Bool {
+        guard configuredSecretGateTarget("aliyun-cli", matches: path),
+              let signing = liveSigningInfo(pid: pid), signing.mainExecutable == path
+        else { return false }
+        return signing.identifier == "aliyun"
+            && signing.teamIdentifier == "ZU76A67LGU"
+            && signing.isDeveloperID
+            && signing.runtimeProtection.allowsSecretGateAccess
+    }
+
+    private func ordercliTargetIdentityValid(pid: pid_t, path: String) -> Bool {
+        guard configuredSecretGateTarget("ordercli", matches: path),
+              let signing = liveSigningInfo(pid: pid), signing.mainExecutable == path
+        else { return false }
+        return signing.identifier == "ordercli"
+            && signing.teamIdentifier == "ZU76A67LGU"
+            && signing.isDeveloperID
+            && signing.runtimeProtection.allowsSecretGateAccess
+    }
+
+    private func openhueTargetIdentityValid(pid: pid_t, path: String) -> Bool {
+        guard configuredSecretGateTarget("openhue-cli", matches: path),
+              let signing = liveSigningInfo(pid: pid), signing.mainExecutable == path
+        else { return false }
+        return signing.identifier == "openhue"
+            && signing.teamIdentifier == "ZU76A67LGU"
+            && signing.isDeveloperID
+            && signing.runtimeProtection.allowsSecretGateAccess
+    }
+
+    private func uaaTargetIdentityValid(pid: pid_t, path: String) -> Bool {
+        guard configuredSecretGateTarget("uaa-cli", matches: path),
+              let signing = liveSigningInfo(pid: pid), signing.mainExecutable == path
+        else { return false }
+        return signing.identifier == "uaa"
+            && signing.teamIdentifier == "ZU76A67LGU"
+            && signing.isDeveloperID
+            && signing.runtimeProtection.allowsSecretGateAccess
+    }
+
+    private func plumberTargetIdentityValid(pid: pid_t, path: String) -> Bool {
+        guard configuredSecretGateTarget("plumber", matches: path),
+              let signing = liveSigningInfo(pid: pid), signing.mainExecutable == path
+        else { return false }
+        return signing.identifier == "plumber"
+            && signing.teamIdentifier == "ZU76A67LGU"
+            && signing.isDeveloperID
+            && signing.runtimeProtection.allowsSecretGateAccess
+    }
+
+    private func railwayTargetIdentityValid(pid: pid_t, path: String) -> Bool {
+        guard configuredSecretGateTarget("railway", matches: path),
+              let signing = liveSigningInfo(pid: pid), signing.mainExecutable == path
+        else { return false }
+        return signing.identifier == "railway"
+            && signing.teamIdentifier == "ZU76A67LGU"
+            && signing.isDeveloperID
+            && signing.runtimeProtection.allowsSecretGateAccess
+    }
+
+    private func oxideTargetIdentityValid(pid: pid_t, path: String) -> Bool {
+        guard configuredSecretGateTarget("oxide-cli", matches: path),
+              let signing = liveSigningInfo(pid: pid),
+              signing.mainExecutable == path
+        else { return false }
+        return signing.identifier == "oxide"
+            && signing.teamIdentifier == "ZU76A67LGU"
+            && signing.isDeveloperID
+            && signing.runtimeProtection == .hardened
+            && liveProcessHasNoEntitlements(pid: pid)
+    }
+
+    private func fastlyTargetIdentityValid(pid: pid_t, path: String) -> Bool {
+        guard configuredSecretGateTarget("fastly-cli", matches: path),
+              let signing = liveSigningInfo(pid: pid),
+              signing.mainExecutable == path
+        else { return false }
+        return signing.identifier == "fastly"
+            && signing.teamIdentifier == "ZU76A67LGU"
+            && signing.isDeveloperID
+            && signing.runtimeProtection == .hardened
+            && liveProcessHasNoEntitlements(pid: pid)
+    }
+
+    private func sqlcmdTargetIdentityValid(pid: pid_t, path: String) -> Bool {
+        guard configuredSecretGateTarget("sqlcmd", matches: path),
+              let signing = liveSigningInfo(pid: pid),
+              signing.mainExecutable == path
+        else { return false }
+        return signing.identifier == "sqlcmd"
+            && signing.teamIdentifier == "ZU76A67LGU"
+            && signing.isDeveloperID
+            && signing.runtimeProtection == .hardened
+            && liveProcessHasNoEntitlements(pid: pid)
+    }
+
+    private func terraformTargetIdentityValid(pid: pid_t, path: String) -> Bool {
+        let expected: (identifier: String, team: String)? = if configuredSecretGateTarget(
+            "terraform", matches: path
+        ) {
+            ("terraform", "D38WU7D763")
+        } else if configuredSecretGateTarget("opentofu", matches: path) {
+            ("tofu", "ZU76A67LGU")
+        } else {
+            nil
+        }
+        guard let expected,
+              let signing = liveSigningInfo(pid: pid),
+              signing.mainExecutable == path
+        else { return false }
+        return signing.identifier == expected.identifier
+            && signing.teamIdentifier == expected.team
+            && signing.isDeveloperID
+            && signing.runtimeProtection.allowsSecretGateAccess
+    }
+
+    private func wakatimeTargetIdentityValid(pid: pid_t, path: String) -> Bool {
+        guard configuredSecretGateTarget("wakatime-cli", matches: path),
+              let signing = liveSigningInfo(pid: pid),
+              signing.mainExecutable == path
+        else { return false }
+        return signing.identifier == "wakatime-cli"
+            && signing.teamIdentifier == "ZU76A67LGU"
+            && signing.isDeveloperID
+            && signing.runtimeProtection == .hardened
+            && liveProcessHasNoEntitlements(pid: pid)
+    }
+
+    private func rcloneTargetIdentityValid(pid: pid_t, path: String) -> Bool {
+        guard configuredSecretGateTarget("rclone", matches: path),
+              let signing = liveSigningInfo(pid: pid),
+              signing.mainExecutable == path
+        else { return false }
+        return signing.identifier == "rclone"
+            && signing.teamIdentifier == "ZU76A67LGU"
+            && signing.isDeveloperID
+            && signing.runtimeProtection == .hardened
+            && liveProcessHasNoEntitlements(pid: pid)
+    }
+
+    private func kubectlTargetIdentityValid(pid: pid_t, path: String) -> Bool {
+        guard configuredSecretGateTarget("kubectl", matches: path),
+              let signing = liveSigningInfo(pid: pid),
+              signing.mainExecutable == path
+        else { return false }
+        return signing.identifier == "kubectl"
+            && signing.teamIdentifier == "ZU76A67LGU"
+            && signing.isDeveloperID
+            && signing.runtimeProtection == .hardened
+            && liveProcessHasNoEntitlements(pid: pid)
+    }
+
+    private func configuredSecretGateTarget(_ gateID: String, matches path: String) -> Bool {
+        secretGateDescriptors.first(where: { $0.id == gateID })?.routes.contains {
+            normalizedExecutablePath($0.targetPath) == normalizedExecutablePath(path)
+        } == true
+    }
+
+    private func validateHcloudTarget(_ request: ApprovalRequest) throws {
+        guard request.target == hcloudOfficialTarget else { return }
+        guard hcloudInstalledReleaseValid() else {
+            throw AppError("hcloud Target changed before Secret Application; run av harden hcloud")
+        }
+    }
+
+    private func validateDoctlTarget(_ request: ApprovalRequest) throws {
+        guard request.target == doctlSignedTarget else { return }
+        guard doctlInstalledReleaseValid(), doctlArgumentsBound(request.args) else {
+            throw AppError("doctl Target changed before Secret Application; run av harden doctl")
+        }
+    }
+
+    private func prepareApprovedFulfillment(
+        for request: ApprovalRequest,
+        awsRegistration: AWSRegistrationCandidate?
+    ) throws -> AuthorizationFulfillmentTransaction<ApprovedFulfillmentMaterial> {
+        try validateDoctlTarget(request)
+        try validateHcloudTarget(request)
+        let credentialParent: CredentialHelperParent?
+        if ["docker-get", "goat-get", "ordercli-get", "openhue-get", "plumber-get", "uaa-get", "railway-get", "oxide-get", "fastly-get", "sqlcmd-get", "terraform-get", "aliyun-get", "wakatime-get", "rclone-get", "kubectl-get", "uv-get"]
+            .contains(request.op)
+        {
+            guard let scope = request.credentialScope,
+                  let parent = request.credentialParent,
+                  let tool = request.tool,
+                  credentialHelperParentValid(parent, tool: tool),
+                  parent.target == request.target,
+                  Array(parent.arguments.dropFirst()) == request.args
+            else { throw AppError("invalid credential-helper request") }
+            let expected: String
+            switch request.op {
+            case "uv-get": expected = uvCredentialSecretName
+            case "aliyun-get": expected = aliyunCredentialSecretName(scope)
+            case "docker-get": expected = dockerCredentialSecretName(scope)
+            case "goat-get":
+                guard let goat = parseGoatCredentialScope(scope) else {
+                    throw AppError("goat credential scope changed before Secret Application")
+                }
+                expected = goat.secretName
+            case "ordercli-get": expected = ordercliCredentialSecretName
+            case "openhue-get": expected = openhueCredentialSecretName
+            case "plumber-get": expected = plumberCredentialSecretName
+            case "uaa-get": expected = uaaCredentialSecretName
+            case "railway-get":
+                guard let railway = parseRailwayCredentialScope(scope) else {
+                    throw AppError("Railway credential scope changed before Secret Application")
+                }
+                expected = railway.secretName
+            case "oxide-get":
+                guard let oxide = parseOxideCredentialScope(scope) else {
+                    throw AppError("Oxide credential scope changed before Secret Application")
+                }
+                expected = oxide.secretName
+            case "fastly-get":
+                guard let fastly = parseFastlyCredentialScope(scope) else {
+                    throw AppError("Fastly credential scope changed before Secret Application")
+                }
+                expected = fastly.secretName
+            case "sqlcmd-get":
+                guard let sqlcmd = parseSqlcmdCredentialScope(scope) else {
+                    throw AppError("sqlcmd credential scope changed before Secret Application")
+                }
+                expected = sqlcmd.secretName
+            case "wakatime-get":
+                guard scope == wakatimeOfficialAPIURL else {
+                    throw AppError("WakaTime API endpoint changed before Secret Application")
+                }
+                expected = wakatimeCredentialSecretName
+            case "rclone-get":
+                guard scope == rcloneAllRemotesScope else {
+                    throw AppError("rclone credential scope changed before Secret Application")
+                }
+                expected = rcloneConfigPasswordSecretName
+            case "kubectl-get":
+                guard let kubectl = parseKubectlCredentialScope(scope) else {
+                    throw AppError("kubectl credential scope changed before Secret Application")
+                }
+                expected = kubectl.secretName
+            default: expected = terraformCredentialSecretName(scope)
+            }
+            guard request.keys == [expected] else {
+                throw AppError("credential-helper Secret Name changed before Secret Application")
+            }
+            credentialParent = parent
+        } else {
+            credentialParent = nil
+        }
+        if let context = request.credentialParent?.gitContext {
+            guard request.op == "keys", request.tool == "gh", request.target == gitTransportGH,
+                  request.args == ["auth", "git-credential", "get"], request.keys == ["GH_TOKEN_GITHUB_COM"],
+                  gitCredentialContextValid(context) else { throw AppError("Git transport changed before Secret Application") }
+        }
+        let secrets = try approvedSecrets(for: request)
+        if let context = request.credentialParent?.gitContext, !gitCredentialContextValid(context) {
+            throw AppError("Git transport changed while loading the credential")
+        }
+        if let credentialParent,
+           let scope = request.credentialScope,
+           let tool = request.tool
+        {
+            guard credentialHelperParentValid(credentialParent, tool: tool) else {
+                throw AppError("credential-helper Target changed before Secret Application")
+            }
+            if request.op == "uv-get" {
+                guard let data = scope.data(using: .utf8),
+                      let fields = (try? JSONSerialization.jsonObject(with: data)) as? [String: String],
+                      Set(fields.keys) == ["service", "username"], let service = fields["service"], let username = fields["username"],
+                      let stored = secrets[uvCredentialSecretName],
+                      let credential = uvKeyringCredential(stored, service: service, username: username.isEmpty ? nil : username),
+                      uvCredentialParentValid(credentialParent) else { throw AppError("uv credential scope is unavailable or changed") }
+                let value = username.isEmpty ? credential.username + "\n" + credential.password : credential.password
+                return AuthorizationFulfillmentTransaction(material: ApprovedFulfillmentMaterial(
+                    payload: ApprovedPayload(secrets: [:], value: value), awsRegistration: nil))
+            } else if request.op == "docker-get" {
+                guard let value = secrets[dockerCredentialSecretName(scope)],
+                      let credential = parseDockerCredential(value),
+                      credential.serverURL == scope
+                else { throw AppError("Docker credential changed before Secret Application") }
+            } else if request.op == "goat-get" {
+                guard let scope = parseGoatCredentialScope(scope),
+                      let value = secrets[scope.secretName], parseGoatCredential(value) != nil
+                else { throw AppError("goat credential changed before Secret Application") }
+            } else if request.op == "ordercli-get" {
+                guard parseOrdercliCredentialScope(scope) != nil,
+                      let value = secrets[ordercliCredentialSecretName],
+                      parseOrdercliCredential(value) != nil
+                else { throw AppError("ordercli credential changed before Secret Application") }
+            } else if request.op == "openhue-get" {
+                guard parseOpenHueCredentialScope(scope) != nil,
+                      let value = secrets[openhueCredentialSecretName],
+                      parseOpenHueCredential(value) != nil
+                else { throw AppError("OpenHue credential changed before Secret Application") }
+            } else if request.op == "plumber-get" {
+                guard parsePlumberCredentialScope(scope) != nil,
+                      let value = secrets[plumberCredentialSecretName],
+                      parsePlumberCredential(value) != nil
+                else { throw AppError("Plumber config changed before Secret Application") }
+            } else if request.op == "uaa-get" {
+                guard parseUAACredentialScope(scope) != nil,
+                      let value = secrets[uaaCredentialSecretName],
+                      parseUAACredential(value) != nil
+                else { throw AppError("UAA credential changed before Secret Application") }
+            } else if request.op == "railway-get" {
+                guard let scope = parseRailwayCredentialScope(scope),
+                      let value = secrets[scope.secretName], parseRailwayCredential(value) != nil
+                else { throw AppError("Railway credential changed before Secret Application") }
+            } else if request.op == "oxide-get" {
+                guard let scope = parseOxideCredentialScope(scope),
+                      let value = secrets[scope.secretName],
+                      parseOxideCredential(value) != nil
+                else { throw AppError("Oxide credential changed before Secret Application") }
+            } else if request.op == "fastly-get" {
+                guard let scope = parseFastlyCredentialScope(scope),
+                      let value = secrets[scope.secretName],
+                      parseFastlyCredential(value) != nil
+                else { throw AppError("Fastly credential changed before Secret Application") }
+            } else if request.op == "sqlcmd-get" {
+                guard let scope = parseSqlcmdCredentialScope(scope),
+                      let value = secrets[scope.secretName],
+                      parseSqlcmdPassword(value) != nil
+                else { throw AppError("sqlcmd credential changed before Secret Application") }
+            } else if request.op == "aliyun-get" {
+                guard let value = secrets[aliyunCredentialSecretName(scope)],
+                      parseAliyunCredential(value)
+                else { throw AppError("Alibaba Cloud credential changed before Secret Application") }
+            } else if request.op == "wakatime-get" {
+                guard scope == wakatimeOfficialAPIURL,
+                      let value = secrets[wakatimeCredentialSecretName],
+                      validWakaTimeAPIKey(value)
+                else { throw AppError("WakaTime credential changed before Secret Application") }
+            } else if request.op == "rclone-get" {
+                guard scope == rcloneAllRemotesScope,
+                      let value = secrets[rcloneConfigPasswordSecretName],
+                      validRcloneConfigPassword(value)
+                else { throw AppError("rclone config password changed before Secret Application") }
+            } else if request.op == "kubectl-get" {
+                guard let scope = parseKubectlCredentialScope(scope),
+                      let value = secrets[scope.secretName],
+                      validKubectlCredential(value, kind: scope.kind)
+                else { throw AppError("kubectl credential changed before Secret Application") }
+            } else {
+                guard let value = secrets[terraformCredentialSecretName(scope)],
+                      parseTerraformCredential(value) != nil
+                else { throw AppError("Terraform credential changed before Secret Application") }
+            }
+        }
+        guard let awsRegistration else {
+            return AuthorizationFulfillmentTransaction(material: ApprovedFulfillmentMaterial(
+                payload: ApprovedPayload(secrets: secrets, value: nil),
+                awsRegistration: nil
+            ))
+        }
+        let registration = AWSRegistration(
+            generation: awsRegistration.generation,
+            chain: awsRegistration.chain,
+            args: awsRegistration.args,
+            target: awsRegistration.target,
+            interpreter: awsRegistration.interpreter,
+            useLongLivedCredentials: awsRegistration.useLongLivedCredentials,
+            secretValues: request.selectedSecretValues,
+            credentials: nil
+        )
+        let section = awsRegistration.chain.selected.name == "default"
+            ? "default"
+            : "profile \(awsRegistration.chain.selected.name)"
+        let config = """
+        [\(section)]
+        credential_process = /usr/local/bin/av aws-credentials\(awsRegistration.generation == .officialV2 ? " official-v2" : "")
+        region = \(awsRegistration.chain.region)
+
+        """
+        return AuthorizationFulfillmentTransaction(material: ApprovedFulfillmentMaterial(
+            payload: ApprovedPayload(secrets: [:], value: config),
+            awsRegistration: registration
+        ))
+    }
+
+    private func fulfillApprovedRequest(
+        request: ApprovalRequest,
+        signing: SigningInfo,
+        awsRegistration: AWSRegistrationCandidate?,
+        pid: pid_t,
+        identity: AVProcessIdentity,
+        record: AccessRequestRecord,
+        launchers: [LauncherIdentity],
+        launcher: LauncherIdentity?,
+        sshScriptAuthorization: SSHScriptAuthorization? = nil,
+        cancellation: ApprovalCancellation? = nil,
+        validateAuthority: () throws -> Void = {},
+        activateAfterRecording: () -> Void = {},
+        release: (ApprovedPayload) -> Void
+    ) throws -> Bool {
+        func validateCancellation() throws {
+            guard cancellation?.isCanceled != true else { throw CancellationError() }
+            try validateAuthority()
+        }
+        try validateCancellation()
+        func validateDenial() throws {
+            let currentLaunchers = request.sshPeer?.launchers ?? launcherIdentities(for: identity)
+            var attributedLaunchers = launchers + currentLaunchers
+            if let launcher, !attributedLaunchers.contains(where: {
+                $0.designatedRequirement == launcher.designatedRequirement
+            }) { attributedLaunchers.append(launcher) }
+            if let denial = launcherDenial(request, signing: signing,
+                                         launchers: attributedLaunchers) {
+                throw denial
+            }
+        }
+        try validateDenial()
+        func validateSSHScriptAuthority() throws {
+            guard let sshScriptAuthorization, let sshPeer = request.sshPeer else { return }
+            guard sshScriptAuthorization.allows(
+                activeSSHScriptAuthority(ancestors: sshPeer.scriptAncestors)
+            ) else { throw AppError("SSH script authority changed before signing") }
+        }
+        try request.sshPeer?.validate()
+        try validateSSHScriptAuthority()
+        let transaction = try prepareApprovedFulfillment(
+            for: request,
+            awsRegistration: awsRegistration
+        )
+        try request.sshPeer?.validate()
+        try validateSSHScriptAuthority()
+        return try transaction.commit(
+            record: {
+                do {
+                    try request.sshPeer?.validate()
+                    try validateSSHScriptAuthority()
+                    if let context = request.credentialParent?.gitContext, !gitCredentialContextValid(context) { return false }
+                    try validateCancellation()
+                    guard onAccessRequest(record) else { return false }
+                    try validateCancellation()
+                    try request.sshPeer?.validate()
+                    try validateSSHScriptAuthority()
+                    if let context = request.credentialParent?.gitContext, !gitCredentialContextValid(context) { return false }
+                    return true
+                } catch let error as CancellationError {
+                    throw error
+                } catch { return false }
+            },
+            activate: { material in
+                if var registration = material.awsRegistration {
+                    registration.denialGate = matchingSecretGateDefinition(
+                        request: request, signing: signing, descriptors: secretGateDescriptors
+                    )
+                    registration.denialClassification = registration.denialGate.map {
+                        classifySecretGateRequest(gateID: $0.id, request: request)
+                    } ?? .unknown
+                    registration.launchers = launchers + launcherIdentities(for: identity)
+                    if let launcher { registration.launchers.append(launcher) }
+                    registration.authorizationRecord = record
+                    installAWSRegistration(registration, pid: pid, identity: identity)
+                }
+                if scriptExecutionDeclaration(for: request)?.manifest.hasEmptyCapabilityCeiling == true {
+                    registerEmptyCapabilityCeiling(pid: pid, identity: identity)
+                }
+                activateAfterRecording()
+            },
+            observe: { material in
+                guard request.sshPeer == nil else { return }
+                recordLiveSecretUse(
+                    request: request,
+                    payload: material.payload,
+                    launcher: launcher,
+                    pid: pid,
+                    identity: identity
+                )
+            },
+            release: { material in
+                try validateCancellation()
+                try validateDoctlTarget(request)
+                try validateHcloudTarget(request)
+                try validateDenial()
+                try releaseAfterSSHAuthorizationCheck(
+                    material.payload,
+                    authorization: sshScriptAuthorization,
+                    validatePeer: {
+                        try request.sshPeer?.validate()
+                        // UI policy changes can now arrive while SSH peer validation runs.
+                        if request.sshPeer != nil { try validateDenial() }
+                        try validateCancellation()
+                    },
+                    currentAuthority: {
+                        request.sshPeer.map {
+                            activeSSHScriptAuthority(ancestors: $0.scriptAncestors)
+                        }
+                    },
+                    deliver: release
+                )
+            }
+        )
+    }
+
+    private func installAWSRegistration(
+        _ registration: AWSRegistration,
+        pid: pid_t,
+        identity: AVProcessIdentity
+    ) {
+        let key = BlessedExecutionKey(pid: pid, startUsec: identity.start_usec)
+        awsRegistrationsLock.lock()
+        defer { awsRegistrationsLock.unlock() }
+        awsRegistrations = awsRegistrations.filter { key, _ in
+            var current = AVProcessIdentity()
+            return av_process_identity(key.pid, &current) && current.start_usec == key.startUsec
+        }
+        awsRegistrations[key] = registration
+    }
+
+    private func recordLiveSecretUse(
+        request: ApprovalRequest,
+        payload: ApprovedPayload,
+        launcher: LauncherIdentity?,
+        pid: pid_t,
+        identity: AVProcessIdentity
+    ) {
+        var secretNames = Set(payload.secrets.keys)
+        if ["aws", "uv"].contains(request.tool ?? ""), payload.value != nil {
+            secretNames.formUnion(request.selectedSecretValues.names)
+        }
+        guard !secretNames.isEmpty else { return }
+
+        let process: LiveSecretUseProcess?
+        if let parent = request.credentialParent,
+           let tool = request.tool,
+           credentialHelperParentValid(parent, tool: tool)
+        {
+            var parentIdentity = AVProcessIdentity()
+            process = av_process_identity(parent.pid, &parentIdentity)
+                ? liveSecretUseProcess(pid: parent.pid, identity: parentIdentity)
+                : nil
+        } else {
+            process = liveSecretUseProcess(pid: pid, identity: identity)
+        }
+        guard let process else { return }
+
+        let launcherName = launcher.map {
+            approvalPromptRequester(launcher: $0, fallback: $0.path).name
+        }
+        liveSecretUses.record(
+            process: process,
+            launcherDesignatedRequirement: launcher?.designatedRequirement,
+            launcherName: launcherName,
+            targetPath: request.target,
+            processID: process.pid,
+            secretNames: secretNames
+        )
+        Task { @MainActor in self.onLiveSecretUsesChanged() }
+    }
+
+    private func recordLiveSecretUse(
+        request: ApprovalRequest,
+        secretNames: Set<String>,
+        launcher: LauncherIdentity,
+        execution: RetainedProcessExecution
+    ) {
+        let process = LiveSecretUseProcess(
+            pid: execution.pid,
+            startUsec: execution.startUsec,
+            effectiveUserID: execution.effectiveUserID,
+            auditSessionID: execution.auditSessionID
+        )
+        guard liveSecretUseProcessIsLive(process) else { return }
+        liveSecretUses.record(
+            process: process,
+            launcherDesignatedRequirement: launcher.designatedRequirement,
+            launcherName: approvalPromptRequester(launcher: launcher, fallback: launcher.path).name,
+            targetPath: request.target,
+            processID: process.pid,
+            secretNames: secretNames
+        )
+        Task { @MainActor in self.onLiveSecretUsesChanged() }
+    }
+
+    private func handleAWSCredentials(
+        _ message: xpc_object_t,
+        on peer: xpc_connection_t,
+        pid: pid_t,
+        identity: AVProcessIdentity
+    ) {
+        let parentPID = identity.ppid
+        var parentIdentity = AVProcessIdentity()
+        guard parentPID > 1, av_process_identity(parentPID, &parentIdentity) else {
+            reply(peer, to: message, ok: false, error: "AWS credential helper has no live parent")
+            return
+        }
+        let key = BlessedExecutionKey(pid: parentPID, startUsec: parentIdentity.start_usec)
+        awsRegistrationsLock.lock()
+        awsRegistrations = awsRegistrations.filter { key, _ in
+            var current = AVProcessIdentity()
+            return av_process_identity(key.pid, &current) && current.start_usec == key.startUsec
+        }
+        let registration = awsRegistrations[key]
+        awsRegistrationsLock.unlock()
+        guard let registration else {
+            reply(peer, to: message, ok: false, error: "AWS credential helper is not a direct child of a registered AWS process")
+            return
+        }
+        let requestedGeneration = xpc_dictionary_get_string(message, "aws_generation")
+            .map { String(cString: $0) }
+        guard requestedGeneration == (registration.generation == .officialV2 ? "official-v2" : nil) else {
+            reply(peer, to: message, ok: false, error: "AWS credential helper generation does not match its registered parent")
+            return
+        }
+        let parentPath = pathString(parentIdentity)
+        guard let arguments = processArguments(parentPID),
+              awsRuntimeMatches(
+                  generation: registration.generation,
+                  interpreter: registration.interpreter,
+                  processPath: parentPath,
+                  processArguments: arguments,
+                  target: registration.target,
+                  approvedArguments: registration.args
+              )
+        else {
+            reply(peer, to: message, ok: false, error: "registered AWS process runtime does not match its approved executable and arguments")
+            return
+        }
+        func denyIfNeeded() -> Bool {
+            guard let denial = evaluateLauncherDenial(
+                gate: registration.denialGate, classification: registration.denialClassification,
+                launchers: registration.launchers + launcherIdentities(for: identity)
+            ) else { return false }
+            let reason = denial.reason
+            if let original = registration.authorizationRecord {
+                _ = self.onAccessRequest(AccessRequestRecord(
+                    date: Date(), tool: original.tool, command: original.command,
+                    displayCommand: original.displayCommand, decision: "Denied", approvalSource: "Auto", reason: reason,
+                    launcher: denial.launcher.map { approvalPromptRequester(launcher: $0, fallback: $0.path).name },
+                    launcherIconPath: denial.launcher.map { approvalPromptRequester(launcher: $0, fallback: $0.path).iconPath },
+                    launcherRequirement: denial.launcher.flatMap {
+                        $0.runtimeProtection.allowsSecretGateAccess ? $0.designatedRequirement : nil
+                    },
+                    gateID: original.gateID,
+                    temporaryDenialScope: original.temporaryDenialScope,
+                    callerPath: pathString(identity), target: original.target, cwd: original.cwd,
+                    keys: original.keys, detail: original.detail, secretValueSources: original.secretValueSources
+                ))
+            }
+            self.reply(peer, to: message, ok: false, error: reason)
+            return true
+        }
+        if denyIfNeeded() { return }
+        if let credentials = registration.credentials,
+           credentials.expiration.map({ $0.timeIntervalSinceNow > 5 * 60 }) ?? true
+        {
+            do {
+                reply(peer, to: message, ok: true, error: nil, value: String(decoding: try credentials.credentialProcessJSON(), as: UTF8.self))
+            } catch {
+                reply(peer, to: message, ok: false, error: error.localizedDescription)
+            }
+            return
+        }
+
+        Task {
+            do {
+                let credentials = try await self.resolveAWSCredentials(
+                    registration,
+                    parentPID: parentPID
+                )
+                var liveIdentity = AVProcessIdentity()
+                guard av_process_identity(parentPID, &liveIdentity),
+                      liveIdentity.start_usec == key.startUsec
+                else { throw AppError("registered AWS process exited before credentials were ready") }
+                if denyIfNeeded() { return }
+                self.awsRegistrationsLock.withLock {
+                    self.awsRegistrations[key]?.credentials = credentials
+                }
+                self.reply(
+                    peer,
+                    to: message,
+                    ok: true,
+                    error: nil,
+                    value: String(decoding: try credentials.credentialProcessJSON(), as: UTF8.self)
+                )
+            } catch {
+                self.reply(peer, to: message, ok: false, error: error.localizedDescription)
+            }
+        }
+    }
+
+    private func resolveAWSCredentials(
+        _ registration: AWSRegistration,
+        parentPID: pid_t
+    ) async throws -> AWSCredentials {
+        let selectedKeys: [String: String]
+        do {
+            selectedKeys = try secretValueCustody.load(
+                registration.secretValues,
+                names: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+            )
+        } catch {
+            throw AppError("selected AWS access keys are unavailable: \(error.localizedDescription)")
+        }
+        guard let accessKey = selectedKeys["AWS_ACCESS_KEY_ID"],
+              let secretKey = selectedKeys["AWS_SECRET_ACCESS_KEY"]
+        else { throw AppError("selected AWS access keys are unavailable") }
+        var credentials = AWSCredentials(accessKeyID: accessKey, secretAccessKey: secretKey)
+        if registration.useLongLivedCredentials { return credentials }
+
+        let profiles = registration.chain.profiles
+        let base = profiles[0]
+        if let serial = base.mfaSerial {
+            let tokenCode = try await requestMFACode(serial: serial)
+            credentials = try await requestSTSCredentials(
+                region: registration.chain.region,
+                parameters: [
+                    "Action": "GetSessionToken",
+                    "Version": "2011-06-15",
+                    "DurationSeconds": "3600",
+                    "SerialNumber": serial,
+                    "TokenCode": tokenCode,
+                ],
+                credentials: credentials
+            )
+        } else if profiles.count == 1 {
+            credentials = try await requestSTSCredentials(
+                region: registration.chain.region,
+                parameters: [
+                    "Action": "GetSessionToken",
+                    "Version": "2011-06-15",
+                    "DurationSeconds": "3600",
+                ],
+                credentials: credentials
+            )
+        }
+        for profile in profiles.dropFirst() {
+            guard let roleARN = profile.roleARN else {
+                throw AWSCredentialError.unsupportedProfile("\(profile.name) does not define role_arn")
+            }
+            var parameters = [
+                "Action": "AssumeRole",
+                "Version": "2011-06-15",
+                "DurationSeconds": "3600",
+                "RoleArn": roleARN,
+                "RoleSessionName": "automic-vault-\(parentPID)",
+            ]
+            if let serial = profile.mfaSerial {
+                let tokenCode = try await requestMFACode(serial: serial)
+                parameters["SerialNumber"] = serial
+                parameters["TokenCode"] = tokenCode
+            }
+            credentials = try await requestSTSCredentials(
+                region: registration.chain.region,
+                parameters: parameters,
+                credentials: credentials
+            )
+        }
+        return credentials
+    }
+
+    @MainActor
+    private func requestMFACode(serial: String) throws -> String {
+        guard canRequestMacInput() else { throw AppError("AWS MFA unavailable while the user session is inactive") }
+        let alert = NSAlert()
+        alert.messageText = String(localized: "AWS MFA required")
+        alert.informativeText = String(localized: "Enter the current code for \(serial). Automic Vault does not run mfa_process commands.")
+        alert.addButton(withTitle: String(localized: "Continue"))
+        alert.addButton(withTitle: String(localized: "Cancel"))
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        field.placeholderString = "123456"
+        field.setAccessibilityLabel(String(localized: "AWS MFA code"))
+        alert.accessoryView = field
+        guard alert.runModal() == .alertFirstButtonReturn else { throw AppError("AWS MFA canceled") }
+        let code = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard code.count >= 6, code.count <= 8, code.allSatisfy(\.isNumber) else {
+            throw AppError("AWS MFA code must contain 6 to 8 digits")
+        }
+        return code
+    }
+
+    private func requestSTSCredentials(
+        region: String,
+        parameters: [String: String],
+        credentials: AWSCredentials
+    ) async throws -> AWSCredentials {
+        let signed = try awsSTSRequest(
+            region: region,
+            parameters: parameters,
+            credentials: credentials
+        )
+        var request = URLRequest(url: signed.url)
+        request.httpMethod = "POST"
+        request.httpBody = signed.body
+        request.timeoutInterval = 30
+        for (name, value) in signed.headers { request.setValue(value, forHTTPHeaderField: name) }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.waitsForConnectivity = false
+        let (data, response) = try await URLSession(configuration: configuration).data(for: request)
+        guard data.count <= 1024 * 1024 else {
+            throw AWSCredentialError.invalidResponse("STS response exceeds 1 MiB")
+        }
+        guard let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode) else {
+            do {
+                _ = try parseAWSTSCredentials(data)
+            } catch {
+                throw error
+            }
+            throw AWSCredentialError.invalidResponse("STS returned HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")
+        }
+        return try parseAWSTSCredentials(data)
+    }
+
+    private func processArguments(_ pid: pid_t) -> [String]? {
+        var buffer = [CChar](repeating: 0, count: 64 * 1024)
+        guard av_process_arguments(pid, &buffer, buffer.count) else { return nil }
+        let end = buffer.firstIndex(of: 0) ?? buffer.endIndex
+        let text = String(decoding: buffer[..<end].map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        return text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+    }
+
+
+    private func reply(
+        _ peer: xpc_connection_t,
+        to message: xpc_object_t,
+        ok: Bool,
+        error: String?,
+        secrets: [String: String]? = nil,
+        value: String? = nil,
+        names: [String]? = nil,
+        protocolVersion: UInt64? = nil,
+        proxySession: ProxySessionMaterial? = nil,
+        humanApprovalDecision: String? = nil
+    ) {
+        let response = xpc_dictionary_create_reply(message) ?? xpc_dictionary_create_empty()
+        xpc_dictionary_set_bool(response, "ok", ok)
+        if let error {
+            error.withCString {
+                xpc_dictionary_set_string(response, "error", $0)
+            }
+        }
+        if let secrets {
+            let values = xpc_dictionary_create_empty()
+            for (key, value) in secrets {
+                let wireKey = xpc_dictionary_get_string(message, "op").map(String.init(cString:)) == "ssh-sign"
+                    && secrets.count == 1 ? sshCredentialSecretName : key
+                wireKey.withCString { keyPointer in
+                    if xpc_dictionary_get_string(message, "op").map(String.init(cString:)) == "inject-fd" {
+                        Data(value.utf8).withUnsafeBytes { bytes in
+                            if let baseAddress = bytes.baseAddress {
+                                xpc_dictionary_set_data(values, keyPointer, baseAddress, bytes.count)
+                            } else {
+                                "".withCString { emptyPtr in
+                                    xpc_dictionary_set_data(values, keyPointer, emptyPtr, 0)
+                                }
+                            }
+                        }
+                    } else {
+                        value.withCString { valuePointer in
+                            xpc_dictionary_set_string(values, keyPointer, valuePointer)
+                        }
+                    }
+                }
+            }
+            xpc_dictionary_set_value(response, "secrets", values)
+        }
+        if let value {
+            value.withCString { xpc_dictionary_set_string(response, "value", $0) }
+        }
+        if let names {
+            let array = xpc_array_create_empty()
+            for name in names {
+                name.withCString { xpc_array_set_string(array, XPC_ARRAY_APPEND, $0) }
+            }
+            xpc_dictionary_set_value(response, "names", array)
+        }
+        if let protocolVersion {
+            xpc_dictionary_set_uint64(response, "protocol_version", protocolVersion)
+        }
+        if let proxySession {
+            proxySession.proxyURL.withCString {
+                xpc_dictionary_set_string(response, "proxy_url", $0)
+            }
+            proxySession.caCertificatePath.withCString {
+                xpc_dictionary_set_string(response, "ca_certificate_path", $0)
+            }
+            proxySession.sessionID.uuidString.lowercased().withCString {
+                xpc_dictionary_set_string(response, "session_id", $0)
+            }
+            let values = xpc_dictionary_create_empty()
+            for (key, value) in proxySession.references {
+                key.withCString { keyPointer in
+                    value.withCString { valuePointer in
+                        xpc_dictionary_set_string(values, keyPointer, valuePointer)
+                    }
+                }
+            }
+            xpc_dictionary_set_value(response, "references", values)
+        }
+        if let humanApprovalDecision {
+            humanApprovalDecision.withCString {
+                xpc_dictionary_set_string(response, "human_approval_decision", $0)
+            }
+        }
+        xpc_connection_send_message(peer, response)
+    }
+
+    private func sendEvent(_ event: String, to peer: xpc_connection_t) {
+        let message = xpc_dictionary_create_empty()
+        event.withCString { xpc_dictionary_set_string(message, "event", $0) }
+        xpc_connection_send_message(peer, message)
+    }
+}
+
+private func approvalRequest(from message: xpc_object_t) -> ApprovalRequest? {
+    guard let opPointer = xpc_dictionary_get_string(message, "op"),
+          let targetPointer = xpc_dictionary_get_string(message, "target"),
+          let cwdPointer = xpc_dictionary_get_string(message, "cwd"),
+          let keys = stringArray(message, "keys"),
+          let args = stringArray(message, "args"),
+          let envConflicts = stringArray(message, "env_conflicts")
+    else {
+        return nil
+    }
+    let op = String(cString: opPointer)
+    guard op == "inject" || op == "inject-fd" || op == "keys" || op == "authorize" || op == "gpg-sign" || op == "ssh-sign"
+        || op == "docker-get" || op == "goat-get" || op == "ordercli-get" || op == "openhue-get" || op == "plumber-get" || op == "uaa-get" || op == "railway-get"
+        || op == "oxide-get" || op == "fastly-get" || op == "sqlcmd-get" || op == "terraform-get" || op == "aliyun-get" || op == "wakatime-get"
+        || op == "rclone-get" || op == "kubectl-get" || op == "uv-get"
+        || op == "proxy-start"
+    else { return nil }
+    let scriptData: Data?
+    if xpc_dictionary_get_value(message, "script_data") != nil {
+        guard let data = xpcData(message, key: "script_data") else { return nil }
+        scriptData = data
+    } else {
+        scriptData = nil
+    }
+
+    var title = xpc_dictionary_get_string(message, "title").map(String.init(cString:))
+    var detail = xpc_dictionary_get_string(message, "detail").map(String.init(cString:))
+    if op == "inject-fd" {
+        guard let mappings = stringArray(message, "secret_fds"),
+              let description = fileDescriptorInjectionDetail(keys: keys, mappings: mappings),
+              !xpc_dictionary_get_bool(message, "replace_existing_env"),
+              !xpc_dictionary_get_bool(message, "allow_missing_keys"),
+              envConflicts.isEmpty,
+              xpc_dictionary_get_value(message, "shebang_script") == nil,
+              xpc_dictionary_get_value(message, "script_data") == nil,
+              xpc_dictionary_get_value(message, "snapshot_incompatible_interpreter") == nil,
+              xpc_dictionary_get_value(message, "tool") == nil
+        else { return nil }
+        title = "Apply Secrets through file descriptors?"
+        detail = description
+    } else if xpc_dictionary_get_value(message, "secret_fds") != nil {
+        return nil
+    }
+
+    return ApprovalRequest(
+        op: op,
+        keys: keys,
+        target: String(cString: targetPointer),
+        args: args,
+        cwd: String(cString: cwdPointer),
+        replaceExistingEnv: xpc_dictionary_get_bool(message, "replace_existing_env"),
+        allowMissingKeys: xpc_dictionary_get_bool(message, "allow_missing_keys"),
+        envConflicts: envConflicts,
+        shebangScript: xpc_dictionary_get_string(message, "shebang_script").map(String.init(cString:)),
+        scriptData: scriptData,
+        snapshotIncompatibleInterpreter: xpc_dictionary_get_string(
+            message,
+            "snapshot_incompatible_interpreter"
+        ).map(String.init(cString:)),
+        tool: xpc_dictionary_get_string(message, "tool").map(String.init(cString:)),
+        title: title,
+        detail: detail
+    )
+}
+
+private func stringArray(_ message: xpc_object_t, _ key: String) -> [String]? {
+    guard let value = xpc_dictionary_get_value(message, key),
+          xpc_get_type(value) == XPC_TYPE_ARRAY
+    else {
+        return nil
+    }
+    var strings: [String] = []
+    for index in 0..<xpc_array_get_count(value) {
+        guard let pointer = xpc_array_get_string(value, index) else { return nil }
+        strings.append(String(cString: pointer))
+    }
+    return strings
+}
+
+private func xpcData(_ message: xpc_object_t, key: String) -> Data? {
+    var length = 0
+    guard let bytes = xpc_dictionary_get_data(message, key, &length),
+          length <= blessedScriptMaximumBytes
+    else { return nil }
+    return Data(bytes: bytes, count: length)
+}
+
+
+private func supportsVarlockProtocol(_ version: UInt64) -> Bool {
+    version == varlockProtocolVersion
+}
+
+private func matchingDirectAccessLauncher(
+    request: ApprovalRequest,
+    configuredGate: SecretGate?,
+    trustedAVGateClient: Bool,
+    launchers: [LauncherIdentity],
+    rules: [DirectAccessRule]
+) -> LauncherIdentity? {
+    guard request.op == "inject", configuredGate == nil, trustedAVGateClient else { return nil }
+    return launchers.first {
+        directAccessAllows(
+            secretNames: request.keys,
+            launcherRequirement: $0.designatedRequirement,
+            runtimeProtection: $0.runtimeProtection,
+            rules: rules
+        )
+    }
+}
+
+private func retainedProvenanceWouldAuthorize(
+    request: ApprovalRequest,
+    configuredGate: SecretGate?,
+    classification: SecretGateRequestClassification?,
+    launcher: LauncherIdentity,
+    directAccessRules: [DirectAccessRule],
+    trustedAVGateClient: Bool
+) -> Bool {
+    if let configuredGate, let classification {
+        guard let policy = resolveSecretGatePolicy(
+            gate: configuredGate,
+            launchers: [launcher]
+        ) else { return false }
+        return secretGateProtectionAllows(
+            policy.protection,
+            classification: classification
+        )
+    }
+    return matchingDirectAccessLauncher(
+        request: request,
+        configuredGate: nil,
+        trustedAVGateClient: trustedAVGateClient,
+        launchers: [launcher],
+        rules: directAccessRules
+    ) != nil
+}
+
+private func retainedProcessApprovalExplanation(
+    match: RetainedProcessProvenanceMatch,
+    gateName: String
+) -> String {
+    let name = URL(fileURLWithPath: match.processPath).lastPathComponent
+    let process = name.isEmpty ? "detached" : name
+    let launcher = shortAppName(match.launcher.identifier)
+    return "Automic Vault previously verified this running \(process) process under \(launcher), but that parent chain is no longer available. Keep Launcher Access for Detached Processes is off; enabling it would have automically authorized this request under the current \(gateName) policy."
+}
+
+private func isAllowedCaller(path: String, signing: SigningInfo) -> Bool {
+    if isTrustedMenuHelperCaller(path: path, signing: signing) {
+        return true
+    }
+    if isTrustedAvCaller(path: path, signing: signing) {
+        return true
+    }
+    if isTrustedWranglerCaller(path: path, signing: signing) {
+        return true
+    }
+    if isTrustedGhCaller(path: path, signing: signing) {
+        return true
+    }
+    if isTrustedStripeCaller(path: path, signing: signing) {
+        return true
+    }
+    if isTrustedBrewStubCaller(path: path, signing: signing) {
+        return true
+    }
+    if isTrustedVarlockPluginHelperCaller(path: path, signing: signing) {
+        return true
+    }
+    let name = URL(fileURLWithPath: path).lastPathComponent
+    return (name == "supabase" || name == "supabase-go")
+        && (signing.identifier == "supabase"
+            || signing.identifier == "supabase-go"
+            || signing.identifier == "com.supabase.cli")
+}
+
+private func isTrustedMenuHelperCaller(path: String, signing: SigningInfo) -> Bool {
+    URL(fileURLWithPath: path).lastPathComponent == "AutomicVaultMenubar"
+        && signing.identifier == "com.automicvault"
+}
+
+private func isTrustedAvCaller(path: String, signing: SigningInfo) -> Bool {
+    URL(fileURLWithPath: path).lastPathComponent == "av"
+        && signing.identifier == "com.automicvault.av"
+}
+
+private func isTrustedWranglerCaller(path: String, signing: SigningInfo) -> Bool {
+    path == "/opt/av/wrangler/Wrangler.app/Contents/MacOS/wrangler"
+        && signing.identifier == "com.automicvault.wrangler"
+        && signing.teamIdentifier == "ZU76A67LGU"
+}
+
+private func isTrustedGhCaller(path: String, signing: SigningInfo) -> Bool {
+    URL(fileURLWithPath: path).lastPathComponent == "gh"
+        && (signing.identifier == "gh" || signing.identifier == "com.github.cli")
+}
+
+private func isTrustedStripeCaller(path: String, signing: SigningInfo) -> Bool {
+    URL(fileURLWithPath: path).lastPathComponent == "stripe"
+        && signing.identifier == "stripe"
+}
+
+private func isTrustedBrewStubCaller(path: String, signing: SigningInfo) -> Bool {
+    let name = URL(fileURLWithPath: path).lastPathComponent
+    return (name == "brew" || name == "av-brew-stub")
+        && signing.identifier == "com.automicvault.av-brew-stub"
+}
+
+private func isTrustedVarlockPluginHelperCaller(path: String, signing: SigningInfo) -> Bool {
+    URL(fileURLWithPath: path).lastPathComponent == "AutomicVaultVarlockPlugin"
+        && signing.identifier == "com.automicvault.varlock-plugin-helper"
+}
+
+private struct ResolvedSecretGatePolicy {
+    let protection: SecretGateProtection
+    let configuredProtection: SecretGateProtection
+    let source: String
+    let launcher: LauncherIdentity?
+    let runtimeProtectionFailure: LauncherRuntimeProtection?
+    var overriddenLaunchers: [LauncherIdentity] = []
+}
+
+private func matchingSecretGate(
+    request: ApprovalRequest,
+    signing: SigningInfo,
+    descriptors: [SecretGateDescriptor],
+    service: String = secretGatePoliciesKeychainService
+) -> SecretGate? {
+    loadSecretGates(descriptors: request.sshPeer.map { sshAgentGateDescriptors(descriptors, configuration: $0.configuration) } ?? descriptors, service: service).first {
+        secretGateMatches($0, request: request, signing: signing)
+    }
+}
+
+private func matchingSecretGateDefinition(
+    request: ApprovalRequest,
+    signing: SigningInfo,
+    descriptors: [SecretGateDescriptor]
+) -> SecretGate? {
+    (request.sshPeer.map { sshAgentGateDescriptors(descriptors, configuration: $0.configuration) } ?? descriptors).lazy.map {
+        SecretGate(
+            id: $0.id,
+            keyPatterns: $0.keyPatterns,
+            routes: $0.routes,
+            defaultProtection: .noAccess,
+            appPolicies: []
+        )
+    }.first {
+        secretGateMatches($0, request: request, signing: signing)
+    }
+}
+
+private func secretGateMatches(
+    _ gate: SecretGate,
+    request: ApprovalRequest,
+    signing: SigningInfo
+) -> Bool {
+    guard request.op != "inject-fd" else { return false }
+    return gate.routes.contains { route in
+        route.operation == request.op
+            && route.callerIdentifiers.contains(signing.identifier)
+            && (normalizedExecutablePath(route.targetPath) == normalizedExecutablePath(request.target)
+                || (gate.id == "gh" && request.target == gitTransportGH && request.credentialParent?.gitContext != nil))
+            && route.scriptPath.map { standardizedPath($0, cwd: request.cwd) }
+                == resolvedShebangScriptPath(request)
+            && routeKeysMatch(route.keyPatterns, request.keys)
+            && route.replaceExistingEnv == request.replaceExistingEnv
+            && route.allowMissingKeys == request.allowMissingKeys
+    }
+}
+
+private func routeKeysMatch(_ patterns: [String], _ keys: [String]) -> Bool {
+    if patterns.isEmpty { return keys.isEmpty }
+    guard !keys.isEmpty else { return false }
+    if patterns.allSatisfy({ !$0.hasSuffix("*") }) {
+        return patterns.sorted() == keys.sorted()
+    }
+    return keys.allSatisfy { key in
+        patterns.contains { pattern in
+            pattern.hasSuffix("*")
+                ? key.hasPrefix(String(pattern.dropLast()))
+                : key == pattern
+        }
+    }
+}
+
+// An override needs actual original-parent execution links, not ordering in the
+// candidate list (which may contain helper aliases and retained provenance).
+private func verifiedLauncherOverrideAncestry(_ ancestor: LauncherIdentity, _ descendant: LauncherIdentity) -> Bool {
+    verifiedLauncherOverrideAncestry(ancestor, descendant, processIdentity: { pid in
+        var identity = AVProcessIdentity()
+        return av_process_identity(pid, &identity) ? identity : nil
+    }, validatesLauncher: { launcher in
+        guard let signing = liveSigningInfo(pid: launcher.pid) else { return false }
+        return launcherIdentities(pid: launcher.pid, path: launcher.path, signing: signing).contains {
+            $0.designatedRequirement == launcher.designatedRequirement
+                && $0.runtimeProtection == launcher.runtimeProtection
+                && $0.verifiedHelper == launcher.verifiedHelper
+        }
+    }, originalParent: { child in
+        var parent = AVProcessIdentity()
+        return verifiedOriginalLauncherParent(child, parent: &parent) ? parent : nil
+    })
+}
+
+private func verifiedLauncherOverrideAncestry(
+    _ ancestor: LauncherIdentity,
+    _ descendant: LauncherIdentity,
+    processIdentity: (pid_t) -> AVProcessIdentity?,
+    validatesLauncher: (LauncherIdentity) -> Bool,
+    originalParent: (AVProcessIdentity) -> AVProcessIdentity?
+) -> Bool {
+    guard ancestor.pid != descendant.pid else { return false }
+    var validated: [AVProcessIdentity] = []
+    for launcher in [ancestor, descendant] {
+        guard let before = processIdentity(launcher.pid),
+              validatesLauncher(launcher),
+              let after = processIdentity(launcher.pid), sameProcessIdentity(before, after),
+              launcher.verifiedHelper == nil || before.pidversion > 0
+        else { return false }
+        validated.append(before)
+    }
+    // Keep the validated execution through the ancestry walk and final authority check.
+    var child = validated[1]
+    for _ in 0..<32 {
+        guard let parent = originalParent(child) else { return false }
+        if parent.pid == ancestor.pid {
+            return sameProcessIdentity(validated[0], parent) && validated.allSatisfy { expected in
+                guard let current = processIdentity(expected.pid) else { return false }
+                return sameProcessIdentity(expected, current)
+            }
+        }
+        child = parent
+    }
+    return false
+}
+
+private func resolveSecretGatePolicy(
+    gate: SecretGate,
+    launchers: [LauncherIdentity],
+    verifiesOverride: (LauncherIdentity, LauncherIdentity) -> Bool = verifiedLauncherOverrideAncestry
+) -> ResolvedSecretGatePolicy? {
+    var matches: [(launcher: LauncherIdentity, policy: SecretGatePolicy)] = []
+    var seenPIDs = Set<pid_t>()
+    for launcher in launchers {
+        if let policy = gate.appPolicies.first(where: {
+            $0.requirement == launcher.designatedRequirement && !$0.usesGateDefault
+        }), seenPIDs.insert(launcher.pid).inserted {
+            // Preserve existing helper-alias precedence within a single process.
+            matches.append((launcher, policy))
+        }
+    }
+    // SSH historically stops at the nearest eligible Launcher; collecting upper
+    // candidates for opt-in overrides must not introduce ordinary policy fallback.
+    let baselineIndex = gate.isSSHAgentGate
+        ? matches.firstIndex(where: { $0.launcher.pid == launchers.first?.pid })
+        : matches.indices.first
+    let baselineLauncher = baselineIndex.map { matches[$0].launcher } ?? launchers.first
+    var selectedIndex = baselineIndex
+    if let baselineLauncher {
+        for index in matches.indices where matches[index].policy.overridesDescendantRules
+            && matches[index].launcher.pid != baselineLauncher.pid {
+            // Losing evidence for a configured override must not expose a broader
+            // descendant rule. Human Approval is required instead of falling back.
+            guard verifiesOverride(matches[index].launcher, baselineLauncher) else { return nil }
+            selectedIndex = index
+        }
+    }
+    if let selected = selectedIndex {
+        let (launcher, policy) = matches[selected]
+        // Overriding Access Levels never waives a descendant rule's runtime requirement.
+        let runtimeMatches = selectedIndex == baselineIndex ? [matches[selected]] : Array(matches.prefix(selected + 1))
+        for match in runtimeMatches {
+            let acceptsClaudeCodeRuntime = match.launcher.verifiedHelper == claudeCodeVerifiedLauncherHelper
+                && match.policy.runtimeRequirement == .hardened
+                && match.launcher.runtimeProtection == .hardenedWithLibraryValidationDisabled
+            if !match.policy.runtimeRequirement.allows(match.launcher.runtimeProtection) && !acceptsClaudeCodeRuntime {
+                return ResolvedSecretGatePolicy(protection: .noAccess,
+                    configuredProtection: match.policy.protection, source: shortAppName(match.launcher.identifier),
+                    launcher: match.launcher, runtimeProtectionFailure: match.launcher.runtimeProtection)
+            }
+        }
+        return ResolvedSecretGatePolicy(
+            protection: policy.protection, configuredProtection: policy.protection,
+            source: shortAppName(launcher.identifier), launcher: launcher, runtimeProtectionFailure: nil,
+            overriddenLaunchers: selectedIndex == baselineIndex ? [] :
+                ([baselineLauncher].compactMap { $0 } + matches.prefix(selected).map(\.launcher))
+                    .reduce(into: [LauncherIdentity]()) { result, candidate in
+                        if !result.contains(where: { $0.pid == candidate.pid }) { result.append(candidate) }
+                    }
+        )
+    }
+    let defaultCandidates = gate.isSSHAgentGate
+        ? Array(launchers.prefix(while: { $0.pid == launchers.first?.pid })) : launchers
+    guard let defaultLauncher = defaultCandidates.first(where: { !$0.isStandalone })
+        ?? defaultCandidates.first(where: { $0.runtimeProtection.allowsSecretGateAccess })
+        ?? defaultCandidates.first
+    else { return nil }
+    let runtimeProtectionFailure = !defaultLauncher.runtimeProtection.allowsSecretGateAccess
+        ? defaultLauncher.runtimeProtection
+        : nil
+    return ResolvedSecretGatePolicy(
+        protection: runtimeProtectionFailure == nil ? gate.defaultProtection : .noAccess,
+        configuredProtection: gate.defaultProtection,
+        source: gate.defaultPolicyLabel,
+        launcher: defaultLauncher,
+        runtimeProtectionFailure: runtimeProtectionFailure
+    )
+}
+
+private func descendantOverrideWarning(
+    policy: ResolvedSecretGatePolicy, gate: SecretGate, classification: SecretGateRequestClassification
+) -> String? {
+    guard policy.protection.allows(classification) else { return nil }
+    let restricted = policy.overriddenLaunchers.filter { launcher in
+        gate.appPolicies.contains {
+            $0.requirement == launcher.designatedRequirement && !$0.usesGateDefault
+                && !$0.protection.allows(classification)
+        }
+    }
+    guard !restricted.isEmpty else { return nil }
+    let names = restricted.map { shortAppName($0.identifier) }.joined(separator: ", ")
+    return "Descendant rule override: \(names) would require Approval for this operation."
+}
+
+private func launcherRuntimeProtectionApprovalExplanation(
+    policy: ResolvedSecretGatePolicy,
+    classification: SecretGateRequestClassification
+) -> String? {
+    guard let launcher = policy.launcher,
+          let failure = policy.runtimeProtectionFailure,
+          secretGateProtectionAllows(
+              policy.configuredProtection,
+              classification: classification
+          )
+    else { return nil }
+
+    let name = shortAppName(launcher.identifier)
+    switch failure {
+    case .hardened:
+        return nil
+    case .hardenedWithLibraryValidationDisabled:
+        return "\(name) disables library validation, so third-party code can run inside the Launcher. Automic Vault cannot apply the Authorization Gate’s configured Access Level because this rule requires a stricter runtime posture. Approval is required."
+    case .hardenedRuntimeMissing:
+        return "\(name) does not enable Hardened Runtime, so Automic Vault cannot apply the Authorization Gate’s configured Access Level. Approval is required."
+    case .unsafeEntitlements(let entitlements):
+        return "\(name) weakens Hardened Runtime with these entitlements: \(entitlements.joined(separator: ", ")). Automic Vault cannot apply the Authorization Gate’s configured Access Level, so approval is required."
+    }
+}
+
+private func secretGateProtectionAllows(
+    _ protection: SecretGateProtection,
+    classification: SecretGateRequestClassification
+) -> Bool {
+    protection.allows(classification)
+}
+
+private func classifySecretGateRequest(
+    gateID: String,
+    request: ApprovalRequest
+) -> SecretGateRequestClassification {
+    if isSSHAgentGateID(gateID) { return .mutating }
+    switch gateID {
+    case "ssh-agent":
+        return .mutating
+    case "gpg-signing":
+        return .localWrite
+    case "wrangler":
+        return .unknown
+    case "gh":
+        return request.credentialParent?.gitContext?.registration.operation.classification ?? ghRequestClassification(request.args)
+    case "docker":
+        return dockerRequestClassification(request.args)
+    case "podman":
+        return .secretDump
+    case "goat":
+        return goatRequestClassification(request.args)
+    case "ordercli":
+        return ordercliRequestClassification(request.args)
+    case "openhue-cli":
+        return openhueRequestClassification(request.args)
+    case "plumber":
+        return plumberRequestClassification(request.args)
+    case "uaa-cli":
+        return uaaRequestClassification(request.args)
+    case "railway":
+        return railwayRequestClassification(request.args)
+    case "oxide-cli":
+        return oxideRequestClassification(request.args)
+    case "fastly-cli":
+        return fastlyRequestClassification(request.args)
+    case "sqlcmd":
+        return sqlcmdRequestClassification(request.args)
+    case "terraform", "opentofu":
+        return terraformRequestClassification(request.args)
+    case "aliyun-cli":
+        return aliyunRequestClassification(request.args)
+    case "wakatime-cli":
+        return wakatimeRequestClassification(request.args)
+    case "rclone":
+        return .unknown
+    case "kubectl":
+        return .unknown
+    case "uv":
+        return uvRequestClassification(request.args)
+    case "aws":
+        if awsRequestMayUseLongLivedCredentials(request) { return .secretDump }
+        return awsRequestIsReadOnly(awsCommandWords(request)) ? .readOnly : .mutating
+    case "brew":
+        return brewRequestClassification(request.args)
+    default:
+        return genericSecretGateRequestClassification(
+            gateID: gateID,
+            arguments: secretGateCommandWords(request)
+        )
+    }
+}
+
+private func wakatimeRequestClassification(_ args: [String]) -> SecretGateRequestClassification {
+    let words = args.map { $0.lowercased() }
+    if words.contains(where: {
+        $0 == "--entity" || $0.hasPrefix("--entity=") || $0 == "--extra-heartbeats"
+            || $0 == "--sync-offline-activity" || $0.hasPrefix("--sync-offline-activity=")
+            || $0 == "--sync-ai-activity" || $0 == "--sync-ai-heartbeats"
+    }) {
+        return .mutating
+    }
+    if words.contains(where: {
+        $0 == "--today" || $0 == "--file-experts" || $0 == "--today-goal"
+            || $0.hasPrefix("--today-goal=")
+    }) {
+        return .readOnly
+    }
+    return .unknown
+}
+
+private func goatRequestClassification(_ args: [String]) -> SecretGateRequestClassification {
+    let words = args.map { $0.lowercased() }
+    guard let command = words.first else { return .unknown }
+    if ["--version", "-v", "help"].contains(command) { return .readOnly }
+    if command == "account" {
+        guard let action = words.dropFirst().first else { return .unknown }
+        if ["check-auth", "missing-blobs", "status"].contains(action) { return .readOnly }
+        return ["login", "logout", "activate", "deactivate", "update-handle", "create"]
+            .contains(action) ? .mutating : .unknown
+    }
+    if command == "record" {
+        guard let action = words.dropFirst().first else { return .unknown }
+        if ["get", "list"].contains(action) { return .readOnly }
+        return ["create", "delete", "update"].contains(action) ? .mutating : .unknown
+    }
+    if ["resolve", "firehose"].contains(command) { return .readOnly }
+    return .unknown
+}
+
+private func railwayRequestClassification(_ args: [String]) -> SecretGateRequestClassification {
+    let words = args.map { $0.lowercased() }
+    guard let command = words.first else { return .unknown }
+    if ["--version", "-v", "version", "help", "completion", "docs", "list", "status", "whoami",
+        "logs", "metrics", "usage", "open"].contains(command)
+    {
+        return .readOnly
+    }
+    if ["run", "local", "shell"].contains(command) { return .secretDump }
+    if ["variable", "variables", "vars", "var"].contains(command) {
+        guard let action = words.dropFirst().first else { return .secretDump }
+        if ["list", "ls"].contains(action) { return .secretDump }
+        return ["set", "delete", "rm", "remove"].contains(action) ? .mutating : .unknown
+    }
+    if ["up", "down", "deploy", "redeploy", "restart", "delete", "init", "link", "unlink",
+        "login", "logout", "environment", "service", "variable", "domain", "volume", "tcp-proxy",
+        "private-network", "outbound-network", "scale", "ssh", "connect"].contains(command)
+    {
+        return .mutating
+    }
+    return .unknown
+}
+
+private func ordercliRequestClassification(_ args: [String]) -> SecretGateRequestClassification {
+    let words = args.map { $0.lowercased() }
+    guard let provider = words.first else { return .unknown }
+    if ["help", "completion", "--help", "-h", "--version", "-v", "version"].contains(provider) {
+        return .readOnly
+    }
+    guard ["foodora", "deliveroo"].contains(provider), let command = words.dropFirst().first
+    else { return .unknown }
+    if ["history", "orders", "order", "countries"].contains(command) { return .readOnly }
+    if command == "config" {
+        guard let action = words.dropFirst(2).first else { return .unknown }
+        if action == "show" { return .readOnly }
+        return action == "set" ? .localWrite : .unknown
+    }
+    if provider == "foodora",
+       ["login", "logout", "session", "cookies", "reorder"].contains(command)
+    {
+        return .mutating
+    }
+    return .unknown
+}
+
+private func openhueRequestClassification(_ args: [String]) -> SecretGateRequestClassification {
+    let words = args.map { $0.lowercased() }
+    guard let command = words.first else { return .unknown }
+    if ["--version", "--help", "-h", "version", "help", "completion", "discover", "get"].contains(command) {
+        return .readOnly
+    }
+    if command == "config" { return .localWrite }
+    if ["setup", "set", "mcp"].contains(command) { return .mutating }
+    return .unknown
+}
+
+private func plumberRequestClassification(_ args: [String]) -> SecretGateRequestClassification {
+    let words = args.map { $0.lowercased() }
+    guard let command = words.first else { return .unknown }
+    if ["--version", "help", "--help", "-h"].contains(command) { return .readOnly }
+    if ["read", "write", "relay", "tunnel", "server", "manage"].contains(command) {
+        return .mutating
+    }
+    return .unknown
+}
+
+private func uaaRequestClassification(_ args: [String]) -> SecretGateRequestClassification {
+    let words = args.map { $0.lowercased() }
+    guard let command = words.first(where: { $0 != "--verbose" && $0 != "-v" }) else {
+        return .unknown
+    }
+    if ["--version", "version", "help", "targets", "contexts", "info", "get-token-key",
+        "get-token-keys", "get-client", "get-user", "get-group", "list-clients", "list-users",
+        "list-groups", "list-group-mappings", "userinfo"].contains(command)
+    {
+        return .readOnly
+    }
+    if ["context", "decode-token"].contains(command) { return .secretDump }
+    if ["target", "use-context", "use-target"].contains(command) { return .localWrite }
+    if command == "curl" { return .unknown }
+    if command.contains("token")
+        || ["create", "update", "delete", "add", "remove", "map", "unmap", "activate",
+            "deactivate", "unlock", "change", "set"].contains(where: { command.hasPrefix($0) })
+    {
+        return .mutating
+    }
+    return .unknown
+}
+
+private func oxideRequestClassification(_ args: [String]) -> SecretGateRequestClassification {
+    var commandIndex = 0
+    while commandIndex < args.count {
+        let argument = args[commandIndex].lowercased()
+        if argument.hasPrefix("--profile=") || argument.hasPrefix("--host=") {
+            commandIndex += 1
+        } else if argument == "--profile" || argument == "--host" {
+            guard commandIndex + 1 < args.count else { return .unknown }
+            commandIndex += 2
+        } else {
+            break
+        }
+    }
+    let words = args.dropFirst(commandIndex).map { $0.lowercased() }
+    guard let command = words.first else { return .unknown }
+    if ["--version", "-v", "version", "help"].contains(command) { return .readOnly }
+    if command == "auth" {
+        switch words.dropFirst().first {
+        case "status", "help": return .readOnly
+        case "login", "logout": return .mutating
+        default: return .unknown
+        }
+    }
+    let topLevelCommands = [
+        "alert", "api", "audit-log", "auth-settings", "bundle", "certificate", "completion",
+        "current-user", "der", "disk", "docs", "experimental", "external-subnet", "floating-ip",
+        "group", "image", "instance", "internet-gateway", "ip-pool", "pem", "ping", "policy",
+        "project", "scim", "silo", "snapshot", "subnet-pool", "system", "user", "utilization",
+        "vpc",
+    ]
+    guard topLevelCommands.contains(command) else { return .unknown }
+    guard let action = words.dropFirst().first else { return .unknown }
+    if ["list", "view", "get"].contains(action) { return .readOnly }
+    if ["create", "delete", "edit", "update", "start", "stop", "reboot"].contains(action) {
+        return .mutating
+    }
+    return .unknown
+}
+
+private func fastlyRequestClassification(_ args: [String]) -> SecretGateRequestClassification {
+    let words = args.map { $0.lowercased() }
+    guard let authIndex = words.firstIndex(of: "auth"), authIndex + 1 < words.count else {
+        return .unknown
+    }
+    let action = words[authIndex + 1]
+    if action == "token" || (action == "show" && words.contains("--reveal")) {
+        return .secretDump
+    }
+    return .unknown
+}
+
+private func sqlcmdRequestClassification(_ args: [String]) -> SecretGateRequestClassification {
+    let words = args.map { $0.lowercased() }
+    guard words.count >= 2, words[0] == "config" else { return .unknown }
+    let action = words[1]
+    if action == "connection-strings" || action == "cs" {
+        return .secretDump
+    }
+    if (action == "view" || action == "show") && words.dropFirst(2).contains("--raw") {
+        return .secretDump
+    }
+    return .unknown
+}
+
+private func terraformRequestClassification(_ args: [String]) -> SecretGateRequestClassification {
+    if args == ["-version"] || args == ["--version"] { return .readOnly }
+    let words = args.drop(while: {
+        $0 == "-no-color" || $0 == "-help" || $0.hasPrefix("-chdir=")
+    }).map { $0.lowercased() }
+    guard let command = words.first else { return .unknown }
+    switch command {
+    case "version", "help", "validate", "show", "output", "graph":
+        return .readOnly
+    case "fmt":
+        return words.contains("-check") ? .readOnly : .localWrite
+    case "providers":
+        guard let subcommand = words.dropFirst().first else { return .readOnly }
+        return subcommand == "schema" ? .readOnly : .localWrite
+    case "init", "plan", "console", "get":
+        return .localWrite
+    case "apply", "destroy", "import", "refresh", "force-unlock", "login", "logout":
+        return .mutating
+    case "state":
+        guard let subcommand = words.dropFirst().first else { return .unknown }
+        return ["list", "show", "pull"].contains(subcommand) ? .readOnly : .mutating
+    case "workspace":
+        guard let subcommand = words.dropFirst().first else { return .unknown }
+        return subcommand == "list" || subcommand == "show" ? .readOnly : .mutating
+    default:
+        return .unknown
+    }
+}
+
+private func aliyunRequestClassification(_ args: [String]) -> SecretGateRequestClassification {
+    let words = args.map { $0.lowercased() }
+    if words == ["--version"] || words == ["version"] || words == ["help"] {
+        return .readOnly
+    }
+    if words.starts(with: ["sts", "getcalleridentity"]) {
+        return .readOnly
+    }
+    return .unknown
+}
+
+private func dockerRequestClassification(_ args: [String]) -> SecretGateRequestClassification {
+    let words = dockerCommandWords(args).map { $0.lowercased() }
+    guard let command = words.first else { return .unknown }
+    if words.contains("--push") { return .mutating }
+    switch command {
+    case "search": return .readOnly
+    case "manifest" where words.dropFirst().first == "inspect": return .readOnly
+    case "pull", "run", "create", "build": return .localWrite
+    case "image" where words.dropFirst().first == "pull": return .localWrite
+    case "push": return .mutating
+    case "image" where words.dropFirst().first == "push": return .mutating
+    case "buildx":
+        guard words.count >= 2 else { return .unknown }
+        if words[1] == "imagetools", words.dropFirst(2).first == "inspect" { return .readOnly }
+        return words[1] == "build" ? .localWrite : .unknown
+    case "compose":
+        guard words.count >= 2 else { return .unknown }
+        if words[1] == "push" { return .mutating }
+        return ["build", "create", "pull", "run", "up"].contains(words[1]) ? .localWrite : .unknown
+    default: return .unknown
+    }
+}
+
+private func dockerCommandWords(_ args: [String]) -> [String] {
+    let optionsWithValue = Set(["--config", "-c", "--context", "-H", "--host", "-l", "--log-level"])
+    let flags = Set(["--debug", "-D", "--tls", "--tlsverify"])
+    var index = 0
+    while index < args.count {
+        let argument = args[index]
+        if argument == "--" { return [] }
+        if optionsWithValue.contains(argument) {
+            guard index + 1 < args.count else { return [] }
+            index += 2
+            continue
+        }
+        if optionsWithValue.contains(where: { argument.hasPrefix("\($0)=") }) || flags.contains(argument) {
+            index += 1
+            continue
+        }
+        if argument.hasPrefix("-") { return [] }
+        return Array(args[index...])
+    }
+    return []
+}
+
+private func secretGateCommandWords(_ request: ApprovalRequest) -> [String] {
+    guard let scriptPath = resolvedShebangScriptPath(request) else { return request.args }
+    guard let scriptIndex = request.args.firstIndex(where: {
+        standardizedPath($0, cwd: request.cwd) == scriptPath
+    }) else { return [] }
+    return Array(request.args.dropFirst(scriptIndex + 1))
+}
+
+private func awsRequestMayUseLongLivedCredentials(_ request: ApprovalRequest) -> Bool {
+    let words = awsCommandWords(awsCommandWords(request)).map { $0.lowercased() }
+    guard words.count >= 2, words[1] != "help" else { return false }
+    if words[0] == "iam" { return true }
+    return words[0] == "sts"
+        && words[1] != "assume-role"
+        && words[1] != "get-caller-identity"
+}
+
+private func approvalRequestWithCredentialContext(_ request: ApprovalRequest) -> ApprovalRequest {
+    let title: String
+    let detail: String
+    if request.credentialParent?.gitContext != nil { return request }
+    let ghClassification = request.tool == "gh" ? ghRequestClassification(request.args) : nil
+    if ghClassification == .secretDump {
+        title = "Disclose GitHub token?"
+        detail = "This Secret Disclosure can return the raw GitHub token to standard output or another general-purpose destination. Write Access does not authorize it."
+    } else if ghClassification == .unknown {
+        title = "Allow unclassified GitHub credential use?"
+        detail = "Automic Vault cannot determine this command’s effects from its arguments. A gh alias can expand to a command that prints the raw GitHub token. Approval permits this possible Secret Disclosure."
+    } else if awsRequestMayUseLongLivedCredentials(request) {
+        title = "Use long-lived AWS credentials?"
+        detail = "AWS does not allow non-MFA GetSessionToken credentials to call this operation. Unless the selected profile uses MFA or assumes a role, Automic Vault will provide your original AWS access keys directly to AWS CLI; they retain every IAM permission assigned to those keys."
+    } else {
+        return request
+    }
+    return ApprovalRequest(
+        op: request.op,
+        keys: request.keys,
+        target: request.target,
+        args: request.args,
+        cwd: request.cwd,
+        replaceExistingEnv: request.replaceExistingEnv,
+        allowMissingKeys: request.allowMissingKeys,
+        envConflicts: request.envConflicts,
+        shebangScript: request.shebangScript,
+        scriptData: request.scriptData,
+        snapshotIncompatibleInterpreter: request.snapshotIncompatibleInterpreter,
+        tool: request.tool,
+        title: title,
+        detail: detail,
+        selectedSecretValues: request.selectedSecretValues
+    )
+}
+
+private func brewRequestClassification(_ args: [String]) -> SecretGateRequestClassification {
+    if brewRequestIsReadOnly(args) { return .readOnly }
+    if let command = args.first?.lowercased(), ["update", "up"].contains(command) { return .update }
+    return .mutating
+}
+
+private func brewRequestIsReadOnly(_ args: [String]) -> Bool {
+    guard let command = args.first?.lowercased() else { return true }
+    if brewReadOnlyQueryOptions.contains(command) { return true }
+    if command.hasPrefix("-") { return false }
+    if command == "services" {
+        guard args.count >= 2 else { return false }
+        return ["list", "info"].contains(args[1].lowercased())
+    }
+    if command == "bundle" {
+        guard args.count >= 2 else { return false }
+        return ["check", "env", "list"].contains(args[1].lowercased())
+    }
+    return brewReadOnlyCommands.contains(command)
+}
+
+private let brewReadOnlyQueryOptions = Set([
+    "--cache", "--caskroom", "--cellar", "--env", "--prefix", "--repository", "--taps",
+    "--version", "-v"
+])
+
+private let brewReadOnlyCommands = Set([
+    "casks", "cat", "command", "commands", "config", "deps", "desc", "doctor", "formula",
+    "formulae", "help", "info", "leaves", "linkage", "list", "livecheck", "log", "ls",
+    "missing", "options", "outdated", "readall", "search", "shellenv", "source", "tab",
+    "tap-info", "unbottled", "uses", "vulns", "which-formula"
+])
+
+private func ghRequestIsSecretDump(_ args: [String]) -> Bool {
+    let words = ghCommandWords(args)
+    guard words.count >= 2, words[0] == "auth" else { return false }
+    return words[1] == "token"
+        // Only get currently reads a token. Treat any credential request through
+        // this helper as disclosure, including future protocol operations.
+        || words[1] == "git-credential"
+        || (words[1] == "status" && words.dropFirst(2).contains {
+            $0 == "--show-token" || $0.hasPrefix("--show-token=")
+        })
+}
+
+private func awsRequestIsReadOnly(_ args: [String]) -> Bool {
+    if args == ["--version"] { return true }
+    let words = awsCommandWords(args).map { $0.lowercased() }
+    guard let service = words.first else { return false }
+    if service == "help" { return true }
+    guard words.count >= 2 else { return false }
+    let operation = words[1]
+    if operation == "help" { return true }
+    return awsCommandIsReadOnly(service: service, operation: operation)
+}
+
+private func awsCommandWords(_ request: ApprovalRequest) -> [String] {
+    if request.tool == "aws" { return request.args }
+    guard let scriptPath = resolvedShebangScriptPath(request),
+          let scriptIndex = request.args.firstIndex(where: {
+              standardizedPath($0, cwd: request.cwd) == scriptPath
+          })
+    else {
+        return []
+    }
+    return Array(request.args.dropFirst(scriptIndex + 1))
+}
+
+private func awsCommandWords(_ args: [String]) -> [String] {
+    var index = 0
+    while index < args.count {
+        let arg = args[index]
+        if arg == "--" {
+            return []
+        }
+        if awsGlobalOptionsWithValue.contains(arg) {
+            index += 2
+            continue
+        }
+        if awsGlobalOptionsWithValue.contains(where: { arg.hasPrefix("\($0)=") }) || awsGlobalFlags.contains(arg) {
+            index += 1
+            continue
+        }
+        if arg.hasPrefix("-") {
+            return []
+        }
+        return Array(args[index...])
+    }
+    return []
+}
+
+private let awsGlobalOptionsWithValue = Set([
+    "--ca-bundle",
+    "--cli-binary-format",
+    "--cli-input-json",
+    "--cli-input-yaml",
+    "--color",
+    "--endpoint-url",
+    "--max-items",
+    "--output",
+    "--page-size",
+    "--profile",
+    "--query",
+    "--region",
+    "--starting-token"
+])
+
+private let awsGlobalFlags = Set([
+    "--debug",
+    "--no-cli-auto-prompt",
+    "--no-cli-pager",
+    "--no-paginate",
+    "--no-sign-request",
+    "--no-verify-ssl",
+    "--only-show-errors",
+    "--version"
+])
+
+private func standardizedPath(_ path: String, cwd: String) -> String {
+    let url = path.hasPrefix("/")
+        ? URL(fileURLWithPath: path)
+        : URL(fileURLWithPath: cwd).appendingPathComponent(path)
+    return url.standardizedFileURL.path
+}
+
+private func ghRequestIsReadOnly(_ args: [String]) -> Bool {
+    let words = ghCommandWords(args)
+    guard let firstWord = words.first else { return false }
+    let command = ghCanonicalCommand(firstWord)
+    if words.contains("--show-token") { return false }
+    if command == "api" {
+        return ghApiRequestClassification(Array(words.dropFirst())) == .readOnly
+    }
+    if ["alias", "extension", "config", "skill"].contains(command) { return false }
+    if ["status", "browse"].contains(command) { return true }
+    guard words.count >= 2 else { return false }
+    let subcommand = words[1]
+    switch command {
+    case "search":
+        return ["code", "commits", "issues", "prs", "repos"].contains(subcommand)
+    case "auth":
+        return subcommand == "status"
+    case "repo":
+        return subcommand == "view" || ghSubcommandIsList(subcommand)
+    case "issue":
+        return ["view", "status"].contains(subcommand) || ghSubcommandIsList(subcommand)
+    case "pr":
+        return ["view", "status", "checks", "diff"].contains(subcommand) || ghSubcommandIsList(subcommand)
+    case "run":
+        return subcommand == "view" || ghSubcommandIsList(subcommand)
+    case "workflow":
+        return subcommand == "view" || ghSubcommandIsList(subcommand)
+    case "release":
+        return subcommand == "view" || ghSubcommandIsList(subcommand)
+    case "gist":
+        return subcommand == "view" || ghSubcommandIsList(subcommand)
+    case "cache", "secret", "variable", "ruleset", "org", "label", "gpg-key", "ssh-key":
+        return ghSubcommandIsList(subcommand) || (command == "ruleset" && subcommand == "view")
+    case "attestation":
+        return ["verify", "trusted-root"].contains(subcommand)
+    case "agent-task":
+        return ["view", "list"].contains(subcommand)
+    default:
+        return false
+    }
+}
+
+private func ghRequestClassification(_ args: [String]) -> SecretGateRequestClassification {
+    if ghRequestIsSecretDump(args) { return .secretDump }
+    if ghRequestIsReadOnly(args) { return .readOnly }
+    if ghRequestIsLocalWrite(args) { return .localWrite }
+    let words = ghCommandWords(args)
+    guard let command = words.first.map(ghCanonicalCommand) else { return .unknown }
+    if command == "api" { return .mutating }
+    guard words.count >= 2,
+          ghWriteCommands[command]?.contains(words[1]) == true
+    else { return .unknown }
+    return .mutating
+}
+
+// Reviewed against automic-vault/gh-cli f192b2530444b0ddec92f4063ac4315d13d2b354.
+// Only builtin runnable commands belong here: gh expands user aliases in-process
+// while its keyring bridge still submits the original argv. Unknown commands
+// and parsing failures must never inherit Write Access (or Full Access).
+private let ghWriteCommands: [String: Set<String>] = [
+    "auth": ["login", "logout", "refresh", "setup-git", "switch"],
+    "repo": ["archive", "create", "new", "delete", "edit", "fork", "rename", "set-default", "sync", "unarchive"],
+    "issue": ["close", "comment", "create", "new", "delete", "develop", "edit", "lock", "pin", "reopen", "transfer", "unlock", "unpin"],
+    "pr": ["close", "comment", "create", "new", "edit", "lock", "merge", "ready", "reopen", "revert", "review", "unlock", "update-branch"],
+    "run": ["cancel", "delete", "rerun", "watch"],
+    "workflow": ["disable", "enable", "run"],
+    "release": ["create", "new", "delete", "delete-asset", "edit", "upload", "verify", "verify-asset"],
+    "gist": ["create", "new", "delete", "edit", "rename"],
+    "cache": ["delete"],
+    "secret": ["delete", "remove", "set"],
+    "variable": ["delete", "remove", "get", "set"],
+    "label": ["clone", "create", "delete", "edit"],
+    "gpg-key": ["add", "delete"],
+    "ssh-key": ["add", "delete"],
+    "agent-task": ["create"],
+    "project": ["close", "copy", "create", "delete", "edit", "field-create", "field-delete", "field-list", "item-add", "item-archive", "item-create", "item-delete", "item-edit", "item-list", "link", "list", "ls", "mark-template", "unlink", "view"],
+    "codespace": ["code", "cp", "create", "delete", "edit", "jupyter", "list", "ls", "logs", "ports", "rebuild", "ssh", "stop", "view"],
+]
+
+private func ghRequestIsLocalWrite(_ args: [String]) -> Bool {
+    let words = ghCommandWords(args)
+    guard words.count >= 2 else { return false }
+    let command = ghCanonicalCommand(words[0])
+    let subcommand = words[1]
+    switch command {
+    case "repo":
+        return subcommand == "clone"
+    case "pr":
+        return ["checkout", "co"].contains(subcommand)
+    case "gist":
+        return subcommand == "clone"
+    case "run", "release", "attestation":
+        return subcommand == "download"
+    default:
+        return false
+    }
+}
+
+private func ghCanonicalCommand(_ command: String) -> String {
+    switch command {
+    case "cs":
+        return "codespace"
+    case "agent-tasks", "agent", "agents":
+        return "agent-task"
+    case "at":
+        return "attestation"
+    case "rs":
+        return "ruleset"
+    default:
+        return command
+    }
+}
+
+private func ghSubcommandIsList(_ subcommand: String) -> Bool {
+    subcommand == "list" || subcommand == "ls"
+}
+
+private enum GhApiRequestClassification {
+    case readOnly
+    case indirectGraphQLInput
+    case other
+}
+
+private func ghApiRequestClassification(_ args: [String]) -> GhApiRequestClassification {
+    var index = 0
+    var endpoints: [String] = []
+    var method: String?
+    var hasFields = false
+    var graphQLArguments = GhGraphQLArguments()
+    while index < args.count {
+        let arg = args[index]
+        switch arg {
+        case "--":
+            return .other
+        case "-X", "--method":
+            guard index + 1 < args.count else { return .other }
+            method = args[index + 1].uppercased()
+            index += 2
+        case "-f", "--raw-field", "-F", "--field":
+            guard index + 1 < args.count else { return .other }
+            hasFields = true
+            graphQLArguments.add(field: args[index + 1], readsFile: arg == "-F" || arg == "--field")
+            index += 2
+        case "--input":
+            return .other
+        case "-H", "--header", "-p", "--preview", "--cache", "-q", "--jq", "-t", "--template", "--hostname":
+            guard index + 1 < args.count else { return .other }
+            index += 2
+        case "-i", "--include", "--paginate", "--slurp", "--silent", "--verbose":
+            index += 1
+        default:
+            if let value = arg.value(afterOption: "--method=") {
+                method = value.uppercased()
+            } else if let field = arg.value(afterOption: "--field=") {
+                hasFields = true
+                graphQLArguments.add(field: field, readsFile: true)
+            } else if let field = arg.value(afterOption: "--raw-field=") {
+                hasFields = true
+                graphQLArguments.add(field: field, readsFile: false)
+            } else if arg.hasPrefix("--input=") {
+                return .other
+            } else if arg.hasPrefix("--header=")
+                || arg.hasPrefix("--preview=")
+                || arg.hasPrefix("--cache=")
+                || arg.hasPrefix("--jq=")
+                || arg.hasPrefix("--template=")
+                || arg.hasPrefix("--hostname=") {
+                // read-only option with inline value
+            } else if arg.hasPrefix("-X"), arg.count > 2 {
+                method = String(arg.dropFirst(2)).uppercased()
+            } else if arg.hasPrefix("-f"), arg.count > 2 {
+                hasFields = true
+                graphQLArguments.add(field: String(arg.dropFirst(2)), readsFile: false)
+            } else if arg.hasPrefix("-F"), arg.count > 2 {
+                hasFields = true
+                graphQLArguments.add(field: String(arg.dropFirst(2)), readsFile: true)
+            } else if arg.hasPrefix("-") {
+                return .other
+            } else {
+                endpoints.append(arg)
+            }
+            index += 1
+        }
+    }
+    guard endpoints.count == 1 else { return .other }
+    if endpoints[0] == "graphql" {
+        if graphQLArguments.usesIndirectFieldInput { return .indirectGraphQLInput }
+        return graphQLArguments.isReadOnly ? .readOnly : .other
+    }
+    return (method ?? (hasFields ? "POST" : "GET")) == "GET" ? .readOnly : .other
+}
+
+private func secretGateAutomaticApprovalExplanation(
+    gateID: String,
+    request: ApprovalRequest
+) -> String? {
+    guard gateID == "gh" else { return nil }
+    return ghGraphQLIndirectInputExplanation(request.args)
+}
+
+private func ghGraphQLIndirectInputExplanation(_ args: [String]) -> String? {
+    let words = ghCommandWords(args)
+    guard words.first?.lowercased() == "api",
+          ghApiRequestClassification(Array(words.dropFirst())) == .indirectGraphQLInput
+    else {
+        return nil
+    }
+    return "Automic Vault could not verify this GraphQL request as read-only because gh will read a field value from standard input or a file. That content is not present in the authorization request, so automic authorization fails closed. Pass field values inline, for example with -f query=…, to make them verifiable."
+}
+
+private struct GhGraphQLArguments {
+    private var queries: [String] = []
+    private var operationNames: [String] = []
+    private var hasIndirectFieldInput = false
+
+    var usesIndirectFieldInput: Bool { hasIndirectFieldInput }
+
+    mutating func add(field: String, readsFile: Bool) {
+        let parts = field.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2 else { return }
+
+        let name = String(parts[0])
+        let value = String(parts[1])
+        if readsFile, value.hasPrefix("@") {
+            hasIndirectFieldInput = true
+            return
+        }
+        guard name == "query" || name == "operationName" else { return }
+        if name == "query" {
+            queries.append(value)
+        } else {
+            operationNames.append(value)
+        }
+    }
+
+    var isReadOnly: Bool {
+        guard !hasIndirectFieldInput,
+              queries.count == 1,
+              operationNames.count <= 1,
+              let query = queries.first
+        else {
+            return false
+        }
+        return graphQLRequestIsReadOnly(query: query, operationName: operationNames.first)
+    }
+}
+
+private func ghCommandWords(_ args: [String]) -> [String] {
+    var index = 0
+    while index < args.count {
+        let arg = args[index]
+        if arg == "--" {
+            return []
+        }
+        if ["-R", "--repo", "--hostname"].contains(arg) {
+            index += 2
+            continue
+        }
+        if arg.hasPrefix("--repo=") || arg.hasPrefix("--hostname=") {
+            index += 1
+            continue
+        }
+        if arg.hasPrefix("-") {
+            return []
+        }
+        return Array(args[index...])
+    }
+    return []
+}
+
+private extension String {
+    func value(afterOption prefix: String) -> String? {
+        hasPrefix(prefix) ? String(dropFirst(prefix.count)) : nil
+    }
+}
+
+private func validSecretKeyName(_ key: String) -> Bool {
+    guard let first = key.unicodeScalars.first,
+          first == "_" || first.isASCIIAlpha
+    else {
+        return false
+    }
+    return key.unicodeScalars.dropFirst().allSatisfy {
+        $0 == "_" || $0.isASCIIAlpha || $0.isASCIIDigit
+    }
+}
+
+private func validDockerServerURL(_ serverURL: String) -> Bool {
+    !serverURL.isEmpty
+        && serverURL.utf8.count <= 2048
+        && !serverURL.unicodeScalars.contains(where: { $0.value == 0 || $0.value == 10 || $0.value == 13 })
+}
+
+private func dockerCredentialSecretName(_ serverURL: String) -> String {
+    let hash = SHA256.hash(data: Data(serverURL.utf8)).map { String(format: "%02X", $0) }.joined()
+    return "DOCKER_REGISTRY_CREDENTIAL_\(hash)"
+}
+
+private func parseDockerCredential(_ value: String) -> StoredDockerCredential? {
+    guard value.utf8.count <= 64 * 1024,
+          let data = value.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          Set(object.keys) == Set(["ServerURL", "Username", "Secret"]),
+          let serverURL = object["ServerURL"] as? String,
+          let username = object["Username"] as? String,
+          let secret = object["Secret"] as? String,
+          validDockerServerURL(serverURL),
+          !username.isEmpty,
+          !secret.isEmpty,
+          !username.unicodeScalars.contains(where: { $0.value == 0 }),
+          !secret.unicodeScalars.contains(where: { $0.value == 0 })
+    else { return nil }
+    return StoredDockerCredential(serverURL: serverURL, username: username, secret: secret)
+}
+
+private struct StoredGoatCredentialScope {
+    let did: String
+    let pds: String
+    let canonical: String
+
+    var secretName: String {
+        let hash = SHA256.hash(data: Data((did + "\0" + pds).utf8))
+            .map { String(format: "%02X", $0) }.joined()
+        return "GOAT_AUTH_SESSION_\(hash)"
+    }
+}
+
+private func parseGoatCredentialScope(_ value: String) -> StoredGoatCredentialScope? {
+    guard value.utf8.count <= 4 * 1024,
+          let data = value.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          Set(object.keys) == Set(["did", "pds"]),
+          let did = object["did"] as? String, validGoatDID(did),
+          let pds = object["pds"] as? String, normalizeOxideHost(pds) == pds,
+          let canonicalData = try? JSONSerialization.data(
+              withJSONObject: ["did": did, "pds": pds],
+              options: [.sortedKeys, .withoutEscapingSlashes]
+          ),
+          let canonical = String(data: canonicalData, encoding: .utf8), canonical == value
+    else { return nil }
+    return StoredGoatCredentialScope(did: did, pds: pds, canonical: canonical)
+}
+
+private func validGoatDID(_ did: String) -> Bool {
+    let prefixLength = did.hasPrefix("did:plc:") ? "did:plc:".utf8.count
+        : did.hasPrefix("did:web:") ? "did:web:".utf8.count : 0
+    return prefixLength > 0
+        && did.utf8.count > prefixLength
+        && did.utf8.count <= 2048
+        && did.unicodeScalars.allSatisfy { scalar in
+            scalar.isASCII && (scalar.isASCIIAlpha || scalar.isASCIIDigit || ".:_%~-".contains(Character(scalar)))
+        }
+}
+
+private func parseGoatCredential(_ value: String) -> String? {
+    guard value.utf8.count <= 64 * 1024,
+          let data = value.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          Set(object.keys) == Set(["password", "access_token", "session_token"]),
+          ["password", "access_token", "session_token"].allSatisfy({ key in
+              guard let field = object[key] as? String else { return false }
+              return !field.isEmpty && field != "@av"
+                  && !field.unicodeScalars.contains(where: { $0.value == 0 })
+          })
+    else { return nil }
+    return value
+}
+
+private let ordercliCredentialSecretName = "ORDERCLI_FOODORA_SESSION"
+
+private struct StoredOrdercliCredentialScope {
+    let canonical: String
+    let secretName = ordercliCredentialSecretName
+}
+
+private func parseOrdercliCredentialScope(_ value: String) -> StoredOrdercliCredentialScope? {
+    guard value == #"{"provider":"foodora"}"# else { return nil }
+    return StoredOrdercliCredentialScope(canonical: value)
+}
+
+private func parseOrdercliCredential(_ value: String) -> String? {
+    guard value.utf8.count <= 256 * 1024,
+          let data = value.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          Set(object.keys) == Set([
+              "access_token", "refresh_token", "client_secret", "pending_mfa_token",
+              "cookies_by_host",
+          ])
+    else { return nil }
+    let stringKeys = ["access_token", "refresh_token", "client_secret", "pending_mfa_token"]
+    guard stringKeys.allSatisfy({ key in
+        guard let field = object[key] as? String else { return false }
+        return !field.unicodeScalars.contains(where: { $0.value == 0 })
+    }) else { return nil }
+    let cookies: [String: Any]
+    if object["cookies_by_host"] is NSNull {
+        cookies = [:]
+    } else if let value = object["cookies_by_host"] as? [String: Any] {
+        cookies = value
+    } else {
+        return nil
+    }
+    guard cookies.count <= 256,
+          cookies.allSatisfy({ host, rawCookie in
+              guard let cookie = rawCookie as? String else { return false }
+              return !host.isEmpty && !cookie.isEmpty
+                  && host.utf8.count <= 2048 && cookie.utf8.count <= 64 * 1024
+                  && !host.unicodeScalars.contains(where: { $0.value == 0 })
+                  && !cookie.unicodeScalars.contains(where: { $0.value == 0 })
+          }),
+          stringKeys.contains(where: { (object[$0] as? String)?.isEmpty == false })
+              || !cookies.isEmpty
+    else { return nil }
+    return value
+}
+
+private let openhueCredentialSecretName = "OPENHUE_APPLICATION_KEY"
+
+private struct StoredOpenHueCredentialScope {
+    let bridge: String
+    let canonical: String
+    let secretName = openhueCredentialSecretName
+}
+
+private func parseOpenHueCredentialScope(_ value: String) -> StoredOpenHueCredentialScope? {
+    guard value.utf8.count <= 512,
+          let data = value.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          Set(object.keys) == Set(["bridge"]),
+          let bridge = object["bridge"] as? String,
+          !bridge.isEmpty, bridge.utf8.count <= 255,
+          !bridge.unicodeScalars.contains(where: { $0.value == 0 }),
+          let canonicalData = try? JSONSerialization.data(withJSONObject: ["bridge": bridge], options: [.sortedKeys]),
+          String(data: canonicalData, encoding: .utf8) == value
+    else { return nil }
+    return StoredOpenHueCredentialScope(bridge: bridge, canonical: value)
+}
+
+private func parseOpenHueCredential(_ value: String) -> String? {
+    guard !value.isEmpty, value != "@av", value.utf8.count <= 64 * 1024,
+          !value.unicodeScalars.contains(where: { $0.value == 0 })
+    else { return nil }
+    return value
+}
+
+private let plumberCredentialSecretName = "PLUMBER_LOCAL_CONFIG"
+private let plumberCredentialScope = #"{"store":"local-config"}"#
+
+private struct StoredPlumberCredentialScope {
+    let canonical: String
+    let secretName = plumberCredentialSecretName
+}
+
+private func parsePlumberCredentialScope(_ value: String) -> StoredPlumberCredentialScope? {
+    guard value == plumberCredentialScope else { return nil }
+    return StoredPlumberCredentialScope(canonical: value)
+}
+
+private func parsePlumberCredential(_ value: String) -> String? {
+    guard !value.isEmpty, value.utf8.count <= 1024 * 1024,
+          !value.unicodeScalars.contains(where: { $0.value == 0 }),
+          let data = value.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          !(Set(object.keys) == Set(["automic_vault"])
+              && object["automic_vault"] as? String == "plumber-config-v1")
+    else { return nil }
+    return value
+}
+
+private let uaaCredentialSecretName = "UAA_OAUTH_TOKENS"
+
+private struct StoredUAACredentialScope {
+    let canonical: String
+    let secretName = uaaCredentialSecretName
+}
+
+private func parseUAACredentialScope(_ value: String) -> StoredUAACredentialScope? {
+    guard value == #"{"store":"contexts"}"# else { return nil }
+    return StoredUAACredentialScope(canonical: value)
+}
+
+private func parseUAACredential(_ value: String) -> String? {
+    guard value.utf8.count <= 1024 * 1024,
+          let data = value.data(using: .utf8),
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          Set(root.keys) == Set(["targets"]),
+          let targets = root["targets"] as? [String: Any],
+          !targets.isEmpty, targets.count <= 128
+    else { return nil }
+    let validKey: (String) -> Bool = { key in
+        !key.isEmpty && key.utf8.count <= 4096
+            && !key.unicodeScalars.contains(where: { $0.value == 0 })
+    }
+    guard targets.allSatisfy({ target, rawContexts in
+        guard validKey(target), let contexts = rawContexts as? [String: Any],
+              !contexts.isEmpty, contexts.count <= 256
+        else { return false }
+        return contexts.allSatisfy({ context, rawToken in
+            guard validKey(context), let token = rawToken as? [String: Any],
+                  !token.isEmpty,
+                  Set(token.keys).isSubset(of: Set(["access_token", "refresh_token"]))
+            else { return false }
+            return token.values.allSatisfy({ rawValue in
+                guard let secret = rawValue as? String else { return false }
+                return !secret.isEmpty && secret != "@av" && secret.utf8.count <= 512 * 1024
+                    && !secret.unicodeScalars.contains(where: { $0.value == 0 })
+            })
+        })
+    }) else { return nil }
+    return value
+}
+
+private struct StoredRailwayCredentialScope {
+    let environment: String
+    let host: String
+    let canonical: String
+
+    var secretName: String {
+        let hash = SHA256.hash(data: Data((environment + "\0" + host).utf8))
+            .map { String(format: "%02X", $0) }.joined()
+        return "RAILWAY_AUTH_\(hash)"
+    }
+}
+
+private func parseRailwayCredentialScope(_ value: String) -> StoredRailwayCredentialScope? {
+    let expectedHosts = [
+        "production": "railway.com",
+        "staging": "railway-staging.com",
+        "dev": "railway-develop.com",
+    ]
+    guard value.utf8.count <= 4 * 1024,
+          let data = value.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          Set(object.keys) == Set(["environment", "host"]),
+          let environment = object["environment"] as? String,
+          let host = object["host"] as? String,
+          expectedHosts[environment] == host,
+          let canonicalData = try? JSONSerialization.data(
+              withJSONObject: ["environment": environment, "host": host],
+              options: [.sortedKeys, .withoutEscapingSlashes]
+          ),
+          let canonical = String(data: canonicalData, encoding: .utf8), canonical == value
+    else { return nil }
+    return StoredRailwayCredentialScope(environment: environment, host: host, canonical: canonical)
+}
+
+private func parseRailwayCredential(_ value: String) -> String? {
+    guard value.utf8.count <= 64 * 1024,
+          let data = value.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          Set(object.keys) == Set(["token", "accessToken", "refreshToken"])
+    else { return nil }
+    func string(_ key: String) -> String? {
+        guard let field = object[key] as? String, !field.isEmpty,
+              !field.unicodeScalars.contains(where: { $0.value == 0 })
+        else { return nil }
+        return field
+    }
+    func absent(_ key: String) -> Bool { object[key] is NSNull }
+    let legacy = string("token") != nil && absent("accessToken") && absent("refreshToken")
+    let oauth = absent("token") && string("accessToken") != nil
+        && (absent("refreshToken") || string("refreshToken") != nil)
+    return legacy || oauth ? value : nil
+}
+
+private struct StoredOxideCredentialScope {
+    let profile: String
+    let host: String
+    let canonical: String
+
+    var secretName: String {
+        let data = Data((profile + "\0" + host).utf8)
+        let hash = SHA256.hash(data: data).map { String(format: "%02X", $0) }.joined()
+        return "OXIDE_PROFILE_TOKEN_\(hash)"
+    }
+}
+
+private func parseOxideCredentialScope(_ value: String) -> StoredOxideCredentialScope? {
+    guard value.utf8.count <= 4 * 1024,
+          let data = value.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          Set(object.keys) == Set(["host", "profile"]),
+          let profile = object["profile"] as? String,
+          let host = object["host"] as? String,
+          validOxideProfile(profile),
+          normalizeOxideHost(host) == host,
+          let canonicalData = try? JSONSerialization.data(
+              withJSONObject: ["host": host, "profile": profile],
+              options: [.sortedKeys, .withoutEscapingSlashes]
+          ),
+          let canonical = String(data: canonicalData, encoding: .utf8),
+          canonical == value
+    else { return nil }
+    return StoredOxideCredentialScope(profile: profile, host: host, canonical: canonical)
+}
+
+private func validOxideProfile(_ profile: String) -> Bool {
+    !profile.isEmpty
+        && profile.utf8.count <= 128
+        && profile == profile.trimmingCharacters(in: .whitespacesAndNewlines)
+        && profile.unicodeScalars.allSatisfy { $0.isASCII && $0.value > 31 && $0.value != 127 }
+}
+
+private func normalizeOxideHost(_ host: String) -> String? {
+    guard let input = URLComponents(string: host),
+          let scheme = input.scheme?.lowercased(),
+          scheme == "http" || scheme == "https",
+          let hostname = input.host?.lowercased(),
+          !hostname.isEmpty,
+          input.user == nil,
+          input.password == nil,
+          input.path.isEmpty || input.path == "/",
+          input.query == nil,
+          input.fragment == nil
+    else { return nil }
+    var output = URLComponents()
+    output.scheme = scheme
+    output.host = hostname
+    if input.port != (scheme == "https" ? 443 : 80) { output.port = input.port }
+    return output.string
+}
+
+private func parseOxideCredential(_ value: String) -> String? {
+    guard !value.isEmpty,
+          value.utf8.count <= 64 * 1024,
+          !value.unicodeScalars.contains(where: { [0, 10, 13].contains($0.value) })
+    else { return nil }
+    return value
+}
+
+private let fastlyOfficialAPIEndpoint = "https://api.fastly.com"
+
+private struct StoredFastlyCredentialScope {
+    let name: String
+    let endpoint: String
+    let canonical: String
+
+    var secretName: String {
+        let data = Data((name + "\0" + endpoint).utf8)
+        let hash = SHA256.hash(data: data).map { String(format: "%02X", $0) }.joined()
+        return "FASTLY_API_TOKEN_\(hash)"
+    }
+}
+
+private func parseFastlyCredentialScope(_ value: String) -> StoredFastlyCredentialScope? {
+    guard value.utf8.count <= 4 * 1024,
+          let data = value.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          Set(object.keys) == Set(["endpoint", "name"]),
+          let name = object["name"] as? String,
+          let endpoint = object["endpoint"] as? String,
+          validFastlyTokenName(name),
+          endpoint == fastlyOfficialAPIEndpoint,
+          let canonicalData = try? JSONSerialization.data(
+              withJSONObject: ["endpoint": endpoint, "name": name],
+              options: [.sortedKeys, .withoutEscapingSlashes]
+          ),
+          let canonical = String(data: canonicalData, encoding: .utf8),
+          canonical == value
+    else { return nil }
+    return StoredFastlyCredentialScope(name: name, endpoint: endpoint, canonical: canonical)
+}
+
+private func validFastlyTokenName(_ name: String) -> Bool {
+    validOxideProfile(name)
+}
+
+private func parseFastlyCredential(_ value: String) -> String? {
+    parseOxideCredential(value)
+}
+
+private struct StoredSqlcmdCredentialScope {
+    let profile: String
+    let address: String
+    let port: Int
+    let canonical: String
+
+    var secretName: String {
+        let hash = SHA256.hash(data: Data(profile.utf8)).map { String(format: "%02X", $0) }.joined()
+        return "SQLCMD_PASSWORD_\(hash)"
+    }
+}
+
+private func parseSqlcmdCredentialScope(_ value: String) -> StoredSqlcmdCredentialScope? {
+    guard value.utf8.count <= 4 * 1024,
+          let data = value.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          Set(object.keys) == Set(["address", "port", "profile"]),
+          let profile = object["profile"] as? String,
+          validSqlcmdProfile(profile),
+          let address = object["address"] as? String,
+          validSqlcmdAddress(address),
+          let port = object["port"] as? Int,
+          (0 ... 65_535).contains(port),
+          (address.isEmpty && port == 0) || (!address.isEmpty && port > 0),
+          let canonicalData = try? JSONSerialization.data(
+              withJSONObject: ["address": address, "port": port, "profile": profile],
+              options: [.sortedKeys, .withoutEscapingSlashes]
+          ),
+          let canonical = String(data: canonicalData, encoding: .utf8),
+          canonical == value
+    else { return nil }
+    return StoredSqlcmdCredentialScope(profile: profile, address: address, port: port, canonical: canonical)
+}
+
+private func validSqlcmdProfile(_ value: String) -> Bool {
+    !value.isEmpty && value.utf8.count <= 128 && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+        && value.unicodeScalars.allSatisfy { $0.isASCII && $0.value >= 0x20 && $0.value <= 0x7e }
+}
+
+private func validSqlcmdAddress(_ value: String) -> Bool {
+    value.utf8.count <= 253 && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+        && value.unicodeScalars.allSatisfy { $0.isASCII && $0.value >= 0x20 && $0.value <= 0x7e }
+}
+
+private func parseSqlcmdPassword(_ value: String) -> String? {
+    parseOxideCredential(value)
+}
+
+private func normalizeTerraformHostname(_ hostname: String) -> String? {
+    guard !hostname.isEmpty,
+          hostname.utf8.count <= 253,
+          hostname.unicodeScalars.allSatisfy(\.isASCII),
+          !hostname.hasPrefix("."),
+          !hostname.hasSuffix(".")
+    else { return nil }
+    let normalized = hostname.lowercased()
+    guard normalized.split(separator: ".", omittingEmptySubsequences: false).allSatisfy({ label in
+        !label.isEmpty
+            && label.utf8.count <= 63
+            && label.first != "-"
+            && label.last != "-"
+            && label.unicodeScalars.allSatisfy { $0.isASCIIAlpha || $0.isASCIIDigit || $0 == "-" }
+    }) else { return nil }
+    return normalized
+}
+
+private func terraformCredentialSecretName(_ hostname: String) -> String {
+    let hash = SHA256.hash(data: Data(hostname.utf8)).map { String(format: "%02X", $0) }.joined()
+    return "TERRAFORM_HOST_CREDENTIAL_\(hash)"
+}
+
+private func normalizeAliyunProfile(_ profile: String) -> String? {
+    guard !profile.isEmpty,
+          profile.utf8.count <= 128,
+          profile.unicodeScalars.allSatisfy({
+              $0.isASCII && !((0...31).contains($0.value) || $0.value == 127)
+          })
+    else { return nil }
+    return profile.trimmingCharacters(in: .whitespacesAndNewlines) == profile ? profile : nil
+}
+
+private func aliyunCredentialSecretName(_ profile: String) -> String {
+    let hash = SHA256.hash(data: Data(profile.utf8)).map { String(format: "%02X", $0) }.joined()
+    return "ALIYUN_PROFILE_CREDENTIAL_\(hash)"
+}
+
+private func parseAliyunCredential(_ value: String) -> Bool {
+    guard value.utf8.count <= 64 * 1024,
+          let data = value.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let mode = object["mode"] as? String,
+          let accessKeyID = object["access_key_id"] as? String,
+          let accessKeySecret = object["access_key_secret"] as? String,
+          validAliyunCredentialValue(accessKeyID),
+          validAliyunCredentialValue(accessKeySecret)
+    else { return false }
+    if mode == "AK" {
+        return Set(object.keys) == Set(["mode", "access_key_id", "access_key_secret"])
+    }
+    guard mode == "StsToken", let token = object["sts_token"] as? String,
+          validAliyunCredentialValue(token)
+    else { return false }
+    return Set(object.keys) == Set(["mode", "access_key_id", "access_key_secret", "sts_token"])
+}
+
+private func validAliyunCredentialValue(_ value: String) -> Bool {
+    !value.isEmpty && value.utf8.count <= 64 * 1024
+        && !value.unicodeScalars.contains(where: { [0, 10, 13].contains($0.value) })
+}
+
+private func parseTerraformCredential(_ value: String) -> String? {
+    guard value.utf8.count <= 64 * 1024,
+          let data = value.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          Set(object.keys) == Set(["token"]),
+          let token = object["token"] as? String,
+          !token.isEmpty,
+          !token.unicodeScalars.contains(where: { $0.value == 0 })
+    else { return nil }
+    return token
+}
+
+private let wakatimeCredentialSecretName = "WAKATIME_API_KEY"
+private let wakatimeOfficialAPIURL = "https://api.wakatime.com/api/v1"
+
+private func validWakaTimeAPIKey(_ value: String) -> Bool {
+    let key = value.hasPrefix("waka_") ? String(value.dropFirst(5)) : value
+    let bytes = Array(key.utf8)
+    let hyphens = Set([8, 13, 18, 23])
+    guard bytes.count == 36, bytes[14] == 52, [56, 57, 97, 98].contains(bytes[19]) else {
+        return false
+    }
+    return bytes.enumerated().allSatisfy { index, byte in
+        hyphens.contains(index)
+            ? byte == 45
+            : (48...57).contains(byte) || (97...102).contains(byte)
+    }
+}
+
+private let rcloneConfigPasswordSecretName = "RCLONE_CONFIG_PASSWORD"
+private let rcloneAllRemotesScope = "all-remotes"
+
+private func validRcloneConfigPassword(_ value: String) -> Bool {
+    !value.isEmpty && value.utf8.count <= 1024
+        && !value.unicodeScalars.contains(where: { [0, 10, 13].contains($0.value) })
+}
+
+private struct StoredKubectlCredentialScope {
+    let kind: String
+    let server: String
+    let user: String
+    let canonical: String
+
+    var secretName: String {
+        let hash = SHA256.hash(data: Data(user.utf8)).map { String(format: "%02X", $0) }.joined()
+        return "KUBECTL_USER_CREDENTIAL_\(hash)"
+    }
+}
+
+private func parseKubectlCredentialScope(_ value: String) -> StoredKubectlCredentialScope? {
+    guard value.utf8.count <= 8 * 1024,
+          let data = value.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          Set(object.keys) == Set(["kind", "server", "user"]),
+          let kind = object["kind"] as? String,
+          kind == "token" || kind == "client-certificate",
+          let server = object["server"] as? String,
+          server.utf8.count <= 4096,
+          server.unicodeScalars.allSatisfy(\.isASCII),
+          let components = URLComponents(string: server),
+          components.scheme == "https",
+          components.host?.isEmpty == false,
+          components.user == nil,
+          components.password == nil,
+          components.query == nil,
+          components.fragment == nil,
+          let user = object["user"] as? String,
+          !user.isEmpty,
+          user.utf8.count <= 1024,
+          user == user.trimmingCharacters(in: .whitespacesAndNewlines),
+          !user.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+          let canonicalData = try? JSONSerialization.data(
+              withJSONObject: ["kind": kind, "server": server, "user": user],
+              options: [.sortedKeys, .withoutEscapingSlashes]
+          ),
+          let canonical = String(data: canonicalData, encoding: .utf8),
+          canonical == value
+    else { return nil }
+    return StoredKubectlCredentialScope(
+        kind: kind,
+        server: server,
+        user: user,
+        canonical: canonical
+    )
+}
+
+private func validKubectlCredential(_ value: String, kind: String) -> Bool {
+    guard value.utf8.count <= 4 * 1024 * 1024,
+          let data = value.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return false }
+    if kind == "token" {
+        guard Set(object.keys) == Set(["token"]), let token = object["token"] as? String else {
+            return false
+        }
+        return !token.isEmpty && token.utf8.count <= 1024 * 1024
+            && !token.unicodeScalars.contains(where: { $0.value == 0 })
+    }
+    guard kind == "client-certificate",
+          Set(object.keys) == Set(["clientCertificateData", "clientKeyData"]),
+          let certificate = object["clientCertificateData"] as? String,
+          let key = object["clientKeyData"] as? String
+    else { return false }
+    return certificate.contains("-----BEGIN CERTIFICATE-----")
+        && key.contains("-----BEGIN")
+        && key.contains("PRIVATE KEY-----")
+        && !certificate.unicodeScalars.contains(where: { $0.value == 0 })
+        && !key.unicodeScalars.contains(where: { $0.value == 0 })
+}
+
+private func isGhTokenKey(_ key: String) -> Bool {
+    key.hasPrefix("GH_TOKEN_") && validSecretKeyName(key)
+}
+
+private func isStripeCredentialKey(_ key: String) -> Bool {
+    key.hasPrefix("STRIPE_CLI_") && validSecretKeyName(key)
+}
+
+private extension UnicodeScalar {
+    var isASCIIAlpha: Bool {
+        (65...90).contains(value) || (97...122).contains(value)
+    }
+
+    var isASCIIDigit: Bool {
+        (48...57).contains(value)
+    }
+}
+
+private struct AppError: LocalizedError {
+    let errorDescription: String?
+
+    init(_ description: String) {
+        errorDescription = description
+    }
+}
+
+private func handOffToLaunchAgentIfNeeded() throws -> Bool {
+    guard shouldHandOffToLaunchAgent(),
+          let launchAgent = bundledLaunchAgentURL(),
+          let executableURL = Bundle.main.executableURL
+    else {
+        return false
+    }
+
+    let installed = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/LaunchAgents/\(approvalLaunchAgentName).plist")
+    try FileManager.default.createDirectory(
+        at: installed.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    let template = try Data(contentsOf: launchAgent)
+    let configured = try configuredLaunchAgent(template: template, executableURL: executableURL)
+    let configurationChanged = !launchAgentConfigurationsMatch(
+        try? Data(contentsOf: installed),
+        configured
+    )
+
+    let domain = "gui/\(getuid())"
+    let service = "\(domain)/\(approvalLaunchAgentName)"
+    if !configurationChanged {
+        if requestExistingInstanceToOpenWindow() {
+            return true
+        }
+        // A pre-open-window release may still be running. Restart it once so
+        // the pending request is consumed by the current release.
+        do {
+            try runLaunchctl(["kickstart", "-k", service])
+            return true
+        } catch {
+            // The matching plist may exist while its job is not loaded.
+        }
+    }
+    try configured.write(to: installed, options: .atomic)
+    try? runLaunchctl(["bootout", service])
+    do {
+        try runLaunchctl(["bootstrap", domain, installed.path])
+    } catch {
+        usleep(200_000)
+        try runLaunchctl(["bootstrap", domain, installed.path])
+    }
+    try runLaunchctl(["enable", service])
+    try runLaunchctl(["kickstart", "-k", service])
+    return true
+}
+
+private func requestExistingInstanceToOpenWindow() -> Bool {
+    let connection = approvalServiceName.withCString {
+        xpc_connection_create_mach_service($0, nil, 0)
+    }
+    xpc_connection_set_event_handler(connection) { _ in }
+    xpc_connection_activate(connection)
+    let message = xpc_dictionary_create_empty()
+    ApprovalServiceOperation.openWindow.rawValue.withCString {
+        xpc_dictionary_set_string(message, "op", $0)
+    }
+    let reply = xpc_connection_send_message_with_reply_sync(connection, message)
+    xpc_connection_cancel(connection)
+    return xpc_get_type(reply) == XPC_TYPE_DICTIONARY
+        && xpc_dictionary_get_bool(reply, "ok")
+}
+
+private func launchAgentConfigurationsMatch(_ lhsData: Data?, _ rhsData: Data) -> Bool {
+    guard let lhsData,
+          let lhs = try? PropertyListSerialization.propertyList(from: lhsData, format: nil)
+            as? NSDictionary,
+          let rhs = try? PropertyListSerialization.propertyList(from: rhsData, format: nil)
+            as? NSDictionary
+    else {
+        return false
+    }
+    return lhs == rhs
+}
+
+private func configuredLaunchAgent(template: Data, executableURL: URL) throws -> Data {
+    guard var plist = try PropertyListSerialization.propertyList(from: template, format: nil) as? [String: Any]
+    else {
+        throw AppError("The bundled launch agent is invalid.")
+    }
+    plist["ProgramArguments"] = [executableURL.path]
+    return try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+}
+
+private func shouldHandOffToLaunchAgent(
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    launchAgentURL: URL? = bundledLaunchAgentURL()
+) -> Bool {
+    !isLaunchAgentInstance(environment: environment) && launchAgentURL != nil
+}
+
+private func bundledLaunchAgentURL() -> URL? {
+    let url = Bundle.main.bundleURL
+        .appendingPathComponent("Contents/Library/LaunchAgents/\(approvalLaunchAgentName).plist")
+    return FileManager.default.fileExists(atPath: url.path) ? url : nil
+}
+
+private func isLaunchAgentInstance(
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> Bool {
+    environment["XPC_SERVICE_NAME"] == approvalLaunchAgentName
+}
+
+private func shouldOpenMainWindow(
+    arguments: [String] = CommandLine.arguments,
+    pending: Bool,
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> Bool {
+    pending || arguments.contains(openMainWindowArgument) || !isLaunchAgentInstance(environment: environment)
+}
+
+private func requestedSecretGateID(arguments: [String]) -> String? {
+    guard let flag = arguments.firstIndex(of: "--secret-gate"),
+          arguments.indices.contains(flag + 1)
+    else { return nil }
+    let id = arguments[flag + 1]
+    return validSecretGateID(id) ? id : nil
+}
+
+private func secretGateID(from url: URL) -> String? {
+    guard url.scheme == "automic-vault",
+          url.host == "secret-gate",
+          url.pathComponents.count == 2
+    else { return nil }
+    let id = url.lastPathComponent
+    return validSecretGateID(id) ? id : nil
+}
+
+private func validSecretGateID(_ id: String) -> Bool {
+    !id.isEmpty && id.utf8.allSatisfy {
+        switch $0 {
+        case 45, 46, 48...57, 65...90, 95, 97...122: true
+        default: false
+        }
+    }
+}
+
+private func runLaunchctl(_ arguments: [String]) throws {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    process.arguments = arguments
+    let pipe = Pipe()
+    process.standardError = pipe
+    process.standardOutput = pipe
+    try process.run()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        throw AppError("launchctl \(arguments.joined(separator: " ")) failed: \(output ?? "exit \(process.terminationStatus)")")
+    }
+}
+
+private func pathString(_ identity: AVProcessIdentity) -> String {
+    var copy = identity
+    return withUnsafePointer(to: &copy.path) { pointer in
+        pointer.withMemoryRebound(to: CChar.self, capacity: 4096) {
+            String(cString: $0)
+        }
+    }
+}
+
+private func sameProcessIdentity(
+    _ expected: AVProcessIdentity,
+    _ current: AVProcessIdentity
+) -> Bool {
+    expected.pid == current.pid
+        && expected.pidversion == current.pidversion
+        && expected.start_usec == current.start_usec
+        && expected.euid == current.euid
+        && expected.audit_session_id == current.audit_session_id
+}
+
+private func signingInfo(path: String) -> SigningInfo {
+    var staticCode: SecStaticCode?
+    let url = URL(fileURLWithPath: path) as CFURL
+    guard SecStaticCodeCreateWithPath(url, [], &staticCode) == errSecSuccess,
+          let staticCode,
+          let info = copySigningInformation(staticCode)
+    else {
+        return SigningInfo(identifier: "unknown", teamIdentifier: "unknown")
+    }
+
+    return SigningInfo(
+        identifier: info[kSecCodeInfoIdentifier] as? String ?? "unknown",
+        teamIdentifier: info[kSecCodeInfoTeamIdentifier] as? String ?? "unknown"
+    )
+}
+
+func selfTeamIdentifier() -> String? {
+    var code: SecCode?
+    var staticCode: SecStaticCode?
+    guard SecCodeCopySelf([], &code) == errSecSuccess,
+          let code,
+          SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess,
+          let staticCode,
+          let info = copySigningInformation(staticCode)
+    else {
+        return nil
+    }
+    return info[kSecCodeInfoTeamIdentifier] as? String
+}
+
+private func copySigningInformation(_ code: SecStaticCode) -> [CFString: Any]? {
+    var info: CFDictionary?
+    guard SecCodeCopySigningInformation(
+        code,
+        SecCSFlags(rawValue: kSecCSSigningInformation),
+        &info
+    ) == errSecSuccess else {
+        return nil
+    }
+    return info as? [CFString: Any]
+}
+
+private func launcherIdentities(for identity: AVProcessIdentity) -> [LauncherIdentity] {
+    for pid in launcherAncestorStartPIDs(identity) {
+        let launchers = launcherIdentities(startingAt: pid)
+        if !launchers.isEmpty { return launchers }
+    }
+    return []
+}
+
+private func launcherAncestorStartPIDs(_ identity: AVProcessIdentity) -> [pid_t] {
+    var seen = Set<pid_t>()
+    return [identity.ppid, identity.sid].filter { $0 > 1 && seen.insert($0).inserted }
+}
+
+private func retainedProcessChains(for identity: AVProcessIdentity) -> [[RetainedProcessChainNode]] {
+    launcherAncestorStartPIDs(identity).map { startPID in
+        var nodes: [RetainedProcessChainNode] = []
+        var pid = startPID
+        var seen = Set<pid_t>()
+        for _ in 0..<32 {
+            guard pid > 1, seen.insert(pid).inserted else { break }
+            var current = AVProcessIdentity()
+            guard av_process_identity(pid, &current) else { break }
+            nodes.append(RetainedProcessChainNode(
+                pid: pid,
+                path: pathString(current),
+                execution: retainedProcessExecution(pid: pid, identity: current)
+            ))
+            pid = current.ppid
+        }
+        return nodes
+    }
+}
+
+private func retainedProcessExecution(
+    pid: pid_t,
+    identity: AVProcessIdentity
+) -> RetainedProcessExecution? {
+    guard identity.euid == geteuid(),
+          identity.pidversion > 0,
+          let codeIdentity = liveCodeIdentity(pid: pid)
+    else { return nil }
+
+    var current = AVProcessIdentity()
+    guard av_process_identity(pid, &current),
+          current.pidversion == identity.pidversion,
+          current.start_usec == identity.start_usec,
+          current.euid == identity.euid,
+          current.audit_session_id == identity.audit_session_id
+    else { return nil }
+
+    return RetainedProcessExecution(
+        pid: pid,
+        pidVersion: identity.pidversion,
+        startUsec: identity.start_usec,
+        effectiveUserID: identity.euid,
+        auditSessionID: identity.audit_session_id,
+        codeIdentity: codeIdentity
+    )
+}
+
+private func retainedProcessExecutionIsLive(_ execution: RetainedProcessExecution) -> Bool {
+    func matches(_ identity: AVProcessIdentity) -> Bool {
+        identity.pidversion == execution.pidVersion
+            && identity.start_usec == execution.startUsec
+            && identity.euid == execution.effectiveUserID
+            && identity.audit_session_id == execution.auditSessionID
+    }
+    var before = AVProcessIdentity()
+    guard av_process_identity(execution.pid, &before),
+          matches(before),
+          liveCodeIdentity(pid: execution.pid) == execution.codeIdentity
+    else { return false }
+    var after = AVProcessIdentity()
+    return av_process_identity(execution.pid, &after) && matches(after)
+}
+
+private func approvalProcessExecution(
+    pid: pid_t,
+    identity: AVProcessIdentity
+) -> ApprovalProcessExecution? {
+    guard let codeIdentity = liveCodeIdentity(pid: pid) else { return nil }
+    // Setuid Gate Clients may deny task-port access. This evidence is diagnostic only,
+    // so bind audit-token fields when available and always bind live process identity.
+    let hasAuditToken = identity.pidversion > 0
+    let execution = ApprovalProcessExecution(
+        pid: pid,
+        pidVersion: hasAuditToken ? identity.pidversion : nil,
+        startUsec: identity.start_usec,
+        effectiveUserID: identity.euid,
+        auditSessionID: hasAuditToken ? identity.audit_session_id : nil,
+        codeIdentity: codeIdentity
+    )
+    var current = AVProcessIdentity()
+    return av_process_identity(pid, &current) && approvalProcessExecutionMatches(execution, current)
+        ? execution
+        : nil
+}
+
+private func approvalProcessExecutionMatches(
+    _ execution: ApprovalProcessExecution,
+    _ identity: AVProcessIdentity
+) -> Bool {
+    execution.startUsec == identity.start_usec
+        && execution.effectiveUserID == identity.euid
+        && execution.pidVersion.map { $0 == identity.pidversion } ?? true
+        && execution.auditSessionID.map { $0 == identity.audit_session_id } ?? true
+}
+
+private func approvalProcessExecutionIsLive(_ execution: ApprovalProcessExecution) -> Bool {
+    var before = AVProcessIdentity()
+    guard av_process_identity(execution.pid, &before),
+          approvalProcessExecutionMatches(execution, before),
+          liveCodeIdentity(pid: execution.pid) == execution.codeIdentity
+    else { return false }
+    var after = AVProcessIdentity()
+    return av_process_identity(execution.pid, &after)
+        && approvalProcessExecutionMatches(execution, after)
+}
+
+private func liveSecretUseProcess(
+    pid: pid_t,
+    identity: AVProcessIdentity
+) -> LiveSecretUseProcess? {
+    guard identity.pid == pid, identity.euid == geteuid() else { return nil }
+    let process = LiveSecretUseProcess(
+        pid: pid,
+        startUsec: identity.start_usec,
+        effectiveUserID: identity.euid,
+        auditSessionID: identity.audit_session_id
+    )
+    return liveSecretUseProcessIsLive(process) ? process : nil
+}
+
+private func liveSecretUseProcessIsLive(_ process: LiveSecretUseProcess) -> Bool {
+    func matches(_ identity: AVProcessIdentity) -> Bool {
+        identity.start_usec == process.startUsec
+            && identity.euid == process.effectiveUserID
+            && identity.audit_session_id == process.auditSessionID
+    }
+    var before = AVProcessIdentity()
+    guard av_process_identity(process.pid, &before), matches(before) else { return false }
+    var after = AVProcessIdentity()
+    return av_process_identity(process.pid, &after) && matches(after)
+}
+
+private func retainedExecutions(
+    leadingTo launcherPID: pid_t,
+    in chains: [[RetainedProcessChainNode]]
+) -> [RetainedProcessExecution] {
+    guard let chain = chains.first(where: { $0.contains(where: { $0.pid == launcherPID }) }),
+          let launcherIndex = chain.firstIndex(where: { $0.pid == launcherPID })
+    else { return [] }
+    return chain[..<launcherIndex].compactMap(\.execution)
+}
+
+private func retainedExecutions(
+    leadingTo retainedExecution: RetainedProcessExecution,
+    in chains: [[RetainedProcessChainNode]]
+) -> [RetainedProcessExecution] {
+    guard let chain = chains.first(where: {
+        $0.contains(where: { $0.execution == retainedExecution })
+    }),
+    let retainedIndex = chain.firstIndex(where: { $0.execution == retainedExecution })
+    else { return [] }
+    return chain[...retainedIndex].compactMap(\.execution)
+}
+
+private func executionOrigin(
+    among launchers: [LauncherIdentity],
+    callerPID: pid_t,
+    ancestorFallbackPath: String?
+) -> LauncherIdentity? {
+    launchers.first { $0.pid != callerPID }
+        ?? (ancestorFallbackPath == nil ? launchers.first : nil)
+}
+
+private func launcherFallbackPath(for identity: AVProcessIdentity) -> String? {
+    launcherAncestorStartPIDs(identity)
+        .compactMap(launcherAncestorPath(startingAt:))
+        .max { $0.depth < $1.depth }?
+        .path
+}
+
+private struct ApprovalProcessIdentity {
+    let pid: pid_t
+    let path: String
+    let execution: ApprovalProcessExecution?
+}
+
+private enum ApprovalProcessPosture: Equatable {
+    case meetsRequirements
+    case needsAttention
+    case doesNotMeetRequirements
+}
+
+private struct ApprovalProcessSecurityNode: Identifiable {
+    let pid: pid_t?
+    let path: String
+    let roles: [String]
+    let posture: ApprovalProcessPosture
+    let explanation: String
+    let isAutomicVaultSigned: Bool
+    var invocationName: String? = nil
+    var scriptOperand: String? = nil
+
+    var id: String { "\(pid ?? -1):\(path)" }
+    var executableName: String { URL(fileURLWithPath: path).lastPathComponent }
+    var name: String { invocationName ?? executableName }
+}
+
+// Diagnostic display only: argv (including npm's rewritten process title) is
+// mutable. It must never replace the executable identity or its runtime posture.
+private func approvalProcessInvocationName(path: String, arguments: [String]) -> String? {
+    guard ["node", "nodejs"].contains(URL(fileURLWithPath: path).lastPathComponent),
+          let first = arguments.first
+    else { return nil }
+    if first == "npm" || first.hasPrefix("npm ") { return "npm" }
+    if let script = arguments.dropFirst().first,
+       URL(fileURLWithPath: script).lastPathComponent == "npm-cli.js"
+    {
+        return "npm"
+    }
+    return nil
+}
+
+// Reported context only: neither argv nor a script operand authenticates source code.
+private func approvalProcessScriptOperand(path: String, arguments: [String]) -> String? {
+    let name = URL(fileURLWithPath: path).lastPathComponent
+    let interpreter = ["sh", "bash", "zsh", "fish", "node", "nodejs", "ruby", "perl", "php", "python"]
+        .contains(name) || name.range(of: #"^python[23](\.[0-9]+)*$"#, options: .regularExpression) != nil
+    guard interpreter, arguments.count > 1,
+          !arguments[1].isEmpty, !arguments[1].hasPrefix("-"),
+          URL(fileURLWithPath: arguments[1]).lastPathComponent != "",
+          !(["node", "nodejs"].contains(name) && (arguments[1] == "inspect"
+              || arguments.first == "npm" || arguments.first?.hasPrefix("npm ") == true))
+    else { return nil }
+    return arguments[1]
+}
+
+private struct ApprovalProcessSecurity {
+    let nodes: [ApprovalProcessSecurityNode]
+}
+
+private func isAutomicVaultSigned(
+    _ signing: LiveSigningInfo?,
+    teamIdentifier: String?
+) -> Bool {
+    signing?.isDeveloperID == true && signing?.teamIdentifier == teamIdentifier
+}
+
+private func approvalProcessIdentities(
+    gateClientPID: pid_t,
+    launcherPID: pid_t?
+) -> [ApprovalProcessIdentity] {
+    var caller = AVProcessIdentity()
+    guard av_process_identity(gateClientPID, &caller) else { return [] }
+    let callerNode = ApprovalProcessIdentity(
+        pid: gateClientPID,
+        path: pathString(caller),
+        execution: approvalProcessExecution(pid: gateClientPID, identity: caller)
+    )
+    var chains: [[ApprovalProcessIdentity]] = []
+    for startPID in launcherAncestorStartPIDs(caller) {
+        var currentPID = startPID
+        var seen = Set<pid_t>()
+        var nodes = [callerNode]
+        for _ in 0..<32 {
+            guard currentPID > 1, seen.insert(currentPID).inserted else { break }
+            var identity = AVProcessIdentity()
+            guard av_process_identity(currentPID, &identity) else { break }
+            let path = pathString(identity)
+            if !path.isEmpty {
+                nodes.append(ApprovalProcessIdentity(
+                    pid: currentPID,
+                    path: path,
+                    execution: approvalProcessExecution(pid: currentPID, identity: identity)
+                ))
+            }
+            currentPID = identity.ppid
+        }
+        chains.append(nodes)
+    }
+    let chain = launcherPID.flatMap { launcherPID in
+        chains.first { $0.contains(where: { $0.pid == launcherPID }) }
+    } ?? chains.max(by: { $0.count < $1.count }) ?? [callerNode]
+    // Keep ancestors above the selected Launcher for diagnostic presentation.
+    // This chain never selects the Launcher or supplies authorization authority.
+    return chain
+}
+
+private func mutableCodeExplanation(path: String) -> String? {
+    let name = URL(fileURLWithPath: path).lastPathComponent.lowercased()
+    if ["node", "nodejs", "deno", "bun"].contains(name) {
+        return "Executes mutable JavaScript and dependencies"
+    }
+    if name == "python" || name.hasPrefix("python3") || ["ruby", "perl", "php"].contains(name) {
+        return "Executes mutable source code and dependencies"
+    }
+    if ["sh", "bash", "zsh", "fish"].contains(name) {
+        return "Executes mutable shell code"
+    }
+    if name == "java" {
+        return "Loads mutable bytecode and dependencies"
+    }
+    return nil
+}
+
+private func approvalProcessPosture(
+    signing: LiveSigningInfo?,
+    runtimeProtection: LauncherRuntimeProtection? = nil,
+    identityVerified: Bool = false,
+    mutableCode: String?
+) -> (ApprovalProcessPosture, String) {
+    guard let signing else {
+        return (
+            .doesNotMeetRequirements,
+            ["Code signature could not be verified", mutableCode].compactMap(\.self).joined(separator: "; ")
+        )
+    }
+    let runtimeProtection = runtimeProtection ?? signing.runtimeProtection
+    var findings: [String] = []
+    var posture = ApprovalProcessPosture.meetsRequirements
+    if signing.isAdHoc && !identityVerified {
+        posture = .doesNotMeetRequirements
+        findings.append("Ad hoc signature does not authenticate a publisher")
+    } else {
+        findings.append(identityVerified ? "Verified Launcher identity" : "Valid code signature")
+    }
+    switch runtimeProtection {
+    case .hardened:
+        findings.append("Hardened Runtime")
+    case .hardenedWithLibraryValidationDisabled:
+        if posture == .meetsRequirements { posture = .needsAttention }
+        findings.append("Library validation is disabled")
+    case .hardenedRuntimeMissing:
+        posture = .doesNotMeetRequirements
+        findings.append("Hardened Runtime is not enabled")
+    case .unsafeEntitlements(let entitlements):
+        posture = .doesNotMeetRequirements
+        findings.append("Unsafe entitlements: \(entitlements.joined(separator: ", "))")
+    }
+    if let mutableCode {
+        if posture == .meetsRequirements { posture = .needsAttention }
+        findings.append(mutableCode)
+    }
+    return (posture, findings.joined(separator: "; "))
+}
+
+private func approvalTargetPID(
+    explicitPID: pid_t?,
+    dockerPID: pid_t?,
+    targetPath: String,
+    identities: [ApprovalProcessIdentity]
+) -> pid_t? {
+    explicitPID ?? dockerPID ?? identities.first(where: {
+        !targetPath.isEmpty && normalizedExecutablePath($0.path) == targetPath
+    })?.pid
+}
+
+private func approvalProcessSecurity(
+    request: ApprovalRequest,
+    gateClientPID: pid_t,
+    gateClientPath: String,
+    targetPID: pid_t? = nil,
+    launcher: LauncherIdentity?
+) -> ApprovalProcessSecurity {
+    let automicVaultTeamIdentifier = selfTeamIdentifier()
+    var identities = approvalProcessIdentities(
+        gateClientPID: request.sshPeer?.identity.pid ?? gateClientPID,
+        launcherPID: launcher?.pid
+    )
+    if let launcher,
+       !identities.contains(where: { $0.pid == launcher.pid })
+    {
+        var identity = AVProcessIdentity()
+        let execution = av_process_identity(launcher.pid, &identity)
+            ? approvalProcessExecution(pid: launcher.pid, identity: identity)
+            : nil
+        identities.append(ApprovalProcessIdentity(
+            pid: launcher.pid,
+            path: launcher.path,
+            execution: execution
+        ))
+    }
+    if !identities.contains(where: { $0.pid == gateClientPID }) {
+        var helper = AVProcessIdentity()
+        let execution = av_process_identity(gateClientPID, &helper)
+            ? approvalProcessExecution(pid: gateClientPID, identity: helper) : nil
+        identities.insert(ApprovalProcessIdentity(
+            pid: gateClientPID,
+            path: gateClientPath,
+            execution: execution
+        ), at: 0)
+    }
+
+    let targetPath = normalizedExecutablePath(request.target)
+    // Ancestors above the Launcher are context only, not Target candidates.
+    let launcherIndex = identities.firstIndex { $0.pid == launcher?.pid }
+    let targetCandidates = launcherIndex.map { Array(identities[...$0]) } ?? identities
+    let liveTargetPID = approvalTargetPID(
+        explicitPID: targetPID,
+        dockerPID: request.credentialParent?.pid,
+        targetPath: targetPath,
+        identities: targetCandidates
+    )
+    var nodes = identities.map { identity -> ApprovalProcessSecurityNode in
+        let isLauncher = identity.pid == launcher?.pid
+        let isGateClient = identity.pid == gateClientPID
+        let isTarget = identity.pid == liveTargetPID
+        var roles: [String] = []
+        if isLauncher { roles.append("Verified Launcher") }
+        if isTarget { roles.append(request.keys.isEmpty ? "Target" : "Secret recipient") }
+        if isGateClient { roles.append("Verified Gate Client") }
+        if identity.pid == request.sshPeer?.identity.pid { roles.append("SSH client") }
+        if roles.isEmpty {
+            let isAncestor = launcherIndex.map { boundary in
+                identities[(boundary + 1)...].contains { $0.pid == identity.pid }
+            } ?? false
+            roles.append(isAncestor ? "Observed ancestor" : "Intermediary")
+        }
+
+        let arguments = identity.execution.flatMap { execution -> [String]? in
+            guard !isLauncher, approvalProcessExecutionIsLive(execution),
+                  let arguments = processArgumentVector(identity.pid),
+                  approvalProcessExecutionIsLive(execution)
+            else { return nil }
+            return arguments
+        }
+        let signing = identity.execution.flatMap { execution -> LiveSigningInfo? in
+            guard approvalProcessExecutionIsLive(execution) else { return nil }
+            let signing = liveSigningInfo(pid: identity.pid)
+            return approvalProcessExecutionIsLive(execution) ? signing : nil
+        }
+        let result = approvalProcessPosture(
+            signing: signing,
+            runtimeProtection: isLauncher ? launcher?.runtimeProtection : nil,
+            identityVerified: isLauncher,
+            mutableCode: mutableCodeExplanation(path: identity.path)
+        )
+        return ApprovalProcessSecurityNode(
+            pid: identity.pid,
+            path: identity.path,
+            roles: roles,
+            posture: result.0,
+            explanation: result.1,
+            isAutomicVaultSigned: isAutomicVaultSigned(
+                signing,
+                teamIdentifier: automicVaultTeamIdentifier
+            ),
+            invocationName: arguments.flatMap { approvalProcessInvocationName(path: identity.path, arguments: $0) },
+            scriptOperand: arguments.flatMap { approvalProcessScriptOperand(path: identity.path, arguments: $0) }
+        )
+    }
+
+    if liveTargetPID == nil, !request.target.isEmpty {
+        let signing = executableSigningInfo(path: request.target)
+        let result = approvalProcessPosture(
+            signing: signing,
+            mutableCode: mutableCodeExplanation(path: request.target)
+        )
+        nodes.insert(ApprovalProcessSecurityNode(
+            pid: nil,
+            path: request.target,
+            roles: [request.keys.isEmpty ? "Target (not started)" : "Secret recipient (not started)"],
+            posture: result.0,
+            explanation: result.1,
+            isAutomicVaultSigned: isAutomicVaultSigned(
+                signing,
+                teamIdentifier: automicVaultTeamIdentifier
+            )
+        ), at: 0)
+    }
+    return ApprovalProcessSecurity(nodes: nodes)
+}
+
+private func approvalProcessChain(pid: pid_t) -> String? {
+    let paths = approvalProcessIdentities(gateClientPID: pid, launcherPID: nil).map(\.path)
+    return paths.isEmpty ? nil : processChainLabel(paths: paths)
+}
+
+private func processChainLabel<S: Sequence>(paths: S) -> String where S.Element == String {
+    paths.map { URL(fileURLWithPath: $0).lastPathComponent }.joined(separator: " → ")
+}
+
+private func launcherAncestorPath(startingAt startPID: pid_t) -> (path: String, depth: Int)? {
+    var pid = startPID
+    var seen = Set<pid_t>()
+    var result: (path: String, depth: Int)?
+    for depth in 1...32 {
+        guard pid > 1, seen.insert(pid).inserted else { return result }
+        var identity = AVProcessIdentity()
+        guard av_process_identity(pid, &identity) else { return result }
+        let path = pathString(identity)
+        if !path.isEmpty { result = (path, depth) }
+        pid = identity.ppid
+    }
+    return result
+}
+
+private func launcherIdentities(startingAt startPID: pid_t) -> [LauncherIdentity] {
+    var pid = startPID
+    var seen = Set<pid_t>()
+    var launchers: [LauncherIdentity] = []
+    for _ in 0..<32 {
+        guard pid > 1, seen.insert(pid).inserted else { return launchers }
+
+        var identity = AVProcessIdentity()
+        guard av_process_identity(pid, &identity) else { return launchers }
+        launchers.append(contentsOf: launcherIdentities(pid: pid, identity: identity))
+        pid = identity.ppid
+    }
+    return launchers
+}
+
+private func launcherIdentity(pid: pid_t, identity: AVProcessIdentity) -> LauncherIdentity? {
+    launcherIdentities(pid: pid, identity: identity).first
+}
+
+private func launcherIdentities(pid: pid_t, identity: AVProcessIdentity) -> [LauncherIdentity] {
+    let path = pathString(identity)
+    let launchers: [LauncherIdentity]
+    if let signing = liveSigningInfo(pid: pid) {
+        launchers = launcherIdentities(pid: pid, path: path, signing: signing)
+    } else {
+        guard let signing = executableSigningInfo(path: path) else { return [] }
+        // A path may now name a replacement binary, so it cannot prove the running process is standalone.
+        launchers = launcherIdentities(
+            pid: pid, path: path, signing: signing, allowsStandaloneFallback: false
+        )
+    }
+    var current = AVProcessIdentity()
+    guard av_process_identity(pid, &current), sameProcessIdentity(identity, current),
+          identity.pidversion > 0 || launchers.allSatisfy({ $0.verifiedHelper == nil })
+    else { return [] }
+    return launchers
+}
+
+private func launcherIdentity(
+    pid: pid_t,
+    path: String,
+    signing: LiveSigningInfo,
+    appSigning: (URL) -> StaticSigningInfo? = staticSigningInfo,
+    bundleExecutableURL: (URL) -> URL? = { Bundle(url: $0)?.executableURL }
+) -> LauncherIdentity? {
+    launcherIdentities(
+        pid: pid,
+        path: path,
+        signing: signing,
+        appSigning: appSigning,
+        bundleExecutableURL: bundleExecutableURL
+    ).first
+}
+
+private func launcherIdentities(
+    pid: pid_t,
+    path: String,
+    signing: LiveSigningInfo,
+    appSigning: (URL) -> StaticSigningInfo? = staticSigningInfo,
+    bundleExecutableURL: (URL) -> URL? = { Bundle(url: $0)?.executableURL },
+    allowsStandaloneFallback: Bool = true,
+    helperConfiguration: VerifiedLauncherHelperConfiguration? = nil,
+    installedAppURL: (String) -> URL? = {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0)
+    },
+    helperSigning: (VerifiedLauncherHelperAssociation, pid_t) -> StaticSigningInfo? = {
+        verifiedLauncherHelperSigningInfo($0, pid: $1)
+    }
+) -> [LauncherIdentity] {
+    // Gate plumbing is never the operation's Launcher.
+    guard signing.identifier != "com.automicvault.av-gpg" else { return [] }
+    var seenContainingApps = Set<String>()
+    let containingAppURLs = (
+        appBundleURLs(containing: path)
+        + appBundleURLs(containing: signing.mainExecutable)
+    ).filter { seenContainingApps.insert($0.path).inserted }
+    var seenApps = Set<String>()
+    let appURLs = (
+        containingAppURLs.filter {
+            appBundleMatchesMainExecutable(
+                $0,
+                executablePaths: [path, signing.mainExecutable],
+                bundleExecutableURL: bundleExecutableURL
+            )
+        }
+        + [associatedAppBundleURL(path: path, signing: signing)].compactMap { $0 }
+    ).filter { seenApps.insert($0.path).inserted }
+    let helperAssociation = verifiedLauncherHelperAssociation(
+        path: path,
+        signing: signing,
+        containingAppURLs: containingAppURLs,
+        configuration: helperConfiguration,
+        installedAppURL: installedAppURL
+    )
+    let claimsLauncherBundleIdentity = signing.identifier.hasPrefix(launcherBundleIdentifierPrefix)
+        || containingAppURLs.contains(where: launcherBundleClaimsReservedIdentity)
+    if claimsLauncherBundleIdentity {
+        guard let appURL = containingAppURLs.first(where: {
+            launcherBundleAppURL(containing: $0.path) == $0
+        }),
+            let liveCodeIdentifier = liveCodeIdentity(pid: pid),
+            let enrollment = try? verifyLauncherBundleProcess(
+                at: appURL,
+                executableURL: URL(fileURLWithPath: path),
+                liveIdentifier: signing.identifier,
+                liveCodeIdentifier: liveCodeIdentifier,
+                liveRuntimeProtection: signing.runtimeProtection
+            )
+        else { return [] }
+        return [LauncherIdentity(
+            pid: pid,
+            path: path,
+            identifier: enrollment.bundleIdentifier,
+            teamIdentifier: signing.teamIdentifier,
+            designatedRequirement: enrollment.launcherRequirement,
+            runtimeProtection: signing.runtimeProtection,
+            appURL: appURL
+        )]
+    }
+    guard !signing.isAdHoc else { return [] }
+    var apps: [LauncherIdentity] = appURLs.compactMap { appURL in
+        guard let app = appSigning(appURL) else { return nil }
+        return LauncherIdentity(
+            pid: pid,
+            path: path,
+            identifier: app.identifier,
+            teamIdentifier: app.teamIdentifier,
+            designatedRequirement: app.designatedRequirement,
+            runtimeProtection: signing.runtimeProtection,
+            appURL: appURL
+        )
+    }
+    if let helperAssociation,
+       seenApps.insert(helperAssociation.appURL.path).inserted,
+       let app = helperSigning(helperAssociation, pid) {
+        // Only a fully verified association may take precedence over the helper bundle.
+        apps.insert(LauncherIdentity(
+            pid: pid,
+            path: path,
+            identifier: app.identifier,
+            teamIdentifier: app.teamIdentifier,
+            designatedRequirement: app.designatedRequirement,
+            runtimeProtection: signing.runtimeProtection,
+            appURL: helperAssociation.appURL,
+            verifiedHelper: helperAssociation.helper
+        ), at: 0)
+    }
+    if !apps.isEmpty { return apps }
+    guard allowsStandaloneFallback,
+          signing.isDeveloperID,
+          signing.identifier != "unknown",
+          signing.teamIdentifier != "unknown"
+    else { return [] }
+    return [LauncherIdentity(
+        pid: pid,
+        path: path,
+        identifier: signing.identifier,
+        teamIdentifier: signing.teamIdentifier,
+        designatedRequirement: signing.designatedRequirement,
+        runtimeProtection: signing.runtimeProtection,
+        isStandalone: true
+    )]
+}
+
+private func launcherBundleIntegrityError(for identity: AVProcessIdentity) -> String? {
+    for startPID in launcherAncestorStartPIDs(identity) {
+        var pid = startPID
+        var seen = Set<pid_t>()
+        for _ in 0..<32 {
+            guard pid > 1, seen.insert(pid).inserted else { break }
+            var ancestor = AVProcessIdentity()
+            guard av_process_identity(pid, &ancestor) else { break }
+            let path = pathString(ancestor)
+            guard let signing = liveSigningInfo(pid: pid) else {
+                pid = ancestor.ppid
+                continue
+            }
+            var seenApps = Set<String>()
+            let appURLs = (
+                appBundleURLs(containing: path)
+                + appBundleURLs(containing: signing.mainExecutable)
+                + [associatedAppBundleURL(path: path, signing: signing)].compactMap { $0 }
+            ).filter { seenApps.insert($0.path).inserted }
+            let claimsLauncherBundleIdentity = signing.identifier.hasPrefix(
+                launcherBundleIdentifierPrefix
+            ) || appURLs.contains(where: launcherBundleClaimsReservedIdentity)
+            if claimsLauncherBundleIdentity {
+                guard let appURL = appURLs.first(where: {
+                    launcherBundleAppURL(containing: $0.path) == $0
+                }),
+                    let codeIdentifier = liveCodeIdentity(pid: pid)
+                else { return "Launcher Bundle is outside its managed location" }
+                do {
+                    _ = try verifyLauncherBundleProcess(
+                        at: appURL,
+                        executableURL: URL(fileURLWithPath: path),
+                        liveIdentifier: signing.identifier,
+                        liveCodeIdentifier: codeIdentifier,
+                        liveRuntimeProtection: signing.runtimeProtection
+                    )
+                } catch {
+                    return "Launcher Bundle denied: \(error.localizedDescription)"
+                }
+            }
+            pid = ancestor.ppid
+        }
+    }
+    return nil
+}
+
+private extension ApprovalServiceOperation {
+    var requiresLauncherBundleIntegrity: Bool {
+        switch self {
+        case .openWindow, .awsHelperVersion, .dockerHelperVersion, .goatHelperVersion,
+             .ordercliHelperVersion, .openhueHelperVersion, .plumberHelperVersion, .uaaHelperVersion,
+             .railwayHelperVersion, .oxideHelperVersion, .terraformHelperVersion,
+             .fastlyHelperVersion,
+             .sqlcmdHelperVersion,
+             .aliyunHelperVersion, .wakatimeHelperVersion, .rcloneHelperVersion,
+             .kubectlHelperVersion, .uvHelperVersion, .gitHelperVersion: false
+        default: true
+        }
+    }
+}
+
+private struct LiveSigningInfo {
+    let identifier: String
+    let teamIdentifier: String
+    let designatedRequirement: String
+    let mainExecutable: String
+    let isAdHoc: Bool
+    let runtimeProtection: LauncherRuntimeProtection
+    let isDeveloperID: Bool
+}
+
+private struct StaticSigningInfo {
+    let identifier: String
+    let teamIdentifier: String
+    let designatedRequirement: String
+}
+
+private struct VerifiedLauncherHelperAssociation {
+    let helper: VerifiedLauncherHelper
+    let appURL: URL
+    let executableURL: URL
+    var isOutsideBundle = false
+}
+
+private func runtimeProtection(_ dictionary: [CFString: Any]) -> LauncherRuntimeProtection {
+    launcherRuntimeProtection(signingInformation: dictionary)
+}
+
+private struct LauncherAppVerificationFailure {
+    let appName: String
+    let resourcesUnreadable: Bool
+
+    var explanation: String {
+        if resourcesUnreadable {
+            return "Automic authorization was unavailable because \(appName) contains signed app resources that Automic Vault cannot read, so its identity could not be securely verified. Approval is required to fail closed."
+        }
+        return "Automic authorization was unavailable because \(appName)’s code signature could not be securely verified. Approval is required to fail closed."
+    }
+}
+
+private func liveSigningInfo(pid: pid_t) -> LiveSigningInfo? {
+    var code: SecCode?
+    let attributes = [kSecGuestAttributePid as String: NSNumber(value: pid)] as CFDictionary
+    guard SecCodeCopyGuestWithAttributes(nil, attributes, [], &code) == errSecSuccess,
+          let code
+    else {
+        return nil
+    }
+    guard SecCodeCheckValidity(code, [], nil) == errSecSuccess else { return nil }
+
+    var info: CFDictionary?
+    let flags = SecCSFlags(
+        rawValue: kSecCSSigningInformation | kSecCSRequirementInformation | kSecCSDynamicInformation
+    )
+    // The C API accepts live SecCode objects despite importing as SecStaticCode in Swift.
+    let inspectableCode = unsafeBitCast(code, to: SecStaticCode.self)
+    guard SecCodeCopySigningInformation(inspectableCode, flags, &info) == errSecSuccess,
+          let dictionary = info as? [CFString: Any],
+          let requirementValue = dictionary[kSecCodeInfoDesignatedRequirement]
+    else {
+        return nil
+    }
+    let requirement = requirementValue as! SecRequirement
+    guard let requirementText = requirementString(requirement) else { return nil }
+
+    let executable = (dictionary[kSecCodeInfoMainExecutable] as? URL)?.path ?? ""
+    let signatureFlags = (dictionary[kSecCodeInfoFlags] as? NSNumber)?.uint32Value ?? 0
+    return LiveSigningInfo(
+        identifier: dictionary[kSecCodeInfoIdentifier] as? String ?? "unknown",
+        teamIdentifier: dictionary[kSecCodeInfoTeamIdentifier] as? String ?? "unknown",
+        designatedRequirement: requirementText,
+        mainExecutable: executable,
+        isAdHoc: signatureFlags & secCodeSignatureAdHoc != 0,
+        runtimeProtection: runtimeProtection(dictionary),
+        isDeveloperID: satisfiesDeveloperIDRequirement {
+            SecCodeCheckValidity(code, [], $0)
+        }
+    )
+}
+
+private func liveProcessHasNoEntitlements(pid: pid_t) -> Bool {
+    var code: SecCode?
+    let attributes = [kSecGuestAttributePid as String: NSNumber(value: pid)] as CFDictionary
+    guard SecCodeCopyGuestWithAttributes(nil, attributes, [], &code) == errSecSuccess,
+          let code,
+          SecCodeCheckValidity(code, [], nil) == errSecSuccess
+    else { return false }
+    var info: CFDictionary?
+    let inspectableCode = unsafeBitCast(code, to: SecStaticCode.self)
+    guard SecCodeCopySigningInformation(
+        inspectableCode,
+        SecCSFlags(rawValue: kSecCSSigningInformation | kSecCSDynamicInformation),
+        &info
+    ) == errSecSuccess,
+        let dictionary = info as? [CFString: Any]
+    else { return false }
+    return (dictionary[kSecCodeInfoEntitlementsDict] as? [String: Any] ?? [:]).isEmpty
+}
+
+private func liveCodeIdentity(pid: pid_t) -> Data? {
+    var code: SecCode?
+    let attributes = [kSecGuestAttributePid as String: NSNumber(value: pid)] as CFDictionary
+    guard SecCodeCopyGuestWithAttributes(nil, attributes, [], &code) == errSecSuccess,
+          let code,
+          SecCodeCheckValidity(code, [], nil) == errSecSuccess
+    else { return nil }
+
+    var staticCode: SecStaticCode?
+    guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess,
+          let staticCode
+    else { return nil }
+    var info: CFDictionary?
+    guard SecCodeCopySigningInformation(staticCode, [], &info) == errSecSuccess,
+          let dictionary = info as? [CFString: Any]
+    else { return nil }
+    return dictionary[kSecCodeInfoUnique] as? Data
+}
+
+private func executableSigningInfo(path: String) -> LiveSigningInfo? {
+    var staticCode: SecStaticCode?
+    guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: path) as CFURL, [], &staticCode) == errSecSuccess,
+          let staticCode,
+          SecStaticCodeCheckValidity(staticCode, [], nil) == errSecSuccess
+    else {
+        return nil
+    }
+
+    var info: CFDictionary?
+    let flags = SecCSFlags(rawValue: kSecCSSigningInformation | kSecCSRequirementInformation)
+    guard SecCodeCopySigningInformation(staticCode, flags, &info) == errSecSuccess,
+          let dictionary = info as? [CFString: Any],
+          let requirementValue = dictionary[kSecCodeInfoDesignatedRequirement]
+    else {
+        return nil
+    }
+    let requirement = requirementValue as! SecRequirement
+    guard let requirementText = requirementString(requirement) else { return nil }
+
+    let executable = (dictionary[kSecCodeInfoMainExecutable] as? URL)?.path ?? path
+    let signatureFlags = (dictionary[kSecCodeInfoFlags] as? NSNumber)?.uint32Value ?? 0
+    return LiveSigningInfo(
+        identifier: dictionary[kSecCodeInfoIdentifier] as? String ?? "unknown",
+        teamIdentifier: dictionary[kSecCodeInfoTeamIdentifier] as? String ?? "unknown",
+        designatedRequirement: requirementText,
+        mainExecutable: executable,
+        isAdHoc: signatureFlags & secCodeSignatureAdHoc != 0,
+        runtimeProtection: runtimeProtection(dictionary),
+        isDeveloperID: satisfiesDeveloperIDRequirement {
+            SecStaticCodeCheckValidity(staticCode, [], $0)
+        }
+    )
+}
+
+private func staticSigningInfo(url: URL) -> StaticSigningInfo? {
+    var staticCode: SecStaticCode?
+    guard SecStaticCodeCreateWithPath(url as CFURL, [], &staticCode) == errSecSuccess,
+          let staticCode,
+          validateAppBundleMainExecutable(staticCode) == errSecSuccess
+    else {
+        return nil
+    }
+
+    return staticSigningInfo(staticCode)
+}
+
+private func staticSigningInfo(_ staticCode: SecStaticCode) -> StaticSigningInfo? {
+    var info: CFDictionary?
+    let flags = SecCSFlags(rawValue: kSecCSSigningInformation | kSecCSRequirementInformation)
+    guard SecCodeCopySigningInformation(staticCode, flags, &info) == errSecSuccess,
+          let dictionary = info as? [CFString: Any],
+          let requirementValue = dictionary[kSecCodeInfoDesignatedRequirement],
+          ((dictionary[kSecCodeInfoFlags] as? NSNumber)?.uint32Value ?? 0) & secCodeSignatureAdHoc == 0
+    else {
+        return nil
+    }
+    let requirement = requirementValue as! SecRequirement
+    guard let requirementText = requirementString(requirement) else { return nil }
+
+    return StaticSigningInfo(
+        identifier: dictionary[kSecCodeInfoIdentifier] as? String ?? "unknown",
+        teamIdentifier: dictionary[kSecCodeInfoTeamIdentifier] as? String ?? "unknown",
+        designatedRequirement: requirementText
+    )
+}
+
+private func launcherAppVerificationFailure(
+    for identity: AVProcessIdentity
+) -> LauncherAppVerificationFailure? {
+    var checkedApps = Set<String>()
+    for startPID in launcherAncestorStartPIDs(identity) {
+        var pid = startPID
+        var seenPIDs = Set<pid_t>()
+        for _ in 0..<32 {
+            guard pid > 1, seenPIDs.insert(pid).inserted else { break }
+            var ancestor = AVProcessIdentity()
+            guard av_process_identity(pid, &ancestor) else { break }
+            let path = pathString(ancestor)
+            if let signing = liveSigningInfo(pid: pid) ?? executableSigningInfo(path: path) {
+                let containingAppURLs = (
+                    appBundleURLs(containing: path)
+                    + appBundleURLs(containing: signing.mainExecutable)
+                )
+                let helperAssociation = verifiedLauncherHelperAssociation(
+                    path: path,
+                    signing: signing,
+                    containingAppURLs: containingAppURLs
+                )
+                if let helperAssociation,
+                   checkedApps.insert(helperAssociation.appURL.path).inserted,
+                   verifiedLauncherHelperSigningInfo(helperAssociation, pid: pid) == nil {
+                    return LauncherAppVerificationFailure(
+                        appName: helperAssociation.helper.appName,
+                        resourcesUnreadable: false
+                    )
+                }
+                let appURLs = containingAppURLs.filter {
+                    $0.path != helperAssociation?.appURL.path
+                        && appBundleMatchesMainExecutable(
+                            $0,
+                            executablePaths: [path, signing.mainExecutable]
+                        )
+                }
+                    + [associatedAppBundleURL(path: path, signing: signing)].compactMap { $0 }
+                for appURL in appURLs where checkedApps.insert(appURL.path).inserted {
+                    if let failure = appBundleVerificationFailure(appURL) { return failure }
+                }
+            }
+            pid = ancestor.ppid
+        }
+    }
+    return nil
+}
+
+private func appBundleVerificationFailure(_ url: URL) -> LauncherAppVerificationFailure? {
+    var staticCode: SecStaticCode?
+    guard SecStaticCodeCreateWithPath(url as CFURL, [], &staticCode) == errSecSuccess,
+          let staticCode
+    else {
+        return nil
+    }
+    let status = validateAppBundleMainExecutable(staticCode)
+    guard status != errSecSuccess else { return nil }
+    let name = url.deletingPathExtension().lastPathComponent
+    let executableOnly = SecCSFlags(
+        rawValue: kSecCSCheckAllArchitectures | kSecCSDoNotValidateResources
+    )
+    let resourcesUnreadable = status == OSStatus(100_000 + EACCES)
+        && SecStaticCodeCheckValidity(staticCode, executableOnly, nil) == errSecSuccess
+    return LauncherAppVerificationFailure(
+        appName: name,
+        resourcesUnreadable: resourcesUnreadable
+    )
+}
+
+// SecRequirement is immutable but is not annotated Sendable by Security.framework.
+nonisolated(unsafe) private let developerIDRequirement: SecRequirement? = {
+    var requirement: SecRequirement?
+    let source = """
+    anchor apple generic and \
+    certificate 1[field.1.2.840.113635.100.6.2.6] exists and \
+    certificate leaf[field.1.2.840.113635.100.6.1.13] exists
+    """
+    guard SecRequirementCreateWithString(source as CFString, [], &requirement) == errSecSuccess,
+          let requirement
+    else { return nil }
+    return requirement
+}()
+
+func satisfiesDeveloperIDRequirement(
+    _ validate: (SecRequirement) -> OSStatus
+) -> Bool {
+    guard let developerIDRequirement else { return false }
+    return validate(developerIDRequirement) == errSecSuccess
+}
+
+private func requirementString(_ requirement: SecRequirement) -> String? {
+    var text: CFString?
+    guard SecRequirementCopyString(requirement, [], &text) == errSecSuccess,
+          let text
+    else {
+        return nil
+    }
+    return text as String
+}
+
+private func isAppBundleExecutable(_ path: String) -> Bool {
+    path.range(of: ".app/Contents/", options: [.caseInsensitive]) != nil
+}
+
+private func appBundleURL(containing path: String) -> URL? {
+    appBundleURLs(containing: path).first
+}
+
+private func appBundleURLs(containing path: String) -> [URL] {
+    var url = URL(fileURLWithPath: path).standardizedFileURL
+    var apps: [URL] = []
+    while url.path != "/" {
+        if url.pathExtension.caseInsensitiveCompare("app") == .orderedSame {
+            apps.append(url)
+        }
+        url.deleteLastPathComponent()
+    }
+    return apps
+}
+
+private func appBundleMatchesMainExecutable(
+    _ appURL: URL,
+    executablePaths: [String],
+    bundleExecutableURL: (URL) -> URL? = { Bundle(url: $0)?.executableURL }
+) -> Bool {
+    guard let bundleExecutableURL = bundleExecutableURL(appURL) else { return false }
+    let bundleExecutablePath = bundleExecutableURL.standardizedFileURL.resolvingSymlinksInPath().path
+    return executablePaths.contains {
+        URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath().path
+            == bundleExecutablePath
+    }
+}
+
+private func associatedAppBundleURL(path: String, signing: LiveSigningInfo) -> URL? {
+    guard signing.identifier == "com.automicvault.vaultty.session-bridge",
+          path.hasSuffix("/Library/Application Support/Vaultty/vaultty-session-bridge")
+    else {
+        return nil
+    }
+    return NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.automicvault.vaultty")
+        ?? URL(fileURLWithPath: "/Applications/Vaultty.app")
+}
+
+private func verifiedLauncherHelperAssociation(
+    path: String,
+    signing: LiveSigningInfo,
+    containingAppURLs: [URL]? = nil,
+    helpers: [VerifiedLauncherHelper]? = nil,
+    configuration: VerifiedLauncherHelperConfiguration? = nil,
+    bundleIdentifier: (URL) -> String? = { Bundle(url: $0)?.bundleIdentifier },
+    installedAppURL: (String) -> URL? = {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0)
+    }
+) -> VerifiedLauncherHelperAssociation? {
+    guard signing.isDeveloperID, !signing.isAdHoc,
+          signing.runtimeProtection.allowsSecretGateAccess else { return nil }
+    let executablePath = signing.mainExecutable.isEmpty ? path : signing.mainExecutable
+    let executableURL = URL(fileURLWithPath: executablePath)
+        .standardizedFileURL
+        .resolvingSymlinksInPath()
+    let appURLs = containingAppURLs ?? appBundleURLs(containing: executableURL.path)
+    let configuration = configuration ?? loadVerifiedLauncherHelperConfiguration()
+    let helpers = helpers ?? configuration.helpers
+    for helper in helpers where configuration.isEnabled(helper)
+        && helper.helperSigningIdentifier == signing.identifier
+        && helper.helperTeamIdentifier == signing.teamIdentifier
+    {
+        let containingAppURL = appURLs.first {
+            bundleIdentifier($0) == helper.appBundleIdentifier
+        }
+        let allowsOutsideBundle = configuration.allowedOutsideBundleHelperIDs.contains(helper.id)
+        guard let appURL = containingAppURL
+            ?? (allowsOutsideBundle ? installedAppURL(helper.appBundleIdentifier) : nil)
+        else { continue }
+        let canonicalAppURL = appURL.standardizedFileURL.resolvingSymlinksInPath()
+        let isOutsideBundle = !executableURL.path.hasPrefix(canonicalAppURL.path + "/")
+        guard !isOutsideBundle || allowsOutsideBundle else { continue }
+        if !isOutsideBundle, let relativePath = helper.relativePath {
+            let expectedURL = appURL.appendingPathComponent(relativePath)
+                .standardizedFileURL
+                .resolvingSymlinksInPath()
+            guard expectedURL == executableURL else { continue }
+        }
+        return VerifiedLauncherHelperAssociation(
+            helper: helper,
+            appURL: canonicalAppURL,
+            executableURL: executableURL,
+            isOutsideBundle: isOutsideBundle
+        )
+    }
+    return nil
+}
+
+private func verifiedLauncherHelperSigningInfo(
+    _ association: VerifiedLauncherHelperAssociation,
+    pid: pid_t
+) -> StaticSigningInfo? {
+    var before = AVProcessIdentity()
+    guard av_process_identity(pid, &before), before.pidversion > 0,
+          let codeIdentity = liveExecutableCodeIdentity(pid: pid, executableURL: association.executableURL),
+          let app = verifiedLauncherHelperAppSigningInfo(association)
+    else { return nil }
+    var after = AVProcessIdentity()
+    guard liveExecutableCodeIdentity(pid: pid, executableURL: association.executableURL) == codeIdentity,
+          av_process_identity(pid, &after), sameProcessIdentity(before, after)
+    else { return nil }
+    return app
+}
+
+private func verifiedLauncherHelperAppSigningInfo(
+    _ association: VerifiedLauncherHelperAssociation
+) -> StaticSigningInfo? {
+    var staticCode: SecStaticCode?
+    guard SecStaticCodeCreateWithPath(
+        association.appURL as CFURL,
+        [],
+        &staticCode
+    ) == errSecSuccess,
+        let staticCode,
+        let requirement = verifiedLauncherHelperAppRequirement(association.helper)
+    else { return nil }
+
+    let validation = association.isOutsideBundle
+        ? validateAppBundleMainExecutable(staticCode, requirement: requirement)
+        : validateAppBundleResource(
+            staticCode,
+            resourceURL: association.executableURL,
+            requirement: requirement
+        )
+    guard validation == errSecSuccess,
+          let app = staticSigningInfo(staticCode),
+          app.identifier == association.helper.appBundleIdentifier,
+          app.teamIdentifier == association.helper.appTeamIdentifier
+    else { return nil }
+    return app
+}
+
+private func verifiedLauncherHelperAppRequirement(
+    _ helper: VerifiedLauncherHelper
+) -> SecRequirement? {
+    let source = """
+    identifier "\(helper.appBundleIdentifier)" and \
+    anchor apple generic and \
+    certificate 1[field.1.2.840.113635.100.6.2.6] exists and \
+    certificate leaf[field.1.2.840.113635.100.6.1.13] exists and \
+    certificate leaf[subject.OU] = "\(helper.appTeamIdentifier)"
+    """
+    var requirement: SecRequirement?
+    guard SecRequirementCreateWithString(
+        source as CFString,
+        [],
+        &requirement
+    ) == errSecSuccess else { return nil }
+    return requirement
+}
+
+private func staticCodeIdentity(_ url: URL) -> Data? {
+    var staticCode: SecStaticCode?
+    guard SecStaticCodeCreateWithPath(url as CFURL, [], &staticCode) == errSecSuccess,
+          let staticCode,
+          SecStaticCodeCheckValidity(staticCode, [], nil) == errSecSuccess
+    else { return nil }
+    var info: CFDictionary?
+    guard SecCodeCopySigningInformation(staticCode, [], &info) == errSecSuccess,
+          let dictionary = info as? [CFString: Any]
+    else { return nil }
+    return dictionary[kSecCodeInfoUnique] as? Data
+}
+
+private func scriptApproval(for request: ApprovalRequest) -> ScriptApproval? {
+    guard let script = request.shebangScript else { return nil }
+    let url = script.hasPrefix("/")
+        ? URL(fileURLWithPath: script)
+        : URL(fileURLWithPath: request.cwd).appendingPathComponent(script)
+    let path = url.standardizedFileURL.resolvingSymlinksInPath().path
+    guard let data = request.scriptData ?? (try? readBlessedScript(path: path)) else {
+        return nil
+    }
+    let checksum = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    return ScriptApproval(path: path, checksum: checksum)
+}
+
+private func scriptExecutionDeclaration(for request: ApprovalRequest) -> BlessedScriptDeclaration? {
+    guard request.op == "inject",
+          request.shebangScript != nil,
+          let data = request.scriptData,
+          let declaration = try? blessedScriptDeclaration(data: data),
+          declaration.matchesExecution(
+              keys: request.keys,
+              target: request.target,
+              replaceExistingEnv: request.replaceExistingEnv,
+              allowMissingKeys: request.allowMissingKeys,
+              snapshotIncompatibleInterpreter: request.snapshotIncompatibleInterpreter
+          )
+    else { return nil }
+    return declaration
+}
+
+private func scriptStartingWithoutApproval(
+    for request: ApprovalRequest
+) -> BlessedScriptDeclaration? {
+    guard request.keys.isEmpty,
+          let declaration = scriptExecutionDeclaration(for: request),
+          declaration.manifest.hasEmptyCapabilityCeiling,
+          declaration.snapshotIncompatibleInterpreter == nil
+    else { return nil }
+    return declaration
+}
+
+private final class ApprovalPanel: NSPanel {
+    private var allowsKey = false
+
+    override var canBecomeKey: Bool { allowsKey }
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .leftMouseDown, !isKeyWindow {
+            allowsKey = true
+            if isVisible {
+                makeKey()
+            }
+        }
+        super.sendEvent(event)
+    }
+}
+
+private final class ApprovalPanelDragView: NSView {
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
+    }
+}
+
+private struct ApprovalPanelDragRegion: NSViewRepresentable {
+    func makeNSView(context: Context) -> ApprovalPanelDragView { ApprovalPanelDragView() }
+    func updateNSView(_ nsView: ApprovalPanelDragView, context: Context) {}
+}
+
+@MainActor
+private func makeApprovalPanel() -> ApprovalPanel {
+    let panel = ApprovalPanel(
+        contentRect: NSRect(x: 0, y: 0, width: 560, height: 660),
+        styleMask: [.borderless, .nonactivatingPanel],
+        backing: .buffered,
+        defer: false
+    )
+    panel.backgroundColor = .clear
+    panel.isOpaque = false
+    panel.hasShadow = true
+    panel.isMovableByWindowBackground = false
+    panel.isFloatingPanel = true
+    panel.hidesOnDeactivate = false
+    panel.level = .modalPanel
+    panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+    return panel
+}
+
+@MainActor
+private func fitApprovalPanel(_ panel: NSPanel, maximumHeight: CGFloat, animate: Bool) {
+    guard let contentView = panel.contentView else { return }
+    contentView.layoutSubtreeIfNeeded()
+    var size = contentView.fittingSize
+    size.height = min(size.height, maximumHeight)
+    var frame = panel.frame
+    let top = frame.maxY
+    frame.size = size
+    frame.origin.y = top - size.height
+    if let visibleFrame = panel.screen?.visibleFrame ?? NSScreen.main?.visibleFrame {
+        frame.origin.y = max(visibleFrame.minY, min(frame.origin.y, visibleFrame.maxY - size.height))
+    }
+    panel.setFrame(frame, display: true, animate: animate)
+}
+
+let approvalPresentationDidAbort = Notification.Name("AutomicVaultApprovalPresentationDidAbort")
+
+@MainActor
+private enum ActiveApprovalPrompt {
+    static var current: ApprovalPromptState?
+    static var abortGeneration: UInt64 = 0
+
+    static func abort() {
+        abortGeneration += 1
+        NotificationCenter.default.post(name: approvalPresentationDidAbort, object: nil)
+        current?.resolve(.canceled)
+        HumanApprovalQueue.shared.cancelAllPending()
+    }
+}
+
+@MainActor
+func abortActiveApprovalPrompt() {
+    ActiveApprovalPrompt.abort()
+}
+
+enum ApprovalDecisionSource {
+    case standardMac
+    case touchID
+    case phone
+    case programmatic
+}
+
+private final class ApprovalPromptState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var hasDecision = false
+    private var continuation: CheckedContinuation<ApprovalDecision, Never>?
+    weak var panel: NSPanel?
+    var remoteRequestID: UUID?
+    var usesIPhoneApproval: Bool = false
+    var presentationToken: UUID?
+    weak var cancellation: ApprovalCancellation?
+
+    init(continuation: CheckedContinuation<ApprovalDecision, Never>, panel: NSPanel) {
+        self.continuation = continuation
+        self.panel = panel
+    }
+
+    @MainActor
+    @discardableResult
+    func resolve(
+        _ result: ApprovalDecision,
+        source: ApprovalDecisionSource = .programmatic,
+        phoneEnabled: Bool = PhoneApprovalCoordinator.shared.isEnabled,
+        touchIDEnabled: Bool = TouchIDApproval.isEnabled
+    ) -> Bool {
+        let shouldResume: Bool = lock.withLock {
+            guard !hasDecision else { return false }
+            hasDecision = true
+            return true
+        }
+        guard shouldResume else { return false }
+
+        var finalResult = result
+        if result == .approved || result == .alwaysApproved || result == .temporaryWriteAccess {
+            switch source {
+            case .standardMac:
+                if phoneEnabled || touchIDEnabled {
+                    finalResult = .interrupted
+                }
+            case .touchID:
+                if !touchIDEnabled {
+                    finalResult = .interrupted
+                }
+            case .phone:
+                if !phoneEnabled {
+                    finalResult = .interrupted
+                }
+            case .programmatic:
+                break
+            }
+        }
+
+        if ActiveApprovalPrompt.current === self {
+            ActiveApprovalPrompt.current = nil
+        }
+
+        if let token = presentationToken {
+            cancellation?.stopObserving(id: token)
+        }
+        if usesIPhoneApproval, let remoteRequestID {
+            PhoneApprovalCoordinator.shared.cancel(remoteRequestID)
+        }
+        #if !DEBUG
+        if finalResult == .approved || finalResult == .alwaysApproved {
+            PostHogTelemetry.shared.captureExplicitApproval()
+        }
+        #endif
+        if finalResult == .rebless,
+           let view = panel?.contentView as? NSHostingView<ApprovalPromptView> {
+            view.rootView.isReviewingBlessing = true
+        } else {
+            panel?.orderOut(nil)
+            panel?.contentView = nil // Tear down any pending embedded biometric attempt.
+        }
+        continuation?.resume(returning: finalResult)
+        continuation = nil
+        return true
+    }
+
+    @MainActor
+    func denyTemporarily(
+        requirement: String, launcherName: String, scope: TemporaryLauncherDenialScope,
+        source: ApprovalDecisionSource,
+        phoneEnabled: Bool = PhoneApprovalCoordinator.shared.isEnabled
+    ) {
+        guard ActiveApprovalPrompt.current === self, cancellation?.isCanceled != true else { return }
+        if case .phone = source, !phoneEnabled { return }
+        // Claim the decision before publishing a denial notification. No suspension is
+        // allowed between resolving this prompt and installing its retained Mac scope.
+        guard resolve(.denied, source: source) else { return }
+        TemporaryLauncherDenials.shared.deny(requirement, launcherName: launcherName, scope: scope)
+    }
+}
+
+func denialActionLauncher(
+    displayedLauncher: LauncherIdentity?,
+    attributedLaunchers: [LauncherIdentity]
+) -> LauncherIdentity? {
+    ((displayedLauncher.map { [$0] } ?? []) + attributedLaunchers).first {
+        $0.runtimeProtection.allowsSecretGateAccess && !$0.designatedRequirement.isEmpty
+    }
+}
+
+// A Blessing review is a separate authority change. Release the execution
+// prompt's queue slot while reviewing, but keep its immutable request pending.
+@MainActor
+private func approvalWithBlessingReview(
+    cancellation: ApprovalCancellation,
+    review: (@MainActor (@escaping @MainActor () -> Void) -> Void)?,
+    present: @MainActor () async -> ApprovalDecision
+) async -> ApprovalDecision {
+    let generation = ActiveApprovalPrompt.abortGeneration
+    while true {
+        guard !cancellation.isCanceled else { return .canceled }
+        guard ActiveApprovalPrompt.abortGeneration == generation else { return .interrupted }
+        let decision = await present()
+        guard decision == .rebless else { return decision }
+        guard ActiveApprovalPrompt.abortGeneration == generation,
+              let review else { return .interrupted }
+        let observerID = UUID()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            var pending: CheckedContinuation<Void, Never>? = continuation
+            let finish: @MainActor @Sendable () -> Void = {
+                let continuation = pending
+                pending = nil
+                continuation?.resume()
+            }
+            guard cancellation.observe(id: observerID, finish) else {
+                finish()
+                return
+            }
+            review(finish)
+        }
+        cancellation.stopObserving(id: observerID)
+        // Review approval grants no execution approval. Present again through
+        // the ordinary denial, cancellation, and release checks.
+    }
+}
+
+@MainActor
+private func showApprovalAlert(
+    request: ApprovalRequest,
+    callerPath: String,
+    pid: pid_t,
+    targetPID: pid_t? = nil,
+    signing: SigningInfo,
+    scriptApproval: ScriptApproval?,
+    blessing: BlessedScriptPromptContext? = nil,
+    launcher: LauncherIdentity?,
+    denialLaunchers: [LauncherIdentity] = [],
+    launcherFallbackPath: String,
+    automaticApprovalExplanation: String?,
+    accessLevel: String? = nil,
+    temporaryGrantCandidate: TemporaryAccessGrantCandidate? = nil,
+    temporaryGrantUnavailableReason: String? = nil,
+    allowsPersistentApproval: Bool = false,
+    persistentApprovalLabel: String = "Always Allow",
+    classification: SecretGateRequestClassification? = nil,
+    denialGate: SecretGate? = nil,
+    cancellation: ApprovalCancellation? = nil,
+    compact: Bool = false,
+    reevaluate: (@MainActor () -> Bool)? = nil,
+    allowsReblessing: Bool = false,
+    existingPanel: NSPanel? = nil
+) async -> ApprovalDecision {
+    guard cancellation?.isCanceled != true else { return .canceled }
+    let sshMonitor = request.sshPeer.map { peer in
+        Task {
+            do {
+                try await monitorAuthorizationValidity { try peer.validate() }
+            } catch {
+                // A result from a dismissed prompt must not cancel its fulfillment.
+                guard !Task.isCancelled else { return }
+                cancellation?.cancel()
+            }
+        }
+    }
+    defer { sshMonitor?.cancel() }
+
+    let startGeneration = ActiveApprovalPrompt.abortGeneration
+    let queueToken = UUID()
+    let acquired = await HumanApprovalQueue.shared.acquire(
+        id: queueToken,
+        isCanceled: { cancellation?.isCanceled == true },
+        registerCancellation: { onCancel in
+            let observed = cancellation?.observe(id: queueToken) {
+                onCancel()
+            } ?? true
+            if !observed {
+                onCancel()
+            }
+        }
+    )
+    cancellation?.stopObserving(id: queueToken)
+    guard acquired else {
+        return terminalApprovalDecision(.canceled, cancellation: cancellation)
+    }
+    defer {
+        HumanApprovalQueue.shared.release()
+    }
+    // If an abort occurred (e.g. user session lock, screen sleep, or app update)
+    // while waiting in the queue or right as this waiter was promoted, bail out
+    // immediately rather than presenting a stale prompt.
+    guard cancellation?.isCanceled != true,
+          ActiveApprovalPrompt.abortGeneration == startGeneration
+    else {
+        return terminalApprovalDecision(.canceled, cancellation: cancellation)
+    }
+
+    let attributedLaunchers = denialLaunchers + (launcher.map { [$0] } ?? [])
+    if evaluateLauncherDenial(gate: denialGate, classification: classification ?? .unknown,
+                             launchers: attributedLaunchers) != nil {
+        return .denied
+    }
+    if reevaluate?() == true {
+        return .reevaluated
+    }
+    let eligibleDenialLauncher = denialActionLauncher(
+        displayedLauncher: launcher, attributedLaunchers: denialLaunchers
+    )
+    let temporaryDenialScope = denialGate.flatMap {
+        TemporaryLauncherDenialScope(gate: $0, classification: classification ?? .unknown)
+    }
+    let offersTemporaryDenial = eligibleDenialLauncher.map {
+        guard let scope = temporaryDenialScope else { return false }
+        return TemporaryLauncherDenials.shared.shouldOfferDenialOnNextPrompt($0.designatedRequirement, gateID: scope.gateID)
+    } ?? false
+    let receivedAt = Date()
+    let requester = approvalPromptRequester(launcher: launcher, fallback: launcherFallbackPath)
+    let processSecurity = approvalProcessSecurity(
+        request: request,
+        gateClientPID: pid,
+        gateClientPath: callerPath,
+        targetPID: targetPID,
+        launcher: launcher
+    )
+    let content = ApprovalPromptContent(
+        requesterName: requester.name,
+        requesterIconPath: requester.iconPath,
+        command: approvalPromptCommand(request),
+        commandPath: escapedSecurityPath(approvalCommandPath(request)),
+        title: request.title,
+        detail: request.detail,
+        automaticApprovalExplanation: automaticApprovalExplanation,
+        operation: classification.map(operationClassificationTitle),
+        accessLevel: accessLevel,
+        temporaryGrantUnavailableReason: temporaryGrantUnavailableReason,
+        cwd: escapedSecurityPath(request.cwd),
+        keys: approvalPromptSecretNames(
+            requested: request.keys,
+            blessed: blessing?.script.keys ?? []
+        ),
+        blessing: blessing,
+        processSecurity: processSecurity,
+        sections: approvalPromptSections(
+            request: request,
+            callerPath: callerPath,
+            pid: pid,
+            signing: signing,
+            scriptApproval: scriptApproval,
+            launcher: launcher,
+            processSecurity: processSecurity,
+            receivedAt: receivedAt
+        ),
+        sshSigningTargetPath: request.sshPeer.map { _ in escapedSecurityPath(request.target) }
+    )
+    let usesIPhoneApproval = PhoneApprovalCoordinator.shared.isEnabled
+    let usesTouchIDApproval = TouchIDApproval.isEnabled
+    let maximumHeight = NSScreen.main?.visibleFrame.height ?? 660
+    let panel = existingPanel ?? makeApprovalPanel()
+
+    let denialObserver = NotificationCenter.default.addObserver(
+        forName: launcherDenialDidChange, object: nil, queue: .main
+    ) { _ in
+        MainActor.assumeIsolated {
+            if evaluateLauncherDenial(gate: denialGate, classification: classification ?? .unknown,
+                                     launchers: attributedLaunchers) != nil {
+                ActiveApprovalPrompt.current?.resolve(.denied, source: .programmatic)
+            }
+        }
+    }
+    defer { NotificationCenter.default.removeObserver(denialObserver) }
+    let decision: ApprovalDecision = await withCheckedContinuation { continuation in
+        let state = ApprovalPromptState(continuation: continuation, panel: panel)
+        ActiveApprovalPrompt.current = state
+        state.usesIPhoneApproval = usesIPhoneApproval
+        state.cancellation = cancellation
+        // Close the gap between the queued check and observer registration.
+        // Later changes are observed; an earlier notification may have been missed.
+        if evaluateLauncherDenial(gate: denialGate, classification: classification ?? .unknown,
+                                 launchers: attributedLaunchers) != nil {
+            state.resolve(.denied, source: .programmatic)
+            return
+        }
+
+        let presentationToken = UUID()
+        state.presentationToken = presentationToken
+
+        panel.contentView = NSHostingView(
+            rootView: ApprovalPromptView(
+                content: content,
+                maximumHeight: maximumHeight,
+                allowsPersistentApproval: allowsPersistentApproval,
+                temporaryGrantCandidate: temporaryGrantCandidate,
+                persistentApprovalLabel: persistentApprovalLabel,
+                usesIPhoneApproval: usesIPhoneApproval,
+                usesTouchIDApproval: usesTouchIDApproval,
+                compact: compact,
+                denialLauncherName: eligibleDenialLauncher.map {
+                    approvalPromptRequester(launcher: $0, fallback: $0.path).name
+                },
+                temporaryDenial: offersTemporaryDenial ? {
+                    guard let eligibleDenialLauncher, let temporaryDenialScope else { return }
+                    state.denyTemporarily(requirement: eligibleDenialLauncher.designatedRequirement,
+                        launcherName: approvalPromptRequester(launcher: eligibleDenialLauncher, fallback: eligibleDenialLauncher.path).name,
+                        scope: temporaryDenialScope, source: .standardMac)
+                } : nil,
+                temporaryDenialScope: temporaryDenialScope,
+                rebless: allowsReblessing ? {
+                    state.resolve(.rebless, source: .standardMac)
+                } : nil,
+                decide: { userDecision, source in
+                    state.resolve(userDecision, source: source)
+                }
+            )
+        )
+
+        if usesIPhoneApproval {
+            do {
+                let phoneDenial = offersTemporaryDenial ? temporaryDenialScope.map { scope in
+                    PhoneTemporaryDenial(actionTitle: scope.actionTitle,
+                        scope: "\(approvalPromptRequester(launcher: eligibleDenialLauncher, fallback: eligibleDenialLauncher?.path ?? launcherFallbackPath).name) at \(scope.gateName)")
+                } : nil
+                let phoneRequest = try PhoneApprovalRequest(
+                    macName: Host.current().localizedName ?? ProcessInfo.processInfo.hostName,
+                    launcher: content.requesterName,
+                    tool: autoApprovalToolName(request),
+                    command: content.command,
+                    cwd: content.cwd,
+                    secretNames: request.keys.sorted(),
+                    reason: automaticApprovalExplanation
+                        ?? request.detail
+                        ?? request.title
+                        ?? "Human Approval is required.",
+                    risks: phoneApprovalRisks(
+                        request: request,
+                        classification: classification,
+                        hasSecurityWarning: automaticApprovalExplanation != nil || blessing != nil
+                    ),
+                    details: content.sections.map { section in
+                        ApprovalDetailSection(
+                            title: section.title,
+                            rows: section.rows.map { .init(label: $0.label, value: $0.value) }
+                        )
+                    } + (phoneDenial.map { [$0.detailSection] } ?? []),
+                    temporaryAccessGrantScope: temporaryGrantCandidate.map { candidate in
+                        "\(candidate.launcherName), \(candidate.authorizationGateName), and \(candidate.scope.agentTaskContext.provider.taskLabel) \(candidate.scope.agentTaskContext.abbreviatedID)"
+                    }
+                )
+                state.remoteRequestID = phoneRequest.id
+                try PhoneApprovalCoordinator.shared.submit(phoneRequest) { result in
+                    if case .temporaryDenial = result {
+                        guard offersTemporaryDenial, let eligibleDenialLauncher, let temporaryDenialScope else {
+                            state.resolve(.denied, source: .phone)
+                            return
+                        }
+                        state.denyTemporarily(requirement: eligibleDenialLauncher.designatedRequirement,
+                            launcherName: approvalPromptRequester(launcher: eligibleDenialLauncher, fallback: eligibleDenialLauncher.path).name,
+                            scope: temporaryDenialScope, source: .phone)
+                        return
+                    }
+                    let mapped: ApprovalDecision = switch result {
+                    case .approved: .approved
+                    case .denied, .temporaryDenial: .denied
+                    case .temporaryWriteAccess: .temporaryWriteAccess
+                    case .canceled: .canceled
+                    }
+                    Task { @MainActor in
+                        state.resolve(mapped, source: .phone)
+                    }
+                }
+            } catch {
+                state.resolve(.denied, source: .programmatic)
+                return
+            }
+        }
+
+        let observed = cancellation?.observe(id: presentationToken) {
+            Task { @MainActor in
+                state.resolve(.canceled, source: .programmatic)
+            }
+        } ?? true
+
+        if !observed {
+            state.resolve(.canceled, source: .programmatic)
+            return
+        }
+
+        fitApprovalPanel(panel, maximumHeight: maximumHeight, animate: false)
+        if !panel.isVisible { panel.center() }
+        panel.orderFrontRegardless()
+        if panel.isVisible, ActiveApprovalPrompt.current === state, let eligibleDenialLauncher, let temporaryDenialScope {
+            _ = TemporaryLauncherDenials.shared.recordPrompt(eligibleDenialLauncher.designatedRequirement, gateID: temporaryDenialScope.gateID)
+        }
+    }
+
+    return terminalApprovalDecision(decision, cancellation: cancellation)
+}
+
+private func phoneApprovalRisks(
+    request: ApprovalRequest,
+    classification: SecretGateRequestClassification?,
+    hasSecurityWarning: Bool
+) -> [ApprovalRisk] {
+    if hasSecurityWarning { return [.securityWarning] }
+    switch classification {
+    case .secretDump: return [.secretDisclosure]
+    case .unknown: return [.unknown]
+    case .readOnly, .localWrite, .update, .mutating: return [.routine]
+    case nil where ApprovalServiceOperation(rawValue: request.op)?.disclosesProtectedMetadata == true:
+        return [.secretDisclosure]
+    case nil where request.op == "inject" || request.op == "inject-fd": return [.unconstrainedSecretApplication]
+    case nil: return [.securityWarning]
+    }
+}
+
+func approvalPromptRequester(
+    launcher: LauncherIdentity?,
+    fallback: String
+) -> (name: String, iconPath: String) {
+    guard let launcher else {
+        return (URL(fileURLWithPath: fallback).lastPathComponent, fallback)
+    }
+    if launcher.isStandalone {
+        return ("\(launcher.path) — Team ID: \(launcher.teamIdentifier)", launcher.path)
+    }
+    if let appURL = launcher.appURL
+        ?? appBundleURLs(containing: launcher.path).first(where: {
+            Bundle(url: $0)?.bundleIdentifier == launcher.identifier
+        })
+        ?? NSWorkspace.shared.urlForApplication(withBundleIdentifier: launcher.identifier)
+    {
+        return (appDisplayName(appURL), appURL.path)
+    }
+    return (shortAppName(launcher.identifier), launcher.path)
+}
+
+private func temporaryAccessGrantLauncherName(_ launcher: LauncherIdentity) -> String {
+    approvalPromptRequester(launcher: launcher, fallback: launcher.path).name
+}
+
+private func appDisplayName(_ appURL: URL) -> String {
+    let bundle = Bundle(url: appURL)
+    return bundle?.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
+        ?? bundle?.object(forInfoDictionaryKey: "CFBundleName") as? String
+        ?? appURL.deletingPathExtension().lastPathComponent
+}
+
+private func prettyShellCommand(target: String, args: [String]) -> String {
+    ([target] + args).map(shellQuote).enumerated().map { index, word in
+        if args.isEmpty { return word }
+        return index == 0 ? "\(word) \\" : "  \(word)" + (index == args.count ? "" : " \\")
+    }.joined(separator: "\n")
+}
+
+private func approvalPromptCommand(_ request: ApprovalRequest, scriptPath: String? = nil) -> String {
+    if let peer = request.sshPeer {
+        return ([pathString(peer.identity)] + peer.arguments.dropFirst()).map(shellQuote).joined(separator: " ")
+    }
+    let parts = authorizationCommandParts(request, scriptPath: scriptPath)
+    let resolvedScript = scriptPath ?? resolvedShebangScriptPath(request)
+    let invokedScript = resolvedScript.flatMap { path in
+        request.args.first { !$0.hasPrefix("/") && standardizedPath($0, cwd: request.cwd) == path }
+    }
+    return ([invokedScript ?? parts.tool] + parts.arguments).map(shellQuote).joined(separator: " ")
+}
+
+private func shellQuote(_ word: String) -> String {
+    guard !word.isEmpty,
+          word.rangeOfCharacter(from: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: #"'"\\$`!&|;()<>{}[]*?"#))) == nil
+    else {
+        return "'" + word.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+    return word
+}
+
+@MainActor
+private func approvalPromptSections(
+    request: ApprovalRequest,
+    callerPath: String,
+    pid: pid_t,
+    signing: SigningInfo,
+    scriptApproval: ScriptApproval?,
+    launcher: LauncherIdentity?,
+    processSecurity: ApprovalProcessSecurity,
+    receivedAt: Date
+) -> [ApprovalPromptSection] {
+    var sections = [
+        ApprovalPromptSection("Request", "clock", [
+            ApprovalPromptRow("Received", approvalPromptTimestamp(receivedAt)),
+        ]),
+        ApprovalPromptSection("Environment", "arrow.triangle.2.circlepath", [
+            ApprovalPromptRow("Existing", request.envConflicts.isEmpty ? "(none)" : request.envConflicts.joined(separator: ", ")),
+            ApprovalPromptRow("Replace existing", request.replaceExistingEnv ? "yes" : "no"),
+            ApprovalPromptRow("Allow missing keys", request.allowMissingKeys ? "yes" : "no"),
+        ]),
+        ApprovalPromptSection("Gate Client Identity", "terminal", [
+            ApprovalPromptRow("Gate Client", "\(callerPath) (pid \(pid))"),
+            ApprovalPromptRow("Signed", "\(signing.identifier) / \(signing.teamIdentifier)"),
+        ]),
+    ]
+
+    if request.op == "inject-fd" {
+        sections[1] = ApprovalPromptSection("Secret Delivery", "arrow.right", [
+            ApprovalPromptRow("Delivery", request.detail ?? ""),
+            ApprovalPromptRow("Environment", "Requested Secret Names are removed"),
+        ])
+    }
+
+    if !request.keys.isEmpty {
+        sections.insert(ApprovalPromptSection(
+            "Secret Values",
+            "key.horizontal",
+            request.keys.sorted().map { key in
+                let source = request.selectedSecretValues.source(for: key)
+                let display = switch source {
+                case .global: "Global Value"
+                case .projectDirectory(let path): escapedSecurityPath(path)
+                case nil: "(missing)"
+                }
+                return ApprovalPromptRow(key, display)
+            }
+        ), at: 1)
+    }
+
+    let chain = processSecurity.nodes.isEmpty
+        ? approvalProcessChain(pid: pid)
+        : processChainLabel(paths: processSecurity.nodes.map(\.path))
+    let chainRows = chain.map { [ApprovalPromptRow("Process chain", $0)] } ?? []
+    sections.append(ApprovalPromptSection("Execution Origin", "app.badge", launcher.map {
+        [
+            ApprovalPromptRow("Verified Launcher", "\($0.identifier) (pid \($0.pid))"),
+            ApprovalPromptRow("Path", $0.path),
+            ApprovalPromptRow("Signed", "\($0.identifier) / \($0.teamIdentifier)"),
+        ] + chainRows
+    } ?? [
+        ApprovalPromptRow("Status", "unavailable; automic authorization disabled"),
+    ] + chainRows))
+
+    if let scriptApproval {
+        sections.append(ApprovalPromptSection("Script", "doc.text", [
+            ApprovalPromptRow("Path", scriptApproval.path),
+            ApprovalPromptRow("Checksum", scriptApproval.checksum),
+        ]))
+    } else if let script = request.shebangScript {
+        sections.append(ApprovalPromptSection("Script", "doc.text", [
+            ApprovalPromptRow("Path", script),
+            ApprovalPromptRow("Checksum", "unavailable"),
+        ]))
+    }
+
+    return sections
+}
+
+private func approvalPromptTimestamp(_ date: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.dateStyle = .medium
+    formatter.timeStyle = .long
+    return formatter.string(from: date)
+}
+
+private struct ApprovalPromptSection: Identifiable {
+    let id: String
+    let title: String
+    let systemImage: String
+    let rows: [ApprovalPromptRow]
+
+    init(_ title: String, _ systemImage: String, _ rows: [ApprovalPromptRow]) {
+        self.id = title
+        self.title = title
+        self.systemImage = systemImage
+        self.rows = rows
+    }
+}
+
+private struct ApprovalPromptRow: Identifiable {
+    let id: String
+    let label: String
+    let value: String
+
+    init(_ label: String, _ value: String) {
+        self.id = label
+        self.label = label
+        self.value = value
+    }
+}
+
+private struct BlessedScriptPromptContext {
+    let script: BlessedScript
+    let explanation: String
+}
+
+private struct ApprovalPromptContent {
+    let requesterName: String
+    let requesterIconPath: String
+    let command: String
+    let commandPath: String
+    let title: String?
+    let detail: String?
+    let automaticApprovalExplanation: String?
+    let operation: String?
+    let accessLevel: String?
+    let temporaryGrantUnavailableReason: String?
+    let cwd: String
+    let keys: String
+    let blessing: BlessedScriptPromptContext?
+    let processSecurity: ApprovalProcessSecurity
+    let sections: [ApprovalPromptSection]
+    var sshSigningTargetPath: String? = nil
+
+    var operationTitle: String? {
+        sshSigningTargetPath == nil ? operation : "SSH Authentication"
+    }
+
+    var writeAccessUnavailableReason: String? {
+        sshSigningTargetPath == nil ? temporaryGrantUnavailableReason : nil
+    }
+}
+
+private extension ApprovalProcessPosture {
+    var presentation: (title: String, image: String, color: Color) {
+        switch self {
+        case .meetsRequirements:
+            ("Meets requirements", "checkmark.shield.fill", .green)
+        case .needsAttention:
+            ("Needs attention", "exclamationmark.shield.fill", .orange)
+        case .doesNotMeetRequirements:
+            ("Does not meet requirements", "xmark.shield.fill", .red)
+        }
+    }
+}
+
+private extension ApprovalProcessSecurityNode {
+    var isLauncher: Bool { roles.contains("Verified Launcher") }
+    var isTarget: Bool {
+        roles.contains { $0.hasPrefix("Target") || $0.hasPrefix("Secret recipient") }
+    }
+    var displayRoles: String {
+        roles.map { $0 == "Verified Gate Client" ? "Gate Client" : $0 }
+            .joined(separator: " • ")
+    }
+    var details: String {
+        [
+            "\(displayRoles): \(name.isEmpty ? path : name)",
+            "Path: \(escapedSecurityPath(path))",
+            scriptOperand.map { "Reported script operand (unverified): \(escapedSecurityPath($0))" },
+            invocationName.map { _ in
+                "Invoked via \(executableName); name reported by mutable process arguments, not verified code identity"
+            },
+            pid.map { "PID: \($0)" },
+            String(localized: "Status: \(localizedUIString(posture.presentation.title))"),
+            explanation,
+        ]
+        .compactMap(\.self)
+        .joined(separator: "\n")
+    }
+}
+
+private extension ApprovalProcessSecurity {
+    var launcher: ApprovalProcessSecurityNode? { nodes.first(where: \.isLauncher) }
+    var target: ApprovalProcessSecurityNode? { nodes.first(where: \.isTarget) }
+    var timelineNodes: [ApprovalProcessSecurityNode] {
+        Array(nodes.filter { !$0.isTarget }.reversed()) + (target.map { [$0] } ?? [])
+    }
+}
+
+private func approvalPromptDetails(_ sections: [ApprovalPromptSection]) -> String {
+    sections.map { section in
+        ([localizedUIString(section.title)] + section.rows.map {
+            let label = section.title == "Secret Values" ? $0.label : localizedUIString($0.label)
+            return "\(label): \($0.value)"
+        })
+            .joined(separator: "\n")
+    }
+    .joined(separator: "\n\n")
+}
+
+private struct ApprovalPromptInfoButton: View {
+    let title: String
+    let details: String
+    var arrowEdge: Edge = .trailing
+    var popoverHeight: CGFloat = 280
+    @State private var isPresented = false
+
+    var body: some View {
+        Button { isPresented.toggle() } label: {
+            Image(systemName: "info.circle")
+                .font(.body)
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(details)
+        .accessibilityLabel(localizedUIString(title))
+        .accessibilityHint(String(localized: "Shows \(localizedUIString(title))"))
+        .popover(isPresented: $isPresented, arrowEdge: arrowEdge) {
+            ScrollView {
+                Text(details)
+                    .font(.system(.callout, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(16)
+            }
+            .frame(width: 380, height: popoverHeight)
+        }
+    }
+}
+
+private let approvalPromptRoleWidth: CGFloat = 112
+private let approvalPromptToolWidth: CGFloat = 170
+private let approvalPromptColumnSpacing: CGFloat = 10
+
+private struct ApprovalPromptPathView: View {
+    let path: String
+
+    var body: some View {
+        Text(path)
+            .font(.system(.caption, design: .monospaced))
+            .foregroundStyle(.tertiary)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .help(path)
+    }
+}
+
+private struct ApprovalPromptHeaderView: View {
+    let content: ApprovalPromptContent
+
+    private var details: String {
+        [content.processSecurity.launcher?.details, approvalPromptDetails(content.sections)]
+            .compactMap { $0?.isEmpty == false ? $0 : nil }
+            .joined(separator: "\n\n")
+    }
+
+    var body: some View {
+        let launcher = content.processSecurity.launcher
+        VStack(alignment: .leading, spacing: 12) {
+            if launcher != nil {
+                Label("Verified Launcher", systemImage: "checkmark.shield")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .textCase(.uppercase)
+            }
+            HStack(alignment: .top, spacing: approvalPromptColumnSpacing) {
+                HStack(spacing: 14) {
+                    Button {
+                        NSWorkspace.shared.activateFileViewerSelecting([
+                            URL(fileURLWithPath: content.requesterIconPath),
+                        ])
+                    } label: {
+                        Image(nsImage: NSWorkspace.shared.icon(forFile: content.requesterIconPath))
+                            .resizable()
+                            .interpolation(.high)
+                            .frame(width: 56, height: 56)
+                            .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Reveal \(content.requesterName) in Finder")
+                    .help("Reveal in Finder")
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(content.requesterName)
+                            .font(.title3.weight(.semibold))
+                            .lineLimit(2)
+                            .help(content.requesterName)
+                        Text(URL(fileURLWithPath: content.requesterIconPath).lastPathComponent)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(
+                    width: approvalPromptRoleWidth + approvalPromptColumnSpacing + approvalPromptToolWidth,
+                    alignment: .leading
+                )
+                ApprovalPromptPathView(path: escapedSecurityPath(launcher?.path ?? content.requesterIconPath))
+                ApprovalPromptInfoButton(
+                    title: String(localized: "Request details"),
+                    details: details.isEmpty ? "No additional request details." : details
+                )
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct ApprovalPromptProcessSecurityView: View {
+    let processSecurity: ApprovalProcessSecurity
+
+    private var nodes: [ApprovalProcessSecurityNode] {
+        processSecurity.timelineNodes
+    }
+
+    private var details: String {
+        nodes.map(\.details).joined(separator: "\n\n")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Text("Execution Chain")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                ApprovalPromptInfoButton(
+                    title: String(localized: "Execution chain details"),
+                    details: details.isEmpty ? "No process details available." : details
+                )
+                .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+            }
+            ScrollView(.horizontal) {
+                HStack(alignment: .top, spacing: 12) {
+                    ForEach(Array(nodes.enumerated()), id: \.element.id) { index, node in
+                        if index > 0 {
+                            Image(systemName: "arrow.right")
+                                .foregroundStyle(.secondary)
+                                .padding(.top, 9)
+                                .accessibilityHidden(true)
+                        }
+                        ApprovalPromptProcessNodeView(node: node)
+                    }
+                }
+            }
+            .scrollIndicators(.hidden)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Observed process ancestry and Target")
+    }
+}
+
+private struct ApprovalPromptProcessNodeView: View {
+    let node: ApprovalProcessSecurityNode
+
+    var body: some View {
+        let presentation = node.posture.presentation
+        VStack(spacing: 6) {
+            HStack(spacing: 8) {
+                Text(node.name.isEmpty ? node.path : node.name)
+                    .font(.system(.headline, design: .monospaced))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                if node.isAutomicVaultSigned,
+                   let imageURL = Bundle.main.url(forResource: "NSMenuItem", withExtension: "png"),
+                   let image = NSImage(contentsOf: imageURL)
+                {
+                    Image(nsImage: image)
+                        .renderingMode(.template)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 10, height: 12)
+                        .help("Signed by Automic Vault")
+                        .accessibilityHidden(true)
+                }
+                if node.posture != .meetsRequirements {
+                    Image(systemName: presentation.image)
+                        .font(.body)
+                        .foregroundStyle(presentation.color)
+                        .accessibilityHidden(true)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
+            .frame(maxWidth: .infinity)
+            .background(
+                Color(nsColor: .controlBackgroundColor).opacity(0.35),
+                in: Capsule()
+            )
+            .overlay {
+                Capsule().stroke(.white.opacity(0.1), lineWidth: 1)
+            }
+            if node.invocationName != nil {
+                Text("via \(node.executableName)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if node.isLauncher {
+                Text("Verified Launcher")
+                    .font(.caption)
+                    .foregroundStyle(Color.accentColor)
+            }
+            if let script = node.scriptOperand {
+                Text(escapedSecurityPath(URL(fileURLWithPath: script).lastPathComponent))
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(width: 150)
+                    .help(node.details)
+                    .accessibilityLabel("Reported script operand, unverified: \(escapedSecurityPath(script))")
+            }
+            ApprovalPromptPathView(path: escapedSecurityPath(node.path))
+                .frame(width: 150)
+        }
+        .frame(minWidth: 150)
+        .help(node.details)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(
+            "\(node.displayRoles), \(node.name)\(node.invocationName == nil ? "" : " via \(node.executableName)"), \(presentation.title)\(node.isAutomicVaultSigned ? ", signed by Automic Vault" : "")"
+        )
+    }
+}
+
+private struct ApprovalPromptRequestView: View {
+    let content: ApprovalPromptContent
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ApprovalPromptCommandView(content: content)
+                .padding(18)
+            Divider()
+            ApprovalPromptHeaderView(content: content)
+                .padding(18)
+            Divider()
+            ApprovalPromptProcessSecurityView(processSecurity: content.processSecurity)
+                .padding(18)
+        }
+    }
+}
+
+private struct CompactSecretMutationApprovalView: View {
+    let content: ApprovalPromptContent
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label(content.title ?? "Add or modify this secret?", systemImage: "key.fill")
+                .font(.title3.weight(.semibold))
+            if let detail = content.detail, !detail.isEmpty {
+                Text(detail)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text(content.keys)
+                .font(.system(.callout, design: .monospaced).weight(.medium))
+                .textSelection(.enabled)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
+            HStack(spacing: 8) {
+                Text("Requested by \(content.requesterName)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                ApprovalPromptInfoButton(
+                    title: String(localized: "Request details"),
+                    details: approvalPromptDetails(content.sections)
+                )
+                .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct ApprovalPromptApprovalMenu: View {
+    let allowsPersistentApproval: Bool
+    let temporaryGrantCandidate: TemporaryAccessGrantCandidate?
+    var title = "Approve Once"
+    var systemImage: String?
+    var persistentApprovalLabel = "Always Allow"
+    let decide: (ApprovalDecision) -> Void
+
+    var body: some View {
+        Group {
+            if hasAlternateActions {
+                Menu {
+                    Button("Approve Once") { decide(.approved) }
+                    if let candidate = temporaryGrantCandidate {
+                        Button { decide(.temporaryWriteAccess) } label: {
+                            Label("Allow Write Access for 10 Minutes…", systemImage: "clock.badge.checkmark")
+                        }
+                        .help(
+                            "Limited to \(candidate.launcherName), \(candidate.authorizationGateName), and \(candidate.scope.agentTaskContext.provider.taskLabel) \(candidate.scope.agentTaskContext.abbreviatedID)."
+                        )
+                        .accessibilityLabel(
+                            "Allow Write Access for 10 minutes for \(candidate.scope.agentTaskContext.provider.taskLabel) \(candidate.scope.agentTaskContext.abbreviatedID)"
+                        )
+                    }
+                    if allowsPersistentApproval {
+                        Button(localizedUIString(persistentApprovalLabel)) { decide(.alwaysApproved) }
+                    }
+                } label: {
+                    buttonLabel
+                } primaryAction: {
+                    decide(.approved)
+                }
+                .accessibilityLabel("\(title) and more approval options")
+                .accessibilityHint("Use the menu for temporary or persistent access options when available")
+            } else {
+                Button {
+                    decide(.approved)
+                } label: {
+                    buttonLabel
+                }
+                .accessibilityLabel(title)
+            }
+        }
+        .buttonStyle(.borderedProminent)
+        .controlSize(.large)
+        .tint(.blue)
+        .frame(maxWidth: .infinity)
+        .keyboardShortcut(.defaultAction)
+    }
+
+    private var hasAlternateActions: Bool {
+        temporaryGrantCandidate != nil || allowsPersistentApproval
+    }
+
+    @ViewBuilder private var buttonLabel: some View {
+        if let systemImage {
+            Label(localizedUIString(title), systemImage: systemImage)
+                .frame(maxWidth: .infinity)
+        } else {
+            Text(localizedUIString(title))
+                .frame(maxWidth: .infinity)
+        }
+    }
+}
+
+private struct ApprovalPromptView: View {
+    let content: ApprovalPromptContent
+    var maximumHeight: CGFloat? = nil
+    var allowsPersistentApproval = false
+    let temporaryGrantCandidate: TemporaryAccessGrantCandidate?
+    var persistentApprovalLabel = "Always Allow"
+    var usesIPhoneApproval = false
+    var usesTouchIDApproval = false
+    var compact = false
+    var denialLauncherName: String? = nil
+    var temporaryDenial: (() -> Void)? = nil
+    var temporaryDenialScope: TemporaryLauncherDenialScope? = nil
+    var rebless: (() -> Void)? = nil
+    var isReviewingBlessing = false
+    let decide: (ApprovalDecision, ApprovalDecisionSource) -> Void
+    @State private var isAuthenticatingWithTouchID = false
+    @StateObject private var embeddedTouchID = EmbeddedTouchIDAttempt()
+    private let usesEmbeddedTouchID = embeddedTouchIDApprovalIsEnabled()
+
+    var body: some View {
+        VStack(spacing: 18) {
+            ScrollView {
+                VStack(spacing: 16) {
+                    if compact {
+                        CompactSecretMutationApprovalView(content: content)
+                    } else {
+                        ApprovalPromptRequestView(content: content)
+                            .layoutPriority(-1)
+
+                        if content.title?.isEmpty == false || content.detail?.isEmpty == false {
+                            VStack(alignment: .leading, spacing: 5) {
+                                if let title = content.title, !title.isEmpty {
+                                    Text(title)
+                                        .font(.headline)
+                                }
+                                if let detail = content.detail, !detail.isEmpty {
+                                    Text(detail)
+                                        .font(.callout)
+                                        .foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+
+                    if let explanation = content.automaticApprovalExplanation {
+                        HStack(spacing: 12) {
+                            Label {
+                                Text(explanation)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            } icon: {
+                                Image(systemName: "exclamationmark.shield.fill")
+                                    .foregroundStyle(.orange)
+                            }
+                            if let rebless {
+                                Spacer(minLength: 0)
+                                Button("Rebless…", action: rebless)
+                                    .buttonStyle(.bordered)
+                                    .fixedSize()
+                                    .help("Review the script changes, then return to this pending request.")
+                            }
+                        }
+                        .font(.callout)
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+                        .accessibilityElement(children: .contain)
+                    }
+                }
+            }
+            .scrollIndicators(.visible)
+            .defaultScrollAnchor(.top)
+            .layoutPriority(1)
+
+            if usesIPhoneApproval && !usesTouchIDApproval,
+               let reason = content.writeAccessUnavailableReason {
+                Text(localizedUIString(reason))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if usesIPhoneApproval {
+                VStack(spacing: 10) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "iphone")
+                            .symbolRenderingMode(.hierarchical)
+                            .foregroundStyle(.purple)
+                        Text("Waiting for iPhone Approval")
+                            .font(.headline)
+                    }
+                    Text(usesTouchIDApproval
+                        ? String(localized: "Approve on iPhone or with fresh Touch ID on this Mac.")
+                        : String(localized: "Approve this request on your iPhone."))
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+            }
+
+            if usesTouchIDApproval {
+                HStack(alignment: .top, spacing: 12) {
+                    denyButton
+                    approvalInfoButton
+                        .padding(.top, 4)
+                    if usesEmbeddedTouchID {
+                        HStack(spacing: 8) {
+                            HStack(spacing: 8) {
+                                if isReviewingBlessing {
+                                    Image(systemName: "touchid")
+                                } else if isAuthenticatingWithTouchID {
+                                    ProgressView().controlSize(.small)
+                                } else {
+                                    EmbeddedTouchIDView(attempt: embeddedTouchID) {
+                                        decide(.approved, .touchID)
+                                    }
+                                    .frame(width: 16, height: 16)
+                                }
+                                Text(isAuthenticatingWithTouchID ? "Waiting for Touch ID…" : "Approve with Touch ID")
+                            }
+                            .padding(.horizontal, 16)
+                            .frame(maxWidth: .infinity, minHeight: 32)
+                            .allowsHitTesting(false)
+                            .accessibilityElement(children: .contain)
+                            .accessibilityHint("Touch the sensor to approve this request once. This is a status indicator, not a button.")
+
+                            if allowsPersistentApproval || temporaryGrantCandidate != nil {
+                                Menu {
+                                    if temporaryGrantCandidate != nil {
+                                        Button("Allow Write Access for 10 Minutes…") {
+                                            authenticateWithTouchID(.temporaryWriteAccess)
+                                        }
+                                    }
+                                    if allowsPersistentApproval {
+                                        Button(localizedUIString(persistentApprovalLabel)) {
+                                            authenticateWithTouchID(.alwaysApproved)
+                                        }
+                                    }
+                                } label: {
+                                    Image(systemName: "chevron.down")
+                                        .font(.caption.weight(.semibold))
+                                        .frame(width: 24, height: 24)
+                                        .contentShape(Rectangle())
+                                }
+                                .menuStyle(.borderlessButton)
+                                .menuIndicator(.hidden)
+                                .padding(.trailing, 10)
+                                .fixedSize()
+                                .accessibilityLabel("More approval options")
+                                .disabled(isAuthenticatingWithTouchID || !TouchIDApproval.isAvailable)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 32)
+                        .background(.quaternary, in: Capsule())
+                    } else {
+                        ApprovalPromptApprovalMenu(
+                            allowsPersistentApproval: allowsPersistentApproval,
+                            temporaryGrantCandidate: temporaryGrantCandidate,
+                            title: isAuthenticatingWithTouchID ? "Waiting for Touch ID…" : "Approve with Touch ID",
+                            systemImage: "touchid",
+                            decide: authenticateWithTouchID
+                        )
+                        .disabled(isAuthenticatingWithTouchID || !TouchIDApproval.isAvailable)
+                    }
+                }
+            } else if usesIPhoneApproval {
+                denyButton
+
+                Text("This Mac cannot approve while iPhone Approval is enabled.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            } else {
+                HStack(alignment: .top, spacing: 18) {
+                    denyButton
+                    approvalInfoButton
+                        .padding(.top, 4)
+
+                    VStack(spacing: 6) {
+                        ApprovalPromptApprovalMenu(
+                            allowsPersistentApproval: allowsPersistentApproval,
+                            temporaryGrantCandidate: temporaryGrantCandidate,
+                            persistentApprovalLabel: persistentApprovalLabel,
+                            decide: { decide($0, .standardMac) }
+                        )
+                        Text(compact
+                            ? String(localized: "This Approval applies only to this secret change.")
+                            : String(localized: "Review the request details before allowing access."))
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+            }
+            if allowsPersistentApproval {
+                Text(persistentApprovalLabel == "Allow for Session"
+                    ? String(localized: "Session approval expires when this Proxy Session ends")
+                    : String(localized: "Manage this Verified Launcher's Access Level in Automic Vault."))
+                    .font(.footnote)
+                    .foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .padding(22)
+        .frame(maxHeight: maximumHeight)
+        .frame(width: compact ? 420 : 680)
+        .fixedSize(horizontal: false, vertical: true)
+        .background {
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .fill(.regularMaterial)
+                // .overlay {
+                //     RoundedRectangle(cornerRadius: 28, style: .continuous)
+                //         .fill(.blue.opacity(0.18))
+                // }
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .stroke(.white.opacity(0.18), lineWidth: 1)
+        }
+        .overlay(alignment: .top) {
+            ApprovalPanelDragRegion()
+                .frame(maxWidth: .infinity)
+                .frame(height: 18)
+                .overlay {
+                    Text("AUTOMIC VAULT")
+                        .font(.caption2.weight(.semibold))
+                        .tracking(1.6)
+                        .foregroundStyle(.tertiary)
+                        .allowsHitTesting(false)
+                }
+                .padding(.top, 3)
+                .accessibilityHidden(true)
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .disabled(isReviewingBlessing)
+        .onChange(of: isReviewingBlessing) { _, reviewing in
+            if reviewing { embeddedTouchID.cancel() }
+        }
+    }
+
+    @ViewBuilder private var approvalInfoButton: some View {
+        let details = [
+            content.writeAccessUnavailableReason.map(localizedUIString),
+            usesTouchIDApproval
+                ? String(localized: "Fresh Touch ID is required for every Approval on this Mac.")
+                : nil,
+        ].compactMap { $0 }.joined(separator: "\n\n")
+        if !details.isEmpty {
+            ApprovalPromptInfoButton(
+                title: String(localized: "Approval details"),
+                details: details,
+                arrowEdge: .top,
+                popoverHeight: 140
+            )
+            .foregroundStyle(.secondary)
+        }
+    }
+
+    private var denyButton: some View {
+        VStack(spacing: 6) {
+            Group {
+                if let temporaryDenial, let temporaryDenialScope {
+                    Menu {
+                        Button("Deny Once") { decide(.denied, .standardMac) }
+                        Button(temporaryDenialScope.actionTitle, action: temporaryDenial)
+                        Text("Only \(denialLauncherName ?? "this Verified Launcher") at \(temporaryDenialScope.gateName)")
+                    } label: {
+                        Text("Deny").frame(maxWidth: .infinity)
+                    } primaryAction: {
+                        decide(.denied, .standardMac)
+                    }
+                    .accessibilityLabel("Deny and more denial options")
+                    .accessibilityHint("Deny this request once, or open the menu for a two-minute denial")
+                } else {
+                    Button("Deny", role: .cancel) { decide(.denied, .standardMac) }
+                }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+            .frame(maxWidth: .infinity)
+            .keyboardShortcut(.cancelAction)
+            if temporaryDenial != nil, let denialLauncherName, let temporaryDenialScope {
+                Text("Spam Prevention Available")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .help("Repeated requests from \(denialLauncherName) at \(temporaryDenialScope.gateName). Use the Deny menu to stop matching requests for 2 minutes. You can end this early from the menu bar.")
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func authenticateWithTouchID(_ decision: ApprovalDecision) {
+        embeddedTouchID.cancel()
+        isAuthenticatingWithTouchID = true
+        TouchIDApproval.authenticate(
+            reason: String(localized: "Approve this exact Automic Vault request")
+        ) { approved in
+            isAuthenticatingWithTouchID = false
+            if approved { decide(decision, .touchID) }
+        }
+    }
+}
+
+private func approvalPromptCapabilitySummary(_ script: BlessedScript) -> String {
+    if script.usesCapabilityInheritance { return "Inherited from execution context" }
+    let summary = script.capabilities.sorted(by: { $0.key < $1.key })
+        .map { "\($0.key): \($0.value.title)" }
+        .joined(separator: " • ")
+    return summary.isEmpty ? "(none)" : summary
+}
+
+private func approvalPromptSecretNames(requested: [String], blessed: [String]) -> String {
+    Set(requested + blessed).sorted().joined(separator: ", ")
+}
+
+private struct ApprovalPromptCommandView: View {
+    let content: ApprovalPromptContent
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Authorization Request")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+            VStack(alignment: .leading, spacing: 16) {
+                Text(content.command)
+                    .font(.system(.title3, design: .monospaced).weight(.semibold))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .help(content.command)
+                if let blessing = content.blessing {
+                    HStack(alignment: .firstTextBaseline, spacing: 12) {
+                        Label("Blessed script authority", systemImage: "checkmark.seal.fill")
+                            .font(.headline)
+                            .foregroundStyle(.green)
+                        Spacer(minLength: 0)
+                        Text(blessing.explanation)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.trailing)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                VStack(alignment: .leading, spacing: 8) {
+                    if let operation = content.operationTitle {
+                        ApprovalPromptInlineMeta(
+                            label: "Operation",
+                            value: localizedUIString(operation),
+                            systemImage: "list.bullet"
+                        )
+                    }
+                    if let accessLevel = content.accessLevel {
+                        ApprovalPromptInlineMeta(
+                            label: "Access Level",
+                            value: localizedUIString(accessLevel),
+                            systemImage: "shield.lefthalf.filled"
+                        )
+                    }
+                    ApprovalPromptInlineMeta(
+                        label: "Secret Names",
+                        value: content.keys,
+                        systemImage: "key"
+                    )
+                    ApprovalPromptInlineMeta(
+                        label: "Working Directory",
+                        value: content.cwd,
+                        systemImage: "folder"
+                    )
+                    ApprovalPromptInlineMeta(
+                        label: content.sshSigningTargetPath == nil ? "Full Path" : "SSH Client",
+                        value: content.commandPath,
+                        systemImage: "terminal"
+                    )
+                    if let target = content.sshSigningTargetPath {
+                        ApprovalPromptInlineMeta(
+                            label: "Signing Target",
+                            value: target,
+                            systemImage: "key.horizontal"
+                        )
+                    }
+                    if let blessing = content.blessing {
+                        ApprovalPromptInlineMeta(
+                            label: "Capabilities",
+                            value: approvalPromptCapabilitySummary(blessing.script),
+                            systemImage: "checkmark.seal"
+                        )
+                    }
+                }
+            }
+            .padding(18)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                Color(nsColor: .textBackgroundColor).opacity(0.45),
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(.white.opacity(0.1), lineWidth: 1)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct ApprovalPromptInlineMeta: View {
+    let label: String
+    let value: String
+    let systemImage: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: approvalPromptColumnSpacing) {
+            Image(systemName: systemImage)
+                .foregroundStyle(.secondary)
+                .frame(width: 24)
+                .accessibilityHidden(true)
+            Text(localizedUIString(label))
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 125, alignment: .leading)
+            Text(value.isEmpty ? "none" : value)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(value.isEmpty ? .tertiary : .secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+                .help(value.isEmpty ? "none" : value)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private func automaticAccessDecisionLabel(wasDenied: Bool) -> String {
+    wasDenied ? "AUTO REJECTED" : "AUTO APPROVED"
+}
+
+private func automaticAccessDecisionSymbol(wasDenied: Bool) -> String {
+    wasDenied ? "xmark.shield.fill" : "checkmark.shield.fill"
+}
+
+private func automaticAccessToastCommand(_ command: String, compact: Bool) -> String {
+    compact ? command.replacingOccurrences(of: " \\\n  ", with: " ") : command
+}
+
+private func automaticAccessToastAccessibilityLabel(
+    _ record: AutoApprovalRecord,
+    compact: Bool
+) -> String {
+    "Dismiss \(record.wasDenied ? "rejection" : "approval") notification for \(automaticAccessToastCommand(record.displayCommand, compact: compact))"
+        + (record.policyWarning.map { ". " + $0 } ?? "")
+}
+
+private struct AutomaticAccessToastView: View {
+    let record: AutoApprovalRecord
+    let dismiss: () -> Void
+    @AppStorage(compactAutomaticApprovalNotificationsDefaultsKey)
+    private var compact = true
+
+    private var compactCommand: Bool { compact && !record.wasDenied }
+
+    var body: some View {
+        Button(action: dismiss) {
+            content
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(automaticAccessToastAccessibilityLabel(record, compact: compactCommand))
+    }
+
+    private var content: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                Image(nsImage: NSWorkspace.shared.icon(forFile: record.launcherIconPath))
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 42, height: 42)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .accessibilityLabel(record.launcher)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(record.launcher)
+                        .font(.headline)
+                    Text(localizedUIString(automaticAccessDecisionLabel(wasDenied: record.wasDenied)))
+                        .font(.caption2.weight(.semibold))
+                        .tracking(1.2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+                Image(systemName: automaticAccessDecisionSymbol(wasDenied: record.wasDenied))
+                    .font(.title2)
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(record.wasDenied ? .red : .green)
+                    .accessibilityLabel(record.wasDenied ? "Rejected" : "Approved")
+            }
+
+            if let warning = record.policyWarning {
+                Label(warning, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(automaticAccessToastCommand(record.displayCommand, compact: compactCommand))
+                    .font(.system(.callout, design: .monospaced).weight(.medium))
+                    .foregroundStyle(.white)
+                    .lineLimit(compactCommand ? 5 : nil)
+                    .truncationMode(.tail)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(record.keys.joined(separator: ", "))
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.68))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
+        .padding(16)
+        .frame(width: 360)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(.white.opacity(0.18), lineWidth: 1)
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+}
+
+private func temporaryAccessGrantRemainingText(_ remaining: TimeInterval) -> String {
+    let seconds = max(0, Int(ceil(remaining)))
+    return String(format: "%d:%02d", seconds / 60, seconds % 60)
+}
+
+private func temporaryAccessGrantUsageText(_ grant: TemporaryAccessGrantSnapshot) -> String {
+    let uses = grant.useCount == 1 ? "1 use" : "\(grant.useCount) uses"
+    return "Write Access: \(uses) · Last used \(grant.lastUsedAt.formatted(date: .omitted, time: .standard))"
+}
+
+private func temporaryAccessGrantMenuTitle(
+    _ grant: TemporaryAccessGrantSnapshot,
+    wallNow: Date,
+    monotonicNow: TimeInterval
+) -> String {
+    let remaining = temporaryAccessGrantRemainingText(
+        grant.remaining(wallNow: wallNow, monotonicNow: monotonicNow)
+    )
+    let countdown = grant.isCountdownSuspended ? "\(remaining) suspended" : remaining
+    return "\(grant.launcherName) → \(grant.authorizationGateName) · \(grant.scope.agentTaskContext.provider.taskLabel) \(grant.scope.agentTaskContext.abbreviatedID) · \(countdown) · \(temporaryAccessGrantUsageText(grant)) — End"
+}
+
+private final class TemporaryAccessGrantPanel: NSPanel {
+    private var allowsKey = false
+
+    override var canBecomeKey: Bool { allowsKey }
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .leftMouseDown, !isKeyWindow {
+            allowsKey = true
+            makeKey()
+        }
+        super.sendEvent(event)
+    }
+
+    override func close() {}
+    override func performClose(_ sender: Any?) {}
+}
+
+@MainActor
+private func makeTemporaryAccessGrantPanel() -> TemporaryAccessGrantPanel {
+    let panel = TemporaryAccessGrantPanel(
+        contentRect: .zero,
+        styleMask: [.borderless, .nonactivatingPanel],
+        backing: .buffered,
+        defer: false
+    )
+    panel.isFloatingPanel = true
+    panel.level = .statusBar
+    panel.hidesOnDeactivate = false
+    panel.canHide = false
+    panel.worksWhenModal = true
+    panel.isOpaque = false
+    panel.backgroundColor = .clear
+    panel.hasShadow = true
+    panel.animationBehavior = .none
+    panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+    return panel
+}
+
+private struct TemporaryAccessGrantStripView: View {
+    let grants: [TemporaryAccessGrantSnapshot]
+    let wallNow: Date
+    let monotonicNow: TimeInterval
+    let collapse: () -> Void
+    let addTenMinutes: (UUID) -> Void
+    let end: (UUID) -> Void
+    let setCountdownSuspended: (UUID, Bool) -> Void
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Label("TEMPORARY WRITE ACCESS", systemImage: "exclamationmark.shield.fill")
+                .font(.caption.weight(.semibold))
+                .tracking(1.1)
+                .foregroundStyle(.orange)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .accessibilityLabel(grants.allSatisfy { $0.isCountdownSuspended }
+                    ? String(localized: "Temporary Write Access is suspended")
+                    : String(localized: "Warning: Temporary Write Access is active"))
+
+            Divider()
+
+            ForEach(Array(grants.enumerated()), id: \.element.id) { index, grant in
+                TemporaryAccessGrantRow(
+                    grant: grant,
+                    remaining: grant.remaining(wallNow: wallNow, monotonicNow: monotonicNow),
+                    addTenMinutes: { addTenMinutes(grant.id) },
+                    end: { end(grant.id) },
+                    setCountdownSuspended: { setCountdownSuspended(grant.id, $0) }
+                )
+                if index != grants.indices.last {
+                    Divider().padding(.leading, 42)
+                }
+            }
+        }
+        .frame(width: 430)
+        .background {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(reduceTransparency
+                    ? AnyShapeStyle(Color(nsColor: .windowBackgroundColor))
+                    : AnyShapeStyle(.regularMaterial))
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(.separator.opacity(0.8), lineWidth: 1)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .onTapGesture(perform: collapse)
+        .accessibilityAction(named: Text("Collapse Strip"), collapse)
+    }
+}
+
+private struct CollapsedTemporaryAccessGrantStripView: View {
+    let grantCount: Int
+    let show: () -> Void
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    var body: some View {
+        Button(action: show) {
+            VStack(spacing: 1) {
+                Image(systemName: "exclamationmark.shield.fill")
+                    .font(.headline)
+                Text("\(grantCount)")
+                    .font(.caption2.monospacedDigit().weight(.semibold))
+            }
+            .foregroundStyle(.orange)
+            .frame(width: 52, height: 44)
+            .background {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(reduceTransparency
+                        ? AnyShapeStyle(Color(nsColor: .windowBackgroundColor))
+                        : AnyShapeStyle(.regularMaterial))
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(.separator.opacity(0.8), lineWidth: 1)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .help("Show Temporary Access Grant Strip")
+        .accessibilityLabel(
+            "Show \(grantCount) active Temporary Access \(grantCount == 1 ? "Grant" : "Grants")"
+        )
+        .accessibilityHint("Opens the complete Temporary Access Grant Strip")
+    }
+}
+
+private struct TemporaryAccessGrantRow: View {
+    let grant: TemporaryAccessGrantSnapshot
+    let remaining: TimeInterval
+    let addTenMinutes: () -> Void
+    let end: () -> Void
+    let setCountdownSuspended: (Bool) -> Void
+
+    private var countdownStatus: String {
+        let remainingText = "\(temporaryAccessGrantRemainingText(remaining)) remaining"
+        return grant.isCountdownSuspended
+            ? "\(remainingText) · Write Access suspended"
+            : remainingText
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("\(grant.launcherName) → \(grant.authorizationGateName)")
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text("\(grant.scope.agentTaskContext.provider.taskLabel) \(grant.scope.agentTaskContext.abbreviatedID) · \(countdownStatus)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Text(temporaryAccessGrantUsageText(grant))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(
+                "\(grant.launcherName), \(grant.authorizationGateName), \(grant.scope.agentTaskContext.provider.taskLabel) \(grant.scope.agentTaskContext.abbreviatedID), \(countdownStatus), \(temporaryAccessGrantUsageText(grant))"
+            )
+
+            ControlGroup {
+                Button("End", action: end)
+                    .accessibilityLabel(
+                        "End temporary Write Access for \(grant.launcherName), \(grant.scope.agentTaskContext.provider.taskLabel) \(grant.scope.agentTaskContext.abbreviatedID)"
+                    )
+                Menu {
+                    Button("Add 10 Minutes", action: addTenMinutes)
+                    Divider()
+                    Button(grant.isCountdownSuspended
+                        ? String(localized: "Resume Write Access")
+                        : String(localized: "Pause Write Access")
+                    ) {
+                        setCountdownSuspended(!grant.isCountdownSuspended)
+                    }
+                } label: {
+                    Label("Temporary Write Access options", systemImage: "chevron.down")
+                        .labelStyle(.iconOnly)
+                }
+                .menuIndicator(.hidden)
+                .accessibilityHint("Opens options to add time or pause Write Access")
+            }
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+    }
+}
+
+@MainActor
+private func installPanelContent(_ content: NSView, in panel: NSWindow) -> NSSize {
+    // Window attachment supplies display metrics; measuring earlier can resize again on the next layout.
+    panel.contentView = content
+    content.layoutSubtreeIfNeeded()
+    let size = content.fittingSize
+    content.frame.size = size
+    return size
+}
+
+private func autoApprovalToastFrame(anchor: NSRect, visibleFrame: NSRect, size: NSSize) -> NSRect {
+    let margin: CGFloat = 8
+    let x = min(max(anchor.midX - size.width / 2, visibleFrame.minX + margin), visibleFrame.maxX - size.width - margin)
+    let y = max(visibleFrame.minY + margin, min(anchor.minY - 4, visibleFrame.maxY) - size.height)
+    return NSRect(origin: NSPoint(x: x, y: y), size: size)
+}
+
+private func temporaryAccessGrantTabFrame(
+    anchor: NSRect,
+    visibleFrame: NSRect,
+    size: NSSize
+) -> NSRect {
+    let margin: CGFloat = 8
+    let peek: CGFloat = 8
+    let x = anchor.midX < visibleFrame.midX
+        ? visibleFrame.minX - peek
+        : visibleFrame.maxX - size.width + peek
+    let y = max(visibleFrame.minY + margin, visibleFrame.maxY - size.height - margin)
+    return NSRect(origin: NSPoint(x: x, y: y), size: size)
+}
+
+private func shouldAnimateTemporaryAccessGrantPanelTransition(
+    isVisible: Bool,
+    reduceMotion: Bool,
+    from: NSRect,
+    to: NSRect
+) -> Bool {
+    isVisible && !reduceMotion && from != to
+}
+
+@MainActor
+private func reanchorToastWindows(below frame: NSRect, visibleFrame: NSRect) {
+    for window in toastWindows where window.isVisible {
+        window.setFrame(
+            autoApprovalToastFrame(anchor: frame, visibleFrame: visibleFrame, size: window.frame.size),
+            display: true
+        )
+    }
+}
+
+@MainActor
+private func showAutomaticAccessToast(
+    _ record: AutoApprovalRecord,
+    below button: NSStatusBarButton?
+) {
+    guard let button, let statusWindow = button.window else { return }
+    let anchor = statusWindow.convertToScreen(button.convert(button.bounds, to: nil))
+    let window = NSPanel(
+        contentRect: .zero,
+        styleMask: [.borderless, .nonactivatingPanel],
+        backing: .buffered,
+        defer: false
+    )
+    let hostingView = NSHostingView(rootView: AutomaticAccessToastView(record: record) { [weak window] in
+        if let window {
+            window.orderOut(nil)
+            toastWindows.removeAll { $0 === window }
+        }
+    })
+    let size = installPanelContent(hostingView, in: window)
+    let visibleFrame = statusWindow.screen?.visibleFrame ?? NSScreen.main?.visibleFrame
+        ?? NSRect(x: 0, y: 0, width: 800, height: 600)
+    let frame = autoApprovalToastFrame(
+        anchor: temporaryAccessGrantStripFrame ?? anchor,
+        visibleFrame: visibleFrame,
+        size: size
+    )
+    window.setFrame(frame, display: false)
+    window.level = .statusBar
+    window.isOpaque = false
+    window.backgroundColor = .clear
+    window.hasShadow = true
+    window.alphaValue = 0
+    toastWindows.append(window)
+    window.orderFront(nil)
+    NSAnimationContext.runAnimationGroup { context in
+        context.duration = 0.15
+        window.animator().alphaValue = 1
+    }
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.25
+            window.animator().alphaValue = 0
+        }, completionHandler: {
+            Task { @MainActor in
+                window.orderOut(nil)
+                toastWindows.removeAll { $0 === window }
+            }
+        })
+    }
+}
+
+@MainActor
+private func runSecretMutationSelfCheck() async -> Int32 {
+    // Tool-gate denial must not transfer to an unrelated Secret mutation.
+    let gate = SecretGate(id: "gh", keyPatterns: ["TOKEN"], routes: [], defaultProtection: .noAccess, appPolicies: [])
+    let scope = TemporaryLauncherDenialScope(gate: gate, classification: .mutating)!
+    for phase in 0..<3 {
+        let ancestor = LauncherIdentity(pid: 1, path: "/ancestor", identifier: "ancestor", teamIdentifier: "TEST",
+            designatedRequirement: "mutation-denial-\(UUID().uuidString)", runtimeProtection: .hardened)
+        let child = LauncherIdentity(pid: 2, path: "/child", identifier: "child", teamIdentifier: "TEST",
+            designatedRequirement: "child", runtimeProtection: .hardened)
+        if phase == 0 { TemporaryLauncherDenials.shared.deny(ancestor.designatedRequirement, launcherName: "Ancestor", scope: scope) }
+        var performed = false
+        var deniedRecord: AccessRequestRecord?
+        let result = await performApprovedSecretMutation(
+            .delete(account: "TEST_SECRET"), callerPath: "/usr/local/bin/av", pid: 42,
+            signing: SigningInfo(identifier: "com.automicvault.av", teamIdentifier: "TEST"),
+            launcher: child, launchers: [child, ancestor], launcherFallbackPath: child.path,
+            canRequestHumanApproval: { true },
+            onAccessRequest: { record in
+                if record.decision == "Denied" { deniedRecord = record }
+                if phase == 2 { TemporaryLauncherDenials.shared.deny(ancestor.designatedRequirement, launcherName: "Ancestor", scope: scope) }
+                return true
+            },
+            decision: { _ in
+                if phase == 1 { TemporaryLauncherDenials.shared.deny(ancestor.designatedRequirement, launcherName: "Ancestor", scope: scope) }
+                return .approved
+            },
+            perform: { _ in performed = true; return errSecSuccess }
+        )
+        guard result.status == errSecSuccess, performed, deniedRecord == nil else { return 20 }
+    }
+
+    let credentialMutationRequest = SecretMutation.terraformDelete(
+        account: terraformCredentialSecretName("registry.example"),
+        hostname: "registry.example"
+    ).approvalRequest(callerPath: "/usr/local/bin/av", requestCWD: "/tmp/project")
+    guard credentialMutationRequest.cwd == "/tmp/project" else { return 1 }
+
+    for mutation in [
+        SecretMutation.save(account: "TEST_SECRET", value: "secret", accessibility: .whenUnlocked),
+        SecretMutation.saveIfAbsentOrEqual(account: "TEST_SECRET", value: "secret"),
+        SecretMutation.delete(account: "TEST_SECRET"),
+    ] {
+        var performed = false
+        let result = await performApprovedSecretMutation(
+            mutation,
+            callerPath: "/usr/local/bin/av",
+            pid: 42,
+            signing: SigningInfo(identifier: "com.automicvault.av", teamIdentifier: "TEAM"),
+            launcher: nil,
+            launcherFallbackPath: "/Applications/Terminal.app",
+            canRequestHumanApproval: { true },
+            onAccessRequest: { _ in true },
+            decision: { _ in .denied },
+            perform: { _ in
+                performed = true
+                return errSecSuccess
+            }
+        )
+        guard result.status == nil, !performed else { return 1 }
+    }
+
+    var performedWhileInactive = false
+    let inactive = await performApprovedSecretMutation(
+        .saveIfAbsentOrEqual(account: "TEST_SECRET", value: "secret"),
+        callerPath: "/usr/local/bin/av",
+        pid: 42,
+        signing: SigningInfo(identifier: "com.automicvault.av", teamIdentifier: "TEAM"),
+        launcher: nil,
+        launcherFallbackPath: "/Applications/Terminal.app",
+        canRequestHumanApproval: { false },
+        onAccessRequest: { _ in true },
+        decision: { _ in .approved },
+        perform: { _ in
+            performedWhileInactive = true
+            return errSecSuccess
+        }
+    )
+    guard inactive.status == nil,
+          inactive.error == "secret mutation denied while user session is inactive",
+          !performedWhileInactive
+    else { return 1 }
+
+    var cancellationRecord: AccessRequestRecord?
+    var performedAfterCancellation = false
+    let canceled = await performApprovedSecretMutation(
+        .delete(account: "TEST_SECRET"),
+        callerPath: "/usr/local/bin/av",
+        pid: 42,
+        signing: SigningInfo(identifier: "com.automicvault.av", teamIdentifier: "TEAM"),
+        launcher: nil,
+        launcherFallbackPath: "/Applications/Terminal.app",
+        canRequestHumanApproval: { true },
+        onAccessRequest: { record in
+            cancellationRecord = record
+            return true
+        },
+        decision: { _ in .canceled },
+        perform: { _ in
+            performedAfterCancellation = true
+            return errSecSuccess
+        }
+    )
+    guard canceled.status == nil,
+          canceled.error == "secret mutation canceled",
+          cancellationRecord?.decision == "Canceled",
+          cancellationRecord?.reason == "Gate client exited",
+          !performedAfterCancellation
+    else { return 1 }
+
+    var performedWithoutAudit = false
+    let unaudited = await performApprovedSecretMutation(
+        .delete(account: "TEST_SECRET"),
+        callerPath: "/usr/local/bin/av",
+        pid: 42,
+        signing: SigningInfo(identifier: "com.automicvault.av", teamIdentifier: "TEAM"),
+        launcher: nil,
+        launcherFallbackPath: "/Applications/Terminal.app",
+        canRequestHumanApproval: { true },
+        onAccessRequest: { _ in false },
+        decision: { _ in .approved },
+        perform: { _ in
+            performedWithoutAudit = true
+            return errSecSuccess
+        }
+    )
+    guard unaudited.status == nil, !performedWithoutAudit else { return 1 }
+
+    let dockerRequest = ApprovalRequest(
+        op: "docker-save",
+        keys: ["DOCKER_REGISTRY_CREDENTIAL_TEST"],
+        target: "/Applications/Docker.app/Contents/Resources/bin/docker",
+        args: ["login", "registry.example"],
+        cwd: "",
+        replaceExistingEnv: false,
+        allowMissingKeys: false,
+        envConflicts: [],
+        shebangScript: nil,
+        scriptData: nil,
+        tool: "docker",
+        title: nil,
+        detail: nil
+    )
+    var approvedRequest: ApprovalRequest?
+    var performedAfterFailedPreflight = false
+    let changedDocker = await performApprovedSecretMutation(
+        .dockerDelete(account: "DOCKER_REGISTRY_CREDENTIAL_TEST", serverURL: "registry.example"),
+        callerPath: "/usr/local/bin/av",
+        pid: 42,
+        signing: SigningInfo(identifier: "com.automicvault.av", teamIdentifier: "TEAM"),
+        launcher: nil,
+        launcherFallbackPath: "/Applications/Terminal.app",
+        canRequestHumanApproval: { true },
+        onAccessRequest: { _ in true },
+        decision: {
+            approvedRequest = $0
+            return .approved
+        },
+        perform: { _ in
+            performedAfterFailedPreflight = true
+            return errSecSuccess
+        },
+        preflight: { "Docker Target changed before mutation" },
+        requestOverride: dockerRequest
+    )
+    guard approvedRequest?.target == dockerRequest.target,
+          approvedRequest?.args == dockerRequest.args,
+          changedDocker.status == nil,
+          changedDocker.error == "Docker Target changed before mutation",
+          !performedAfterFailedPreflight
+    else { return 1 }
+    return 0
+}
+
+private func runKeychainPersistenceSelfCheck() -> Int32 {
+    let service = "com.automicvault.self-check.\(UUID().uuidString)"
+    let account = "KEYCHAIN_SELF_CHECK"
+    let value = UUID().uuidString
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: service,
+        kSecAttrAccount as String: account,
+        kSecAttrAccessGroup as String: "ZU76A67LGU.com.automicvault",
+        kSecUseDataProtectionKeychain as String: true,
+    ]
+    defer { SecItemDelete(query as CFDictionary) }
+
+    guard saveStoredSecret(
+        account: account,
+        value: value,
+        accessibility: .afterFirstUnlock,
+        service: service
+    ) == errSecSuccess,
+        loadStoredSecret(account: account, service: service) == value,
+        storedSecretExists(account: account, service: service)
+    else { return 1 }
+
+    var attributesQuery = query
+    attributesQuery[kSecReturnAttributes as String] = true
+    attributesQuery[kSecMatchLimit as String] = kSecMatchLimitOne
+    var attributesResult: CFTypeRef?
+    guard SecItemCopyMatching(attributesQuery as CFDictionary, &attributesResult) == errSecSuccess,
+          let attributes = attributesResult as? [String: Any],
+          attributes[kSecAttrAccessible as String] as? String
+              == kSecAttrAccessibleAfterFirstUnlock as String,
+          deleteStoredSecret(account: account, service: service) == errSecSuccess,
+          !storedSecretExists(account: account, service: service)
+    else { return 1 }
+    let gate = SecretGate(id: "gh", keyPatterns: ["TOKEN"], routes: [],
+                          defaultProtection: .fullIncludingSecretDumps, appPolicies: [])
+    let requirement = "identifier com.automicvault.denial-self-check"
+    guard setSecretGateDefaultProtection(.readOnly, for: gate, service: service, account: account) == errSecSuccess,
+          setSecretGateDenialThreshold(.fullIncludingSecretDumps, requirement: requirement, in: gate,
+              runtimeRequirement: .hardened, service: service, account: account) == errSecSuccess
+    else { return 2 }
+    let inherited = reloadSecretGatePolicy(for: gate, service: service, account: account)
+    guard inherited.appPolicies.first?.usesGateDefault == true,
+          inherited.appPolicies.first?.protection == .readOnly,
+          inherited.defaultPolicyLabel == "Default Policy",
+          setSecretGateDenialThreshold(nil, requirement: requirement, in: gate, runtimeRequirement: .hardened,
+              approvedDenialThreshold: .fullIncludingSecretDumps, service: service, account: account) == errSecSuccess,
+          reloadSecretGatePolicy(for: gate, service: service, account: account).appPolicies.isEmpty,
+          setSecretGateDenialThreshold(.fullIncludingSecretDumps, requirement: requirement, in: gate,
+              runtimeRequirement: .hardened, service: service, account: account) == errSecSuccess,
+          removeSecretGatePolicies(forLauncherRequirement: requirement, service: service, account: account) == errSecSuccess,
+          reloadSecretGatePolicy(for: gate, service: service, account: account).appPolicies.first?.usesGateDefault == true,
+          reloadSecretGatePolicy(for: gate, service: service, account: account).appPolicies.first?.protection == .readOnly,
+          setSecretGateDefaultProtection(.noAccess, for: gate, service: service, account: account) == errSecSuccess,
+          reloadSecretGatePolicy(for: gate, service: service, account: account).appPolicies.first?.protection == .noAccess,
+          setSecretGateAppProtection(requirement: requirement, protection: .fullIncludingSecretDumps,
+              for: gate, service: service, account: account) == errSecSuccess
+    else { return 3 }
+    func denial(_ classification: SecretGateRequestClassification) -> String? {
+        secretGateDenialReason(gate: gate, classification: classification, launcherRequirements: [requirement],
+                              service: service, account: account)
+    }
+    guard denial(.secretDump) != nil, denial(.readOnly) == nil,
+          secretGateDenial(gate: gate, classification: .secretDump,
+              launcherRequirements: ["unmatched child", requirement], service: service, account: account)?.launcherRequirement == requirement,
+          let policy = reloadSecretGatePolicy(for: gate, service: service, account: account).appPolicies.first,
+          policy.denialThreshold == .fullIncludingSecretDumps,
+          setSecretGateDenialThreshold(.fullExceptSecretDumps, requirement: requirement, in: gate,
+              runtimeRequirement: .hardened, service: service, account: account) == errSecSuccess,
+          setSecretGateDenialThreshold(nil, requirement: requirement, in: gate, runtimeRequirement: .hardened,
+              approvedDenialThreshold: policy.denialThreshold, service: service, account: account) == errSecAuthFailed,
+          removeSecretGateAppPolicy(policy, from: gate, approvedDenialThreshold: policy.denialThreshold,
+              service: service, account: account) == errSecAuthFailed,
+          denial(.mutating) != nil,
+          setSecretGateDenialThreshold(.fullIncludingSecretDumps, requirement: requirement, in: gate,
+              runtimeRequirement: .hardened, approvedDenialThreshold: .fullExceptSecretDumps,
+              service: service, account: account) == errSecSuccess,
+          setSecretGateDenialThreshold(nil, requirement: requirement, in: gate, runtimeRequirement: .hardened,
+              service: service, account: account) == errSecAuthFailed,
+          removeSecretGateAppPolicy(policy, from: gate, service: service, account: account) == errSecAuthFailed,
+          setSecretGateDefaultProtection(.fullIncludingSecretDumps, for: gate, service: service, account: account) == errSecSuccess,
+          removeSecretGatePolicies(forLauncherRequirement: requirement, service: service, account: account) == errSecSuccess,
+          reloadSecretGatePolicy(for: gate, service: service, account: account).appPolicies.first?.usesGateDefault == false,
+          reloadSecretGatePolicy(for: gate, service: service, account: account).appPolicies.first?.protection == .noAccess,
+          denial(.secretDump) != nil,
+          setSecretGateDenialThreshold(nil, requirement: requirement, in: gate, runtimeRequirement: .hardened,
+              approvedDenialThreshold: .fullIncludingSecretDumps, service: service, account: account) == errSecSuccess,
+          denial(.secretDump) == nil,
+          saveStoredSecret(account: account, value: "malformed", accessibility: .afterFirstUnlock, service: service) == errSecSuccess,
+          denial(.readOnly) == "Denied because Authorization Policy is unavailable"
+    else { return 4 }
+    return 0
+}
+
+// Exercise real XPC replies, including reuse of the request dictionary between chunks.
+private func historyTransferWireSelfCheck() -> Bool {
+    let data = Data(String(repeating: "history 界\n", count: 120_000).utf8)
+    let listener = xpc_connection_create(nil, DispatchQueue.global(qos: .userInitiated))
+    xpc_connection_set_event_handler(listener) { event in
+        guard xpc_get_type(event) == XPC_TYPE_CONNECTION else { return }
+        let peer = event
+        let transfer = AuthorizationHistoryTransfer()
+        guard transfer.begin(), transfer.prepare(data) else { return }
+        xpc_connection_set_event_handler(peer) { message in
+            guard xpc_get_type(message) == XPC_TYPE_DICTIONARY else {
+                transfer.cancel()
+                return
+            }
+            let offset = Int(xpc_dictionary_get_uint64(message, "offset"))
+            if let chunk = transfer.next(offset: offset) {
+                replyHistoryChunk(chunk, to: message, on: peer)
+            } else {
+                let response = xpc_dictionary_create_reply(message)!
+                xpc_dictionary_set_bool(response, "ok", false)
+                xpc_connection_send_message(peer, response)
+            }
+        }
+        xpc_connection_activate(peer)
+    }
+    xpc_connection_activate(listener)
+    defer { xpc_connection_cancel(listener) }
+    let client = xpc_connection_create_from_endpoint(xpc_endpoint_create(listener))
+    xpc_connection_set_event_handler(client) { _ in }
+    xpc_connection_activate(client)
+    defer { xpc_connection_cancel(client) }
+    let request = xpc_dictionary_create_empty()
+    var received = Data()
+    while received.count < data.count {
+        xpc_dictionary_set_uint64(request, "offset", UInt64(received.count))
+        let response = xpc_connection_send_message_with_reply_sync(client, request)
+        guard xpc_get_type(response) == XPC_TYPE_DICTIONARY,
+              xpc_dictionary_get_bool(response, "ok"),
+              xpc_dictionary_get_uint64(response, "offset") == UInt64(received.count),
+              xpc_dictionary_get_uint64(response, "total") == UInt64(data.count) else { return false }
+        var count = 0
+        guard let bytes = xpc_dictionary_get_data(response, "history_chunk", &count),
+              count > 0, count <= AuthorizationHistoryTransfer.chunkBytes else { return false }
+        received.append(bytes.assumingMemoryBound(to: UInt8.self), count: count)
+    }
+    xpc_dictionary_set_uint64(request, "offset", UInt64(received.count))
+    let exhausted = xpc_connection_send_message_with_reply_sync(client, request)
+    return received == data && xpc_get_type(exhausted) == XPC_TYPE_DICTIONARY
+        && !xpc_dictionary_get_bool(exhausted, "ok")
+}
+
+private func runMetadataDisclosureSelfCheck() -> Int32 {
+    guard historyTransferWireSelfCheck() else { return 1 }
+    let wire = xpc_dictionary_create_empty()
+    let wireNow = Date(timeIntervalSince1970: 1_000_000)
+    guard validatedAuthorizationHistorySince(
+        operation: .history, message: wire, now: wireNow
+    ).valid,
+        !validatedAuthorizationHistorySince(
+            operation: .historyWindow, message: wire, now: wireNow
+        ).valid else { return 1 }
+    xpc_dictionary_set_uint64(wire, "since", 0)
+    guard !validatedAuthorizationHistorySince(
+        operation: .historyWindow, message: wire, now: wireNow
+    ).valid else { return 1 }
+    xpc_dictionary_set_string(wire, "since", "999999")
+    guard !validatedAuthorizationHistorySince(
+        operation: .historyWindow, message: wire, now: wireNow
+    ).valid else { return 1 }
+    xpc_dictionary_set_uint64(wire, "since", 1_000_001)
+    guard !validatedAuthorizationHistorySince(
+        operation: .historyWindow, message: wire, now: wireNow
+    ).valid else { return 1 }
+    xpc_dictionary_set_uint64(wire, "since", 999_999)
+    guard !validatedAuthorizationHistorySince(
+        operation: .history, message: wire, now: wireNow
+    ).valid,
+        validatedAuthorizationHistorySince(
+            operation: .historyWindow, message: wire, now: wireNow
+        ).since == Date(timeIntervalSince1970: 999_999) else { return 1 }
+
+    let chunkedWire = xpc_dictionary_create_empty()
+    guard validatedAuthorizationHistorySince(operation: .historyRead, message: chunkedWire, now: wireNow).valid
+    else { return 1 }
+    xpc_dictionary_set_string(chunkedWire, "since", "7d")
+    guard !validatedAuthorizationHistorySince(operation: .historyRead, message: chunkedWire, now: wireNow).valid
+    else { return 1 }
+    xpc_dictionary_set_uint64(chunkedWire, "since", 999_999)
+    guard validatedAuthorizationHistorySince(operation: .historyRead, message: chunkedWire, now: wireNow).since
+        == Date(timeIntervalSince1970: 999_999) else { return 1 }
+    xpc_dictionary_set_uint64(chunkedWire, "since", 1_000_001)
+    guard !validatedAuthorizationHistorySince(operation: .historyRead, message: chunkedWire, now: wireNow).valid
+    else { return 1 }
+
+    let requirement = #"identifier "com.apple.Terminal" and anchor apple"#
+    let launcher = LauncherIdentity(
+        pid: 42,
+        path: "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
+        identifier: "com.apple.Terminal",
+        teamIdentifier: "APPLE",
+        designatedRequirement: requirement,
+        runtimeProtection: .hardened
+    )
+    let grant = BlessedScriptLauncher(
+        bundleIdentifier: launcher.identifier,
+        requirement: requirement
+    )
+    guard metadataDisclosureHasAutomaticAccess(
+        .secretNames(globalOnly: false),
+        launchers: [launcher],
+        secretNameAccessApps: [grant],
+        authorizationHistoryAccessApps: []
+    ),
+        !metadataDisclosureHasAutomaticAccess(
+            .authorizationHistory(since: nil),
+            launchers: [launcher],
+            secretNameAccessApps: [grant],
+            authorizationHistoryAccessApps: []
+        ),
+        metadataDisclosureHasAutomaticAccess(
+            .authorizationHistory(since: nil),
+            launchers: [launcher],
+            secretNameAccessApps: [],
+            authorizationHistoryAccessApps: [grant]
+        )
+    else { return 1 }
+
+    let record = AccessRequestRecord(
+        date: Date(timeIntervalSince1970: 0),
+        tool: "av",
+        command: "av history --token plaintext-credential",
+        displayCommand: "av history --token <redacted>",
+        decision: "Approved",
+        approvalSource: "Manual",
+        reason: "Allowed once in prompt",
+        launcher: "Terminal",
+        callerPath: "/usr/local/bin/av",
+        target: "/usr/local/bin/av",
+        cwd: "/tmp",
+        keys: [],
+        detail: nil
+    )
+    var recordedSuccessfulDisclosure = false
+    var historyReadCount = 0
+    guard let disclosure = authorizationHistoryDisclosureValue(
+        record: record,
+        since: nil,
+        records: { _, limit, maximumBytes in
+            guard limit == 49, maximumBytes == 1_048_576 else { return nil }
+            historyReadCount += 1
+            guard !recordedSuccessfulDisclosure else { return nil }
+            return []
+        },
+        onAccessRequest: { _ in
+            recordedSuccessfulDisclosure = true
+            return true
+        }
+    ), recordedSuccessfulDisclosure, historyReadCount == 1,
+        let disclosureData = disclosure.data(using: .utf8)
+    else { return 1 }
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    guard let disclosedRecords = try? decoder.decode([AccessRequestRecord].self, from: disclosureData),
+          disclosedRecords.first?.id == record.id,
+          disclosedRecords.first?.command == record.commandForDisplay,
+          disclosedRecords.first?.command != record.command
+    else { return 1 }
+    guard let bounded = authorizationHistoryDisclosureValue(
+        record: record,
+        since: nil,
+        records: { _, limit, _ in
+            guard limit == 49 else { return nil }
+            return Array(repeating: record, count: 49)
+        },
+        onAccessRequest: { _ in true }
+    ), let boundedData = bounded.data(using: .utf8),
+        let boundedRecords = try? decoder.decode([AccessRequestRecord].self, from: boundedData),
+        boundedRecords.count == 50, boundedRecords.first?.id == record.id
+    else { return 1 }
+    let since = Date(timeIntervalSince1970: 123)
+    let now = Date(timeIntervalSince1970: 4_000_000)
+    guard authorizationHistorySinceIsValid(now.addingTimeInterval(-31 * 24 * 60 * 60), now: now),
+          !authorizationHistorySinceIsValid(now.addingTimeInterval(1), now: now)
+    else { return 1 }
+    var windowReads = 0
+    var windowRecorded = false
+    guard let window = authorizationHistoryDisclosureValue(
+        record: record,
+        since: since,
+        records: { forwardedSince, limit, maximumBytes in
+            guard forwardedSince == since, limit == nil,
+                  maximumBytes == 1_048_576 else { return nil }
+            windowReads += 1
+            guard !windowRecorded else { return nil }
+            return Array(repeating: record, count: 50)
+        },
+        onAccessRequest: { _ in
+            windowRecorded = true
+            return true
+        }
+    ), windowRecorded, windowReads == 1,
+        let windowData = window.data(using: .utf8),
+        let windowRecords = try? decoder.decode([AccessRequestRecord].self, from: windowData),
+        windowRecords.count == 51
+    else { return 1 }
+    var largeReadRecorded = false
+    guard let largeWindow = authorizationHistoryDisclosureValue(
+        record: record,
+        since: since,
+        maximumReplyBytes: nil,
+        records: { forwardedSince, limit, maximumBytes in
+            guard forwardedSince == since, limit == nil, maximumBytes == nil else { return nil }
+            return Array(repeating: record, count: 4_000)
+        },
+        onAccessRequest: { _ in largeReadRecorded = true; return true }
+    ), largeReadRecorded, largeWindow.utf8.count > 1_048_576,
+        let largeData = largeWindow.data(using: .utf8),
+        let largeRecords = try? decoder.decode([AccessRequestRecord].self, from: largeData),
+        largeRecords.count == 4_001,
+        largeRecords.allSatisfy({ $0.command == record.commandForDisplay })
+    else { return 1 }
+    guard authorizationHistoryDisclosureValue(
+        record: record, since: since, maximumReplyBytes: nil,
+        records: { _, _, _ in [] }, onAccessRequest: { _ in false }
+    ) == nil else { return 1 }
+    guard authorizationHistoryDisclosureValue(
+        record: record,
+        since: since,
+        records: { _, _, _ in Array(repeating: record, count: 4_000) },
+        onAccessRequest: { _ in true }
+    ) == nil else { return 1 }
+    guard authorizationHistoryDisclosureValue(
+        record: record,
+        since: nil,
+        records: { _, _, _ in [] },
+        onAccessRequest: { _ in false }
+    ) == nil else { return 1 }
+    var recordedUnavailableHistory = false
+    guard authorizationHistoryDisclosureValue(
+        record: record,
+        since: nil,
+        records: { _, _, _ in nil },
+        onAccessRequest: { _ in
+            recordedUnavailableHistory = true
+            return true
+        }
+    ) == nil, !recordedUnavailableHistory else { return 1 }
+    let canceledRead = ApprovalCancellation()
+    var recordedAfterCancellation = false
+    guard authorizationHistoryDisclosureValue(
+        record: record,
+        since: nil,
+        records: { _, _, _ in
+            canceledRead.cancel()
+            return []
+        },
+        isCanceled: { canceledRead.isCanceled },
+        onAccessRequest: { _ in recordedAfterCancellation = true; return true }
+    ) == nil, !recordedAfterCancellation else { return 1 }
+    return 0
+}
+
+@MainActor
+private func fileDescriptorInjectionSelfCheck() -> Bool {
+    let message = xpc_dictionary_create_empty()
+    func strings(_ key: String, _ values: [String]) {
+        let array = xpc_array_create_empty()
+        for value in values { value.withCString { xpc_array_set_string(array, XPC_ARRAY_APPEND, $0) } }
+        key.withCString { xpc_dictionary_set_value(message, $0, array) }
+    }
+    xpc_dictionary_set_string(message, "op", "inject-fd")
+    xpc_dictionary_set_string(message, "target", "/bin/cat")
+    xpc_dictionary_set_string(message, "cwd", "/tmp")
+    xpc_dictionary_set_string(message, "detail", "untrusted description")
+    xpc_dictionary_set_bool(message, "replace_existing_env", false)
+    xpc_dictionary_set_bool(message, "allow_missing_keys", false)
+    strings("keys", ["FOO", "BAR"])
+    strings("args", [])
+    strings("env_conflicts", [])
+    strings("secret_fds", ["FOO:3", "BAR:4"])
+    guard let request = approvalRequest(from: message),
+          request.detail?.contains("BAR → FD 4, FOO → FD 3") == true,
+          request.title == "Apply Secrets through file descriptors?",
+          phoneApprovalRisks(request: request, classification: nil, hasSecurityWarning: false)
+              == [.unconstrainedSecretApplication]
+    else { return false }
+    var identity = AVProcessIdentity()
+    guard av_process_identity(getpid(), &identity) else { return false }
+    let signing = SigningInfo(identifier: "com.automicvault.av", teamIdentifier: "TEAM")
+    let reuse = request.decisionReuseRequest(clientIdentity: identity, callerPath: "/usr/local/bin/av", signing: signing)
+    var cache = AuthorizationDecisionReuseCache()
+    cache.remember(.approved, for: reuse)
+    guard cache.decision(for: reuse) == nil,
+          request.selecting(SelectedSecretValues(values: [:])).detail == request.detail,
+          accessRequestRecord(request: request, callerPath: "/usr/local/bin/av", decision: "Approved",
+                              approvalSource: "Manual", reason: "test", launcher: nil).detail == request.detail,
+          approvalPromptSections(request: request, callerPath: "/usr/local/bin/av", pid: getpid(),
+                                 signing: signing, scriptApproval: nil, launcher: nil,
+                                 processSecurity: ApprovalProcessSecurity(nodes: []), receivedAt: Date())
+              .contains(where: { $0.title == "Secret Delivery" })
+    else { return false }
+    strings("secret_fds", ["FOO:4", "BAR:3"])
+    guard let swapped = approvalRequest(from: message),
+          swapped.decisionReuseRequest(clientIdentity: identity, callerPath: "/usr/local/bin/av", signing: signing) != reuse
+    else { return false }
+    for mappings in [["FOO:3"], ["FOO:3", "BAR:3"], ["FOO:1", "BAR:4"], ["FOO:3", "BAZ:4"]] {
+        strings("secret_fds", mappings)
+        guard approvalRequest(from: message) == nil else { return false }
+    }
+    strings("secret_fds", ["FOO:3", "BAR:4"])
+    for key in ["replace_existing_env", "allow_missing_keys"] {
+        key.withCString { xpc_dictionary_set_bool(message, $0, true) }
+        guard approvalRequest(from: message) == nil else { return false }
+        key.withCString { xpc_dictionary_set_bool(message, $0, false) }
+    }
+    strings("env_conflicts", ["FOO"])
+    guard approvalRequest(from: message) == nil else { return false }
+    strings("env_conflicts", [])
+    for key in ["shebang_script", "tool", "snapshot_incompatible_interpreter"] {
+        key.withCString { xpc_dictionary_set_string(message, $0, "unexpected") }
+        guard approvalRequest(from: message) == nil else { return false }
+        key.withCString { xpc_dictionary_set_value(message, $0, nil) }
+    }
+    for op in ["inject", "ssh-sign"] {
+        op.withCString { xpc_dictionary_set_string(message, "op", $0) }
+        strings("secret_fds", ["FOO:3", "BAR:4"])
+        guard approvalRequest(from: message) == nil else { return false }
+        xpc_dictionary_set_value(message, "secret_fds", nil)
+        guard approvalRequest(from: message)?.op == op else { return false }
+    }
+    return true
+}
+
+@MainActor
+private func runApprovalSelfCheck() -> Int32 {
+    guard embeddedTouchIDAttemptSelfCheck() else { return 1 }
+    guard fileDescriptorInjectionSelfCheck() else { return 1 }
+    // Adding denial-only policy must not shadow an ancestor's narrower allow rule.
+    let denialOnlyLauncher = LauncherIdentity(pid: 1, path: "/child", identifier: "child", teamIdentifier: "TEST",
+        designatedRequirement: "child", runtimeProtection: .hardened, isStandalone: true)
+    let restrictedLauncher = LauncherIdentity(pid: 2, path: "/parent", identifier: "parent", teamIdentifier: "TEST",
+        designatedRequirement: "parent", runtimeProtection: .hardened)
+    let denialOnlyGate = SecretGate(id: "gh", keyPatterns: ["TOKEN"], routes: [],
+        defaultProtection: .fullIncludingSecretDumps, appPolicies: [
+            SecretGatePolicy(bundleIdentifier: "child", requirement: "child", protection: .fullIncludingSecretDumps,
+                denialThreshold: .fullIncludingSecretDumps, usesGateDefault: true),
+            SecretGatePolicy(bundleIdentifier: "parent", requirement: "parent", protection: .noAccess),
+        ])
+    guard resolveSecretGatePolicy(gate: denialOnlyGate, launchers: [denialOnlyLauncher, restrictedLauncher])?.protection == .noAccess,
+          resolveSecretGatePolicy(gate: denialOnlyGate, launchers: [denialOnlyLauncher, restrictedLauncher])?.launcher?.designatedRequirement == "parent"
+    else { return 1 }
+    let helperSigning = SigningInfo(identifier: "com.automicvault", teamIdentifier: "TEAM")
+    var selfIdentity = AVProcessIdentity()
+    guard av_process_identity(getpid(), &selfIdentity), liveSigningInfo(pid: getpid()) != nil else {
+        return 1
+    }
+    var reusedIdentity = selfIdentity
+    reusedIdentity.start_usec &+= 1
+    guard sameProcessIdentity(selfIdentity, selfIdentity),
+          !sameProcessIdentity(selfIdentity, reusedIdentity)
+    else { return 1 }
+    guard let liveUse = liveSecretUseProcess(pid: getpid(), identity: selfIdentity),
+          liveSecretUseProcessIsLive(liveUse),
+          !liveSecretUseProcessIsLive(LiveSecretUseProcess(
+              pid: liveUse.pid,
+              startUsec: liveUse.startUsec &+ 1,
+              effectiveUserID: liveUse.effectiveUserID,
+              auditSessionID: liveUse.auditSessionID
+          ))
+    else { return 1 }
+    let reusedDockerPID = CredentialHelperParent(
+        pid: getpid(),
+        startUsec: selfIdentity.start_usec &+ 1,
+        euid: selfIdentity.euid,
+        target: pathString(selfIdentity),
+        arguments: []
+    )
+    guard liveSigningInfo(for: reusedDockerPID) == nil else { return 1 }
+    let targetRuntimeRequest = ApprovalRequest(
+        op: "inject",
+        keys: ["TEST_SECRET"],
+        target: "/bin/zsh",
+        args: [],
+        cwd: "/tmp",
+        replaceExistingEnv: false,
+        allowMissingKeys: false,
+        envConflicts: [],
+        shebangScript: nil,
+        scriptData: nil,
+        tool: nil,
+        title: nil,
+        detail: nil,
+        selectedSecretValues: SelectedSecretValues(values: [
+            "TEST_SECRET": StoredSecretValue(
+                source: .global,
+                keychainAccount: "TEST_SECRET",
+                accessibility: .whenUnlocked,
+                keychainProperties: []
+            ),
+        ])
+    )
+    let sshRequest = ApprovalRequest(
+        op: "ssh-sign", keys: [sshCredentialSecretName], target: "/usr/local/bin/av",
+        args: ["ssh-agent"], cwd: "/tmp", replaceExistingEnv: false,
+        allowMissingKeys: false, envConflicts: [], shebangScript: nil,
+        scriptData: nil, tool: "ssh-agent", title: nil, detail: nil,
+        sshPeer: SSHAgentPeer(
+            socket: .nullDevice, identity: selfIdentity, configuration: SSHAgentConfiguration(enabled: true, publicKey: "ssh-ed25519 " + Data(repeating: 1, count: 51).base64EncodedString()),
+            launchers: [], ancestors: [], arguments: [pathString(selfIdentity), "pangolin", "true"],
+            cwd: "/tmp", helperIdentity: selfIdentity
+        )
+    )
+    var scriptAncestor = selfIdentity
+    scriptAncestor.pid &+= 1
+    scriptAncestor.start_usec &+= 1
+    var unrelatedAncestor = selfIdentity
+    unrelatedAncestor.pid &+= 2
+    unrelatedAncestor.start_usec &+= 2
+    let scriptKey = BlessedExecutionKey(pid: scriptAncestor.pid, startUsec: scriptAncestor.start_usec)
+    let sshBlessing = BlessedScript(
+        path: "/tmp/publish.sh", checksum: "reviewed", keys: [], target: "/bin/bash",
+        replaceExistingEnv: false, allowMissingKeys: false,
+        capabilities: ["ssh-agent": .fullExceptSecretDumps], launchers: []
+    )
+    let insufficientSSHBlessing = BlessedScript(
+        path: sshBlessing.path, checksum: sshBlessing.checksum, keys: [], target: sshBlessing.target,
+        replaceExistingEnv: false, allowMissingKeys: false,
+        capabilities: ["ssh-agent": .readOnlyAndLocalWrites], launchers: []
+    )
+    let sshDescriptor = SecretGateDescriptor(
+        id: "ssh-agent", keyPatterns: [sshCredentialSecretName],
+        routes: [SecretGateRoute(
+            operation: "ssh-sign", scriptPath: nil, targetPath: sshRequest.target,
+            callerIdentifiers: ["com.automicvault.av"], keyPatterns: [sshCredentialSecretName],
+            replaceExistingEnv: false, allowMissingKeys: false
+        )]
+    )
+    let sshSigning = SigningInfo(identifier: "com.automicvault.av", teamIdentifier: "TEAM")
+    let additionalKey = SSHAgentCredential(name: "Homelab", publicKey: "ssh-ed25519 " + Data(repeating: 2, count: 51).base64EncodedString())
+    let additionalRequest = ApprovalRequest(
+        op: "ssh-sign", keys: [additionalKey.secretName], target: sshRequest.target,
+        args: sshRequest.args, cwd: sshRequest.cwd, replaceExistingEnv: false,
+        allowMissingKeys: false, envConflicts: [], shebangScript: nil,
+        scriptData: nil, tool: "ssh-agent", title: nil, detail: nil,
+        sshPeer: SSHAgentPeer(socket: .nullDevice, identity: selfIdentity,
+            configuration: SSHAgentConfiguration(enabled: true, credentials: [additionalKey]),
+            launchers: [], ancestors: [], arguments: [], cwd: "/tmp", helperIdentity: selfIdentity)
+    )
+    guard let additionalGate = matchingSecretGateDefinition(request: additionalRequest,
+            signing: sshSigning, descriptors: [sshDescriptor]),
+          additionalGate.id == additionalKey.gateID,
+          additionalGate.initialProtection == .noAccess,
+          classifySecretGateRequest(gateID: additionalGate.id, request: additionalRequest) == .mutating,
+          !blessedScriptCanAutoApprove(sshBlessing, request: additionalRequest,
+                signing: sshSigning, descriptors: [sshDescriptor])
+    else { print("Per-key SSH authority self-check failed"); return 1 }
+    let executions = [scriptKey: sshBlessing]
+    let innerKey = BlessedExecutionKey(pid: unrelatedAncestor.pid, startUsec: unrelatedAncestor.start_usec)
+    let blockingBlessing = BlessedScript(
+        path: "/tmp/inner.sh", checksum: "reviewed-inner", keys: [], target: "/bin/bash",
+        replaceExistingEnv: false, allowMissingKeys: false,
+        capabilities: ["gh": .readOnly], launchers: []
+    )
+    guard blessedScriptCanAutoApprove(
+        sshBlessing, request: sshRequest, signing: sshSigning, descriptors: [sshDescriptor]
+    ),
+        !blessedScriptCanAutoApprove(
+            insufficientSSHBlessing, request: sshRequest,
+            signing: sshSigning, descriptors: [sshDescriptor]
+        ),
+        sshScriptAuthority(
+            ancestors: [scriptAncestor, selfIdentity], executions: executions,
+            ceilings: [], currentBlessings: [sshBlessing]
+        ).canUse(sshBlessing),
+        sshScriptAuthority(
+            ancestors: [unrelatedAncestor, selfIdentity], executions: executions,
+            ceilings: [], currentBlessings: [sshBlessing]
+        ).nearestBlessing == nil,
+        sshScriptAuthority(
+            ancestors: [scriptAncestor], executions: executions,
+            ceilings: [], currentBlessings: []
+        ).nearestBlessing == nil,
+        !sshScriptAuthority(
+            ancestors: [scriptAncestor, selfIdentity], executions: executions,
+            ceilings: [scriptKey], currentBlessings: [sshBlessing]
+        ).canUse(sshBlessing),
+        !sshScriptAuthority(
+            ancestors: [unrelatedAncestor, scriptAncestor],
+            executions: [innerKey: blockingBlessing, scriptKey: sshBlessing],
+            ceilings: [], currentBlessings: [blockingBlessing, sshBlessing]
+        ).canUse(sshBlessing),
+        !sshScriptAuthority(
+            ancestors: [unrelatedAncestor, scriptAncestor],
+            executions: [innerKey: blockingBlessing, scriptKey: sshBlessing],
+            ceilings: [], currentBlessings: [sshBlessing]
+        ).allowsAutomaticAuthority,
+        !sshScriptAuthority(
+            ancestors: [scriptAncestor], executions: executions,
+            ceilings: [scriptKey], currentBlessings: [sshBlessing]
+        ).inheritsLauncherPolicy
+    else {
+        print("SSH Blessed Script authority self-check failed")
+        return 1
+    }
+    let testPayload = ApprovedPayload(secrets: [:], value: "test payload")
+    var delivered = false
+    do {
+        try releaseAfterSSHAuthorizationCheck(
+            testPayload, authorization: .blessing(sshBlessing), validatePeer: {},
+            currentAuthority: {
+                sshScriptAuthority(
+                    ancestors: [scriptAncestor], executions: executions,
+                    ceilings: [], currentBlessings: []
+                )
+            },
+            deliver: { _ in delivered = true }
+        )
+        return 1
+    } catch {}
+    guard !delivered else { return 1 }
+    do {
+        try releaseAfterSSHAuthorizationCheck(
+            testPayload, authorization: .blessing(sshBlessing), validatePeer: {},
+            currentAuthority: {
+                sshScriptAuthority(
+                    ancestors: [scriptAncestor], executions: executions,
+                    ceilings: [], currentBlessings: [sshBlessing]
+                )
+            },
+            deliver: { _ in delivered = true }
+        )
+    } catch { return 1 }
+    guard delivered else { return 1 }
+    delivered = false
+    do {
+        try releaseAfterSSHAuthorizationCheck(
+            testPayload, authorization: .blessing(sshBlessing),
+            validatePeer: { throw AppError("test peer changed") },
+            currentAuthority: {
+                sshScriptAuthority(
+                    ancestors: [scriptAncestor], executions: executions,
+                    ceilings: [], currentBlessings: [sshBlessing]
+                )
+            },
+            deliver: { _ in delivered = true }
+        )
+        return 1
+    } catch {}
+    guard !delivered else { return 1 }
+    for interpreter in ["bash", "zsh", "sh", "fish", "node", "nodejs", "python", "python3", "python3.14", "ruby", "perl", "php"] {
+        let path = "/usr/bin/" + interpreter
+        guard approvalProcessScriptOperand(path: path, arguments: [path, "scripts/publish file", "--token", "secret"]) == "scripts/publish file",
+              approvalProcessScriptOperand(path: path, arguments: [path]) == nil,
+              approvalProcessScriptOperand(path: path, arguments: [path, ""]) == nil,
+              approvalProcessScriptOperand(path: path, arguments: [path, "-"]) == nil,
+              approvalProcessScriptOperand(path: path, arguments: [path, "-c", "echo secret"]) == nil,
+              approvalProcessScriptOperand(path: path, arguments: [path, "--", "publish.sh"]) == nil
+        else { print("Script operand presentation self-check failed: \(interpreter)"); return 1 }
+    }
+    guard approvalProcessScriptOperand(path: "/usr/bin/ssh", arguments: ["ssh", "host"]) == nil,
+          approvalProcessScriptOperand(path: "/usr/bin/python3-imposter", arguments: ["python3-imposter", "script"]) == nil,
+          approvalProcessScriptOperand(path: "/usr/bin/node", arguments: ["node", "inspect", "script.js"]) == nil,
+          approvalProcessScriptOperand(path: "/usr/bin/node", arguments: ["npm", "install"]) == nil
+    else { return 1 }
+    let nodePath = "/opt/homebrew/bin/node"
+    let sshReuseRequest = sshRequest.decisionReuseRequest(
+        clientIdentity: selfIdentity, callerPath: sshRequest.target, signing: helperSigning
+    )
+    var sshReuseCache = AuthorizationDecisionReuseCache()
+    for outcome in [AuthorizationDecisionReuseOutcome.denied, .approved, .alwaysApproved] {
+        sshReuseCache.remember(outcome, for: sshReuseRequest)
+        guard sshReuseCache.decision(for: sshReuseRequest) == nil else {
+            print("SSH requests must never reuse approval or denial")
+            return 1
+        }
+    }
+    guard approvalCommandPath(sshRequest) == pathString(selfIdentity),
+          sshRequest.target == "/usr/local/bin/av",
+          approvalPromptCommand(sshRequest) == "\(shellQuote(pathString(selfIdentity))) pangolin true",
+          authorizationHistoryCommand(sshRequest) == prettyShellCommand(
+              target: pathString(selfIdentity), args: ["pangolin", "true"]
+          ),
+          approvalProcessInvocationName(path: nodePath, arguments: ["npm i", "", ""]) == "npm",
+          approvalProcessInvocationName(path: nodePath, arguments: ["npm", "install"]) == "npm",
+          approvalProcessInvocationName(path: nodePath, arguments: [nodePath, "/opt/npm/bin/npm-cli.js", "i"]) == "npm",
+          approvalProcessInvocationName(path: nodePath, arguments: [nodePath, "postinstall.cjs"]) == nil,
+          approvalProcessInvocationName(path: nodePath, arguments: [nodePath, "-e", "npm-cli.js"]) == nil,
+          approvalProcessInvocationName(path: nodePath, arguments: ["npm-imposter"]) == nil,
+          approvalProcessInvocationName(path: "/usr/bin/ssh", arguments: ["npm i"]) == nil,
+          approvalProcessInvocationName(path: nodePath, arguments: []) == nil
+    else {
+        print("SSH command and npm invocation presentation self-check failed")
+        return 1
+    }
+    guard brewAgentTaskContextSelfCheck() else { return 1 }
+    guard processEnvironmentValueSelfCheck() else {
+        print("bounded peer environment self-check failed")
+        return 2
+    }
+    guard automaticTargetRuntimeProtection(
+        request: targetRuntimeRequest,
+        decision: "Approved",
+        approvalSource: "Auto"
+    ) != nil,
+    automaticTargetRuntimeProtection(
+        request: targetRuntimeRequest,
+        decision: "Approved",
+        approvalSource: "Manual"
+    ) == nil,
+    !makeApprovalPanel().isMovableByWindowBackground
+    else { return 1 }
+    guard supportsVarlockProtocol(1),
+          !supportsVarlockProtocol(0),
+          !supportsVarlockProtocol(2)
+    else { return 1 }
+    guard isTrustedMenuHelperCaller(
+        path: "/Applications/Automic Vault.app/Contents/MacOS/AutomicVaultMenubar",
+        signing: helperSigning
+    ), !isTrustedMenuHelperCaller(path: "/tmp/av", signing: helperSigning)
+    else { return 1 }
+    let varlockSigning = SigningInfo(
+        identifier: "com.automicvault.varlock-plugin-helper",
+        teamIdentifier: "TEAM"
+    )
+    guard isTrustedVarlockPluginHelperCaller(
+        path: "/Applications/Automic Vault.app/Contents/Resources/AutomicVaultVarlockPlugin",
+        signing: varlockSigning
+    ), !isTrustedVarlockPluginHelperCaller(path: "/tmp/av", signing: varlockSigning)
+    else { return 1 }
+    let approvedBlessing = blessingReply(for: .approved)
+    let deniedBlessing = blessingReply(for: .denied)
+    let failedBlessing = blessingReply(for: .failed("failed"))
+    guard approvedBlessing.ok,
+          approvedBlessing.error == nil,
+          approvedBlessing.humanApprovalDecision == "approved",
+          !deniedBlessing.ok,
+          deniedBlessing.error == "script blessing denied",
+          deniedBlessing.humanApprovalDecision == "denied",
+          !failedBlessing.ok,
+          failedBlessing.error == "failed",
+          failedBlessing.humanApprovalDecision == nil
+    else { return 1 }
+
+    let cancellation = ApprovalCancellation()
+    guard isApprovalCancellationEvent(XPC_ERROR_CONNECTION_INTERRUPTED),
+          isApprovalCancellationEvent(XPC_ERROR_CONNECTION_INVALID),
+          cancellation.observe({}),
+          !cancellation.isCanceled
+    else { return 1 }
+    cancellation.cancel()
+    guard cancellation.isCanceled,
+          !cancellation.observe({}),
+          terminalApprovalDecision(.canceled, cancellation: nil) == .interrupted,
+          terminalApprovalDecision(.canceled, cancellation: cancellation) == .canceled,
+          terminalApprovalDecision(.approved, cancellation: nil) == .approved
+    else { return 1 }
+
+    HumanApprovalQueue.shared.resetForTesting()
+    let initialAbortGeneration = ActiveApprovalPrompt.abortGeneration
+    abortActiveApprovalPrompt()
+    guard ActiveApprovalPrompt.abortGeneration == initialAbortGeneration + 1,
+          !HumanApprovalQueue.shared.hasActiveSlot,
+          HumanApprovalQueue.shared.pendingCount == 0
+    else { return 1 }
+
+    let testPanel = makeApprovalPanel()
+    let dummyView = NSView()
+    testPanel.contentView = dummyView
+    testPanel.initialFirstResponder = dummyView
+    guard !testPanel.canBecomeKey,
+          !testPanel.canBecomeMain,
+          testPanel.styleMask.contains(.nonactivatingPanel),
+          testPanel.level == .modalPanel,
+          !testPanel.hidesOnDeactivate,
+          testPanel.initialFirstResponder === dummyView
+    else { return 1 }
+
+    let requester = approvalPromptRequester(
+        launcher: LauncherIdentity(
+            pid: 41,
+            path: "/Applications/Vaultty.app/Contents/Helpers/vaultty-sessiond",
+            identifier: "com.automicvault.vaultty",
+            teamIdentifier: "TEAM",
+            designatedRequirement: #"identifier "com.automicvault.vaultty" and anchor apple generic"#,
+            runtimeProtection: .hardened,
+            appURL: URL(fileURLWithPath: "/Applications/Vaultty.app")
+        ),
+        fallback: "/opt/homebrew/bin/gh"
+    )
+    let unverifiedRequester = approvalPromptRequester(
+        launcher: nil,
+        fallback: "/Applications/Vaultty.app/Contents/Helpers/vaultty-sessiond"
+    )
+    let cliRequester = approvalPromptRequester(
+        launcher: LauncherIdentity(
+            pid: 42,
+            path: "/opt/homebrew/bin/gh",
+            identifier: "gh",
+            teamIdentifier: "TEAM",
+            designatedRequirement: #"identifier "gh" and anchor apple generic"#,
+            runtimeProtection: .hardened,
+            isStandalone: true
+        ),
+        fallback: "/opt/homebrew/bin/gh"
+    )
+    let candidateGate = SecretGate(
+        id: "gh",
+        keyPatterns: ["GH_TOKEN_*"],
+        routes: [],
+        defaultProtection: .noAccess,
+        appPolicies: []
+    )
+    let candidateLauncher = LauncherIdentity(
+        pid: 41,
+        path: "/Applications/Codex.app/Contents/MacOS/Codex",
+        identifier: "com.openai.codex",
+        teamIdentifier: "TEAM",
+        designatedRequirement: #"identifier "com.openai.codex" and anchor apple generic"#,
+        runtimeProtection: .hardened
+    )
+    let candidateAgent = AgentTaskContext(
+        provider: .codex,
+        id: UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
+    )
+    guard temporaryAccessGrantCandidate(
+        gate: candidateGate,
+        classification: .mutating,
+        launcher: candidateLauncher,
+        agentTaskContext: candidateAgent
+    )?.scope.agentTaskContext == candidateAgent,
+    temporaryAccessGrantCandidate(
+        gate: candidateGate,
+        classification: .readOnly,
+        launcher: candidateLauncher,
+        agentTaskContext: candidateAgent
+    ) == nil,
+    temporaryAccessGrantCandidate(
+        gate: candidateGate,
+        classification: .secretDump,
+        launcher: candidateLauncher,
+        agentTaskContext: candidateAgent
+    ) == nil,
+    temporaryAccessGrantCandidate(
+        gate: nil,
+        classification: .mutating,
+        launcher: candidateLauncher,
+        agentTaskContext: candidateAgent
+    ) == nil,
+    temporaryAccessGrantCandidate(
+        gate: candidateGate,
+        classification: .mutating,
+        launcher: LauncherIdentity(
+            pid: 41,
+            path: candidateLauncher.path,
+            identifier: candidateLauncher.identifier,
+            teamIdentifier: candidateLauncher.teamIdentifier,
+            designatedRequirement: candidateLauncher.designatedRequirement,
+            runtimeProtection: .hardenedRuntimeMissing
+        ),
+        agentTaskContext: candidateAgent
+    ) == nil
+    else { return 1 }
+    let automaticApprovalExplanation = LauncherAppVerificationFailure(
+        appName: "ChatGPT",
+        resourcesUnreadable: true
+    ).explanation
+    let promptBlessing = BlessedScriptPromptContext(
+        script: BlessedScript(
+            path: "/tmp/publish.sh",
+            checksum: "checksum",
+            keys: ["PUBLISH_TOKEN"],
+            target: "/bin/sh",
+            replaceExistingEnv: false,
+            allowMissingKeys: false,
+            capabilities: ["gh": .readOnly, "stripe": .fullExceptSecretDumps],
+            launchers: []
+        ),
+        explanation: "Approval activates this stored authority for one execution."
+    )
+    let promptProcessSecurity = ApprovalProcessSecurity(nodes: [
+        ApprovalProcessSecurityNode(
+            pid: 40,
+            path: "/Applications/Example.app/Contents/MacOS/Example",
+            roles: ["Verified Launcher"],
+            posture: .meetsRequirements,
+            explanation: "Valid code signature; Hardened Runtime",
+            isAutomicVaultSigned: false
+        ),
+        ApprovalProcessSecurityNode(
+            pid: 41,
+            path: "/opt/homebrew/bin/gh",
+            roles: ["Secret recipient", "Verified Gate Client"],
+            posture: .meetsRequirements,
+            explanation: "Valid code signature; Hardened Runtime",
+            isAutomicVaultSigned: true
+        ),
+    ])
+    let promptContent = ApprovalPromptContent(
+        requesterName: requester.name,
+        requesterIconPath: requester.iconPath,
+        command: "gh auth token",
+        commandPath: "/opt/homebrew/bin/gh",
+        title: "GitHub token requested",
+        detail: "gh needs the GitHub token",
+        automaticApprovalExplanation: automaticApprovalExplanation,
+        operation: operationClassificationTitle(.unknown),
+        accessLevel: SecretGateProtection.noAccess.title,
+        temporaryGrantUnavailableReason: "10-minute Write Access excludes Unknown operations.",
+        cwd: "/tmp",
+        keys: "GH_TOKEN_GITHUB_COM",
+        blessing: promptBlessing,
+        processSecurity: promptProcessSecurity,
+        sections: []
+    )
+    var sshPromptContent = promptContent
+    sshPromptContent.sshSigningTargetPath = sshRequest.target
+    let npmNode = ApprovalProcessSecurityNode(
+        pid: 42, path: nodePath, roles: ["Intermediary"], posture: .doesNotMeetRequirements,
+        explanation: "Hardened Runtime is not enabled; Executes mutable JavaScript and dependencies",
+        isAutomicVaultSigned: false, invocationName: "npm"
+    )
+    let ancestorNode = ApprovalProcessSecurityNode(
+        pid: 39, path: "/Applications/Parent.app/Contents/MacOS/Parent",
+        roles: ["Observed ancestor"], posture: .meetsRequirements,
+        explanation: "Valid code signature; diagnostic context only",
+        isAutomicVaultSigned: false
+    )
+    let fullAncestry = ApprovalProcessSecurity(nodes: [
+        promptProcessSecurity.nodes[1], npmNode, promptProcessSecurity.nodes[0], ancestorNode,
+    ])
+    guard fullAncestry.timelineNodes.map(\.pid) == [39, 40, 42, 41],
+          fullAncestry.launcher?.pid == 40,
+          fullAncestry.target?.pid == 41,
+          !ancestorNode.isLauncher,
+          ApprovalProcessSecurity(nodes: [promptProcessSecurity.nodes[1]])
+            .timelineNodes.map(\.pid) == [41]
+    else {
+        print("Full approval ancestry presentation self-check failed")
+        return 1
+    }
+    for name in ["cargo-binstall", "cargo-binstall-with-a-long-executable-name"] {
+        let node = ApprovalProcessSecurityNode(
+            pid: 43, path: "/opt/homebrew/bin/\(name)", roles: ["Intermediary"],
+            posture: .doesNotMeetRequirements, explanation: "Hardened Runtime is not enabled",
+            isAutomicVaultSigned: false
+        )
+        let labelWidth = NSHostingView(rootView:
+            Text(name).font(.system(.headline, design: .monospaced))
+        ).fittingSize.width
+        let nodeWidth = NSHostingView(rootView: ApprovalPromptProcessNodeView(node: node)).fittingSize.width
+        guard nodeWidth >= labelWidth + 28 else {
+            print("Execution chain executable name sizing self-check failed: \(name)")
+            return 1
+        }
+    }
+    guard sshPromptContent.operationTitle == "SSH Authentication",
+          sshPromptContent.writeAccessUnavailableReason == nil,
+          promptContent.operationTitle == promptContent.operation,
+          promptContent.writeAccessUnavailableReason == promptContent.temporaryGrantUnavailableReason,
+          npmNode.name == "npm", npmNode.executableName == "node",
+          npmNode.details.contains(nodePath),
+          npmNode.details.contains("not verified code identity"),
+          npmNode.posture == .doesNotMeetRequirements,
+          !npmNode.isLauncher, !npmNode.isTarget,
+          NSHostingView(rootView: ApprovalPromptCommandView(content: sshPromptContent)).fittingSize.height > 0,
+          NSHostingView(rootView: ApprovalPromptProcessNodeView(node: npmNode)).fittingSize.height > 0
+    else {
+        print("SSH Approval presentation self-check failed")
+        return 1
+    }
+    let collapsedPrompt = NSHostingView(
+        rootView: ApprovalPromptView(
+            content: promptContent,
+            temporaryGrantCandidate: nil,
+            decide: { _, _ in }
+        )
+    )
+    collapsedPrompt.layoutSubtreeIfNeeded()
+    let collapsedHeight = collapsedPrompt.fittingSize.height
+    let sshDenialGate = SecretGate(id: "ssh-agent", keyPatterns: ["KEY"], routes: [], defaultProtection: .noAccess, appPolicies: [])
+    let sshDenialScope = TemporaryLauncherDenialScope(gate: sshDenialGate, classification: .mutating)
+    for (phone, touchID) in [(false, false), (true, false), (false, true), (true, true)] {
+        let denialPrompt = NSHostingView(rootView: ApprovalPromptView(
+            content: sshPromptContent, maximumHeight: 600, temporaryGrantCandidate: nil,
+            usesIPhoneApproval: phone, usesTouchIDApproval: touchID,
+            denialLauncherName: "Example", temporaryDenial: {}, temporaryDenialScope: sshDenialScope,
+            decide: { _, _ in }
+        ))
+        let size = denialPrompt.fittingSize
+        guard size.width == 680, size.height > 0, size.height <= 600 else {
+            print("Temporary denial Approval layout self-check failed: \(size)")
+            return 1
+        }
+    }
+
+    let narrowedPrompt = NSHostingView(
+        rootView: ApprovalPromptView(
+            content: ApprovalPromptContent(
+                requesterName: requester.name,
+                requesterIconPath: requester.iconPath,
+                command: "git commit -S",
+                commandPath: "/usr/local/bin/git",
+                title: "Sign this Git operation?",
+                detail: "Automic Vault will use your default GPG signing credential.",
+                automaticApprovalExplanation: nil,
+                operation: operationClassificationTitle(.localWrite),
+                accessLevel: "Allow Signing",
+                temporaryGrantUnavailableReason: nil,
+                cwd: "/tmp",
+                keys: "AV_GPG_PRIVATE_KEY",
+                blessing: BlessedScriptPromptContext(
+                    script: promptBlessing.script,
+                    explanation: activeBlessedScriptPromptExplanation(
+                        script: promptBlessing.script,
+                        gateID: "gpg-signing",
+                        launcherAllowsOperation: true
+                    )
+                ),
+                processSecurity: promptProcessSecurity,
+                sections: []
+            ),
+            temporaryGrantCandidate: nil,
+            decide: { _, _ in }
+        )
+    )
+    narrowedPrompt.layoutSubtreeIfNeeded()
+    let narrowedHeight = narrowedPrompt.fittingSize.height
+    let compactSize = NSHostingView(
+        rootView: ApprovalPromptView(
+            content: promptContent,
+            temporaryGrantCandidate: nil,
+            compact: true,
+            decide: { _, _ in }
+        )
+    ).fittingSize
+    func containsDragRegion(_ view: NSView) -> Bool {
+        view is ApprovalPanelDragView || view.subviews.contains(where: containsDragRegion)
+    }
+    let constrainedHeight = NSHostingView(
+        rootView: ApprovalPromptView(
+            content: ApprovalPromptContent(
+                requesterName: requester.name,
+                requesterIconPath: requester.iconPath,
+                command: Array(repeating: "  --long-option \\", count: 100).joined(separator: "\n"),
+                commandPath: "/opt/homebrew/bin/gh",
+                title: nil,
+                detail: nil,
+                automaticApprovalExplanation: nil,
+                operation: nil,
+                accessLevel: nil,
+                temporaryGrantUnavailableReason: nil,
+                cwd: "/tmp",
+                keys: "GH_TOKEN_GITHUB_COM",
+                blessing: nil,
+                processSecurity: promptProcessSecurity,
+                sections: []
+            ),
+            maximumHeight: 500,
+            temporaryGrantCandidate: nil,
+            decide: { _, _ in }
+        )
+    ).fittingSize.height
+    guard prettyShellCommand(target: "/bin/echo", args: ["hello world", "it's-ok"]) == """
+    /bin/echo \\
+      'hello world' \\
+      'it'\\''s-ok'
+    """,
+          prettyShellCommand(target: "/bin/echo", args: []) == "/bin/echo",
+          promptProcessSecurity.launcher?.pid == 40,
+          promptProcessSecurity.target?.pid == 41,
+          promptProcessSecurity.timelineNodes.map(\.pid) == [40, 41],
+          promptBlessing.script.capabilities["gh"] == .readOnly,
+          approvalPromptCapabilitySummary(promptBlessing.script)
+            == "gh: Read Only • stripe: Write Access",
+          activeBlessedScriptPromptExplanation(
+              script: promptBlessing.script,
+              gateID: "gpg-signing",
+              launcherAllowsOperation: true
+          ) == "The Blessed Script’s declared Capabilities narrow gate policy for this execution and lack a gpg-signing Capability. Approval applies only to this request.",
+          activeBlessedScriptPromptExplanation(
+              script: promptBlessing.script,
+              gateID: "gh",
+              launcherAllowsOperation: true
+          ) == "The Blessed Script’s declared Capabilities narrow gate policy for this execution and exceed the declared gh Capability. Approval applies only to this request.",
+          activeBlessedScriptPromptExplanation(
+              script: promptBlessing.script,
+              gateID: "gpg-signing",
+              launcherAllowsOperation: false
+          ) == "This request exceeds the stored authority. Approval applies only to this request.",
+          approvalPromptSecretNames(
+              requested: ["PUBLISH_TOKEN", "AWS_ACCESS_KEY_ID"],
+              blessed: ["PUBLISH_TOKEN", "AWS_SECRET_ACCESS_KEY"]
+          ) == "AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, PUBLISH_TOKEN",
+          requester.name == "Vaultty",
+          requester.iconPath == "/Applications/Vaultty.app",
+          unverifiedRequester.name == "vaultty-sessiond",
+          unverifiedRequester.iconPath == "/Applications/Vaultty.app/Contents/Helpers/vaultty-sessiond",
+          cliRequester.name == "/opt/homebrew/bin/gh — Team ID: TEAM",
+          cliRequester.iconPath == "/opt/homebrew/bin/gh",
+          automaticApprovalExplanation.contains("ChatGPT contains signed app resources"),
+          automaticApprovalExplanation.contains("Approval is required to fail closed"),
+          containsDragRegion(collapsedPrompt),
+          collapsedHeight > 0,
+          narrowedHeight > 0,
+          compactSize.width == 420,
+          compactSize.height < collapsedHeight,
+          SecretMutation.save(
+              account: "TEST_SECRET",
+              value: "value",
+              accessibility: .whenUnlocked
+          ).usesCompactApproval,
+          !SecretMutation.delete(account: "TEST_SECRET").usesCompactApproval,
+          constrainedHeight <= 500
+    else {
+        return 1
+    }
+    let vaulttySigning = LiveSigningInfo(
+        identifier: "app.vaultty.Vaultty",
+        teamIdentifier: "TEAM",
+        designatedRequirement: #"identifier "app.vaultty.Vaultty" and anchor apple generic"#,
+        mainExecutable: "/Applications/Vaultty.app/Contents/Helpers/vaultty-sessiond",
+        isAdHoc: false,
+        runtimeProtection: .hardened,
+        isDeveloperID: true
+    )
+    let vaulttyBridgeSigning = LiveSigningInfo(
+        identifier: "com.automicvault.vaultty.session-bridge",
+        teamIdentifier: "TEAM",
+        designatedRequirement: #"identifier "com.automicvault.vaultty.session-bridge" and anchor apple generic"#,
+        mainExecutable: "/Users/mxcl/Library/Application Support/Vaultty/vaultty-session-bridge",
+        isAdHoc: false,
+        runtimeProtection: .hardened,
+        isDeveloperID: true
+    )
+    let vaulttyAppSigning = StaticSigningInfo(
+        identifier: "com.automicvault.vaultty",
+        teamIdentifier: "TEAM",
+        designatedRequirement: #"identifier "com.automicvault.vaultty" and anchor apple generic"#
+    )
+    let nestedMenuSigning = LiveSigningInfo(
+        identifier: "dev.mxcl.pmm.menu",
+        teamIdentifier: "TEAM",
+        designatedRequirement: #"identifier "dev.mxcl.pmm.menu" and anchor apple generic"#,
+        mainExecutable: "/Applications/Package Manager Manager.app/Contents/Library/LoginItems/Package Manager Manager Menu.app/Contents/MacOS/PMMMenuBar",
+        isAdHoc: false,
+        runtimeProtection: .hardened,
+        isDeveloperID: true
+    )
+    var detachedCaller = AVProcessIdentity()
+    detachedCaller.ppid = 1
+    detachedCaller.sid = 43
+    let pythonSigning = LiveSigningInfo(
+        identifier: "org.python.python",
+        teamIdentifier: "unknown",
+        designatedRequirement: #"identifier "org.python.python" and anchor apple generic"#,
+        mainExecutable: "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python",
+        isAdHoc: true,
+        runtimeProtection: .hardenedRuntimeMissing,
+        isDeveloperID: false
+    )
+    let unbundledSigning = LiveSigningInfo(
+        identifier: "com.automicvault.av",
+        teamIdentifier: "TEAM",
+        designatedRequirement: #"identifier "com.automicvault.av" and anchor apple generic"#,
+        mainExecutable: "/usr/local/bin/av",
+        isAdHoc: false,
+        runtimeProtection: .hardened,
+        isDeveloperID: true
+    )
+    let hardenedPosture = approvalProcessPosture(
+        signing: unbundledSigning,
+        mutableCode: nil
+    )
+    let nodePosture = approvalProcessPosture(
+        signing: unbundledSigning,
+        mutableCode: mutableCodeExplanation(path: "/opt/homebrew/bin/node")
+    )
+    let unsafePosture = approvalProcessPosture(
+        signing: pythonSigning,
+        mutableCode: mutableCodeExplanation(path: "/opt/homebrew/bin/python3")
+    )
+    let unsignedPosture = approvalProcessPosture(
+        signing: nil,
+        mutableCode: mutableCodeExplanation(path: "/opt/homebrew/bin/node")
+    )
+    let repeatedNodeProcesses = [
+        ApprovalProcessIdentity(pid: 41, path: "/opt/homebrew/bin/node", execution: nil),
+        ApprovalProcessIdentity(pid: 42, path: "/opt/homebrew/bin/node", execution: nil),
+    ]
+    let parentlessVaulttyLauncher = launcherIdentity(
+        pid: 43,
+        path: "/Applications/Vaultty.app/Contents/Helpers/vaultty-sessiond",
+        signing: vaulttySigning,
+        appSigning: { _ in vaulttyAppSigning },
+        bundleExecutableURL: { _ in URL(fileURLWithPath: vaulttySigning.mainExecutable) }
+    )
+    let vaulttyBridgeLauncher = launcherIdentity(
+        pid: 44,
+        path: "/Users/mxcl/Library/Application Support/Vaultty/vaultty-session-bridge",
+        signing: vaulttyBridgeSigning,
+        appSigning: { _ in vaulttyAppSigning }
+    )
+    let nestedLaunchers = launcherIdentities(
+        pid: 45,
+        path: nestedMenuSigning.mainExecutable,
+        signing: nestedMenuSigning,
+        appSigning: { url in
+            let identifier = url.lastPathComponent == "Package Manager Manager.app"
+                ? "dev.mxcl.pmm"
+                : "dev.mxcl.pmm.menu"
+            return StaticSigningInfo(
+                identifier: identifier,
+                teamIdentifier: "TEAM",
+                designatedRequirement: "identifier \"\(identifier)\" and anchor apple generic"
+            )
+        },
+        bundleExecutableURL: { _ in URL(fileURLWithPath: nestedMenuSigning.mainExecutable) }
+    )
+    guard parentlessVaulttyLauncher?.designatedRequirement == vaulttyAppSigning.designatedRequirement,
+          vaulttyBridgeLauncher?.designatedRequirement == vaulttyAppSigning.designatedRequirement,
+          nestedLaunchers.map(\.identifier) == ["dev.mxcl.pmm.menu", "dev.mxcl.pmm"],
+          launcherAncestorStartPIDs(detachedCaller) == [43],
+          hardenedPosture.0 == .meetsRequirements,
+          isAutomicVaultSigned(unbundledSigning, teamIdentifier: "TEAM"),
+          !isAutomicVaultSigned(unbundledSigning, teamIdentifier: "OTHER"),
+          !isAutomicVaultSigned(pythonSigning, teamIdentifier: "unknown"),
+          nodePosture.0 == .needsAttention,
+          nodePosture.1.contains("mutable JavaScript"),
+          unsafePosture.0 == .doesNotMeetRequirements,
+          unsignedPosture.0 == .doesNotMeetRequirements,
+          unsignedPosture.1.contains("Code signature could not be verified"),
+          approvalTargetPID(
+              explicitPID: 42,
+              dockerPID: nil,
+              targetPath: "/opt/homebrew/bin/node",
+              identities: repeatedNodeProcesses
+          ) == 42,
+          launcherIdentity(pid: 46, path: pythonSigning.mainExecutable, signing: pythonSigning) == nil,
+          launcherIdentity(pid: 47, path: "/usr/local/bin/av", signing: unbundledSigning)?.isStandalone == true
+    else {
+        return 1
+    }
+    let ghSigning = SigningInfo(identifier: "gh", teamIdentifier: "TEAM")
+    func ghRequest(
+        op: String = "keys",
+        keys: [String] = ["GH_TOKEN_GITHUB_COM"],
+        args: [String] = ["repo", "view"]
+    ) -> ApprovalRequest {
+        ApprovalRequest(
+            op: op,
+            keys: keys,
+            target: "/opt/homebrew/Cellar/gh-cli/2.94.0/bin/gh",
+            args: args,
+            cwd: "/tmp",
+            replaceExistingEnv: true,
+            allowMissingKeys: false,
+            envConflicts: [],
+            shebangScript: nil,
+            scriptData: nil,
+            tool: "gh",
+            title: nil,
+            detail: nil
+        )
+    }
+    let readOnlyGh = ghRequest()
+    let blockedRequirement = #"identifier "com.openai.codex" and anchor apple generic"#
+    let policyGate = SecretGate(
+        id: "gh",
+        keyPatterns: ["GH_TOKEN_*"],
+        routes: [],
+        defaultProtection: .fullExceptSecretDumps,
+        appPolicies: [SecretGatePolicy(
+            bundleIdentifier: "com.openai.codex",
+            requirement: blockedRequirement,
+            protection: .noAccess
+        )]
+    )
+    let blockedLauncher = LauncherIdentity(
+        pid: 42,
+        path: "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+        identifier: "com.openai.codex",
+        teamIdentifier: "TEAM",
+        designatedRequirement: blockedRequirement,
+        runtimeProtection: .hardened
+    )
+    let unhardenedLauncher = LauncherIdentity(
+        pid: blockedLauncher.pid,
+        path: blockedLauncher.path,
+        identifier: blockedLauncher.identifier,
+        teamIdentifier: blockedLauncher.teamIdentifier,
+        designatedRequirement: blockedLauncher.designatedRequirement,
+        runtimeProtection: .hardenedRuntimeMissing
+    )
+    let runtimeProtectedGate = SecretGate(
+        id: "gh",
+        keyPatterns: ["GH_TOKEN_*"],
+        routes: [],
+        defaultProtection: .noAccess,
+        appPolicies: [SecretGatePolicy(
+            bundleIdentifier: blockedLauncher.identifier,
+            requirement: blockedRequirement,
+            protection: .readOnly,
+            requiresHardenedRuntime: true
+        )]
+    )
+    let grandfatheredGate = SecretGate(
+        id: "gh",
+        keyPatterns: ["GH_TOKEN_*"],
+        routes: [],
+        defaultProtection: .noAccess,
+        appPolicies: [SecretGatePolicy(
+            bundleIdentifier: blockedLauncher.identifier,
+            requirement: blockedRequirement,
+            protection: .readOnly
+        )]
+    )
+    let ghMetadata = HardenerMetadata(
+        name: "gh",
+        hardened: true,
+        secretGate: SecretGateDescriptor(
+            id: "gh",
+            keyPatterns: ["GH_TOKEN_*"],
+            routes: [SecretGateRoute(
+                operation: "keys",
+                scriptPath: nil,
+                targetPath: "/opt/homebrew/opt/gh-cli/bin/gh",
+                callerIdentifiers: ["gh", "com.github.cli"],
+                keyPatterns: ["GH_TOKEN_*"],
+                replaceExistingEnv: true,
+                allowMissingKeys: false
+            )]
+        )
+    )
+    let ghDescriptor = ghMetadata.secretGate!
+    let stripeSigning = SigningInfo(identifier: "stripe", teamIdentifier: "TEAM")
+    let stripeRequest = ApprovalRequest(
+        op: "keys",
+        keys: ["STRIPE_CLI_6163636F756E742E616363745F3132332E746573745F6D6F64655F6170695F6B6579".uppercased()],
+        target: "/opt/homebrew/opt/stripe-isotope/bin/stripe",
+        args: ["customers", "list"],
+        cwd: "/tmp",
+        replaceExistingEnv: true,
+        allowMissingKeys: false,
+        envConflicts: [],
+        shebangScript: nil,
+        scriptData: nil,
+        tool: "stripe",
+        title: "Stripe credential requested",
+        detail: nil
+    )
+    let stripeMetadata = HardenerMetadata(
+        name: "stripe",
+        hardened: true,
+        secretGate: SecretGateDescriptor(
+            id: "stripe",
+            keyPatterns: ["STRIPE_CLI_*"],
+            routes: [SecretGateRoute(
+                operation: "keys",
+                scriptPath: nil,
+                targetPath: "/opt/homebrew/opt/stripe-isotope/bin/stripe",
+                callerIdentifiers: ["stripe"],
+                keyPatterns: ["STRIPE_CLI_*"],
+                replaceExistingEnv: true,
+                allowMissingKeys: false
+            )]
+        )
+    )
+    let stripeDescriptor = stripeMetadata.secretGate!
+    func flyRequest(_ arguments: [String]) -> ApprovalRequest {
+        ApprovalRequest(
+            op: "inject",
+            keys: ["FLY_ACCESS_TOKEN"],
+            target: "/bin/sh",
+            args: ["/usr/local/bin/fly"] + arguments,
+            cwd: "/tmp",
+            replaceExistingEnv: false,
+            allowMissingKeys: true,
+            envConflicts: [],
+            shebangScript: "/usr/local/bin/fly",
+            scriptData: nil,
+            tool: nil,
+            title: nil,
+            detail: nil
+        )
+    }
+    let directRequest = ApprovalRequest(
+        op: "inject",
+        keys: ["HCLOUD_TOKEN"],
+        target: "/bin/sh",
+        args: ["-c", "hcloud server list"],
+        cwd: "/tmp",
+        replaceExistingEnv: false,
+        allowMissingKeys: false,
+        envConflicts: [],
+        shebangScript: nil,
+        scriptData: nil,
+        tool: nil,
+        title: nil,
+        detail: nil
+    )
+    let fdRequest = ApprovalRequest(
+        op: "inject-fd", keys: directRequest.keys, target: directRequest.target,
+        args: directRequest.args, cwd: directRequest.cwd,
+        replaceExistingEnv: false, allowMissingKeys: false, envConflicts: [],
+        shebangScript: nil, scriptData: nil, tool: nil, title: nil,
+        detail: fileDescriptorInjectionDetail(keys: directRequest.keys, mappings: ["HCLOUD_TOKEN:3"])
+    )
+    let directRules = [DirectAccessRule(
+        secretName: "HCLOUD_TOKEN",
+        launcher: BlessedScriptLauncher(
+            bundleIdentifier: blockedLauncher.identifier,
+            requirement: blockedLauncher.designatedRequirement
+        )
+    )]
+    guard matchingDirectAccessLauncher(
+              request: fdRequest, configuredGate: nil, trustedAVGateClient: true,
+              launchers: [blockedLauncher], rules: directRules
+          ) == nil,
+          resolveSecretGatePolicy(gate: policyGate, launchers: []) == nil,
+          resolveSecretGatePolicy(gate: policyGate, launchers: [blockedLauncher])?.protection == .noAccess,
+          resolveSecretGatePolicy(gate: runtimeProtectedGate, launchers: [blockedLauncher])?.protection == .readOnly,
+          resolveSecretGatePolicy(gate: runtimeProtectedGate, launchers: [unhardenedLauncher])?.protection == .noAccess,
+          resolveSecretGatePolicy(gate: grandfatheredGate, launchers: [unhardenedLauncher])?.protection == .readOnly,
+          matchingSecretGate(request: readOnlyGh, signing: ghSigning, descriptors: [ghDescriptor])?.id == "gh",
+          matchingSecretGate(request: ghRequest(keys: ["OTHER_TOKEN"]), signing: ghSigning, descriptors: [ghDescriptor]) == nil,
+          matchingSecretGate(request: ghRequest(keys: []), signing: ghSigning, descriptors: [ghDescriptor]) == nil,
+          matchingSecretGate(request: ghRequest(op: "inject"), signing: ghSigning, descriptors: [ghDescriptor]) == nil,
+          matchingSecretGate(
+              request: readOnlyGh,
+              signing: SigningInfo(identifier: "com.automicvault.av", teamIdentifier: "TEAM"),
+              descriptors: [ghDescriptor]
+          ) == nil,
+          classifySecretGateRequest(gateID: "gh", request: readOnlyGh) == .readOnly,
+          classifySecretGateRequest(gateID: "gh", request: ghRequest(args: ["repo", "delete", "owner/name"])) == .mutating,
+          classifySecretGateRequest(gateID: "gh", request: ghRequest(args: ["auth", "git-credential", "get"])) == .secretDump,
+          approvalRequestWithCredentialContext(ghRequest(args: ["auth", "git-credential", "get"])).title == "Disclose GitHub token?",
+          approvalRequestWithCredentialContext(ghRequest(args: ["credential-alias"])).detail?.contains("possible Secret Disclosure") == true,
+          classifySecretGateRequest(gateID: "gh", request: ghRequest(args: ["auth", "token"])) == .secretDump,
+          classifySecretGateRequest(gateID: "gh", request: ghRequest(args: ["auth", "status", "--show-token"])) == .secretDump,
+          isGhTokenKey("GH_TOKEN_GITHUB_COM_MXCL"),
+          !isGhTokenKey("GITHUB_TOKEN"),
+          !isGhTokenKey("GH_TOKEN_bad-key"),
+          matchingSecretGate(request: stripeRequest, signing: stripeSigning, descriptors: [stripeDescriptor])?.id == "stripe",
+          matchingSecretGate(
+              request: stripeRequest,
+              signing: SigningInfo(identifier: "gh", teamIdentifier: "TEAM"),
+              descriptors: [stripeDescriptor]
+          ) == nil,
+          classifySecretGateRequest(gateID: "stripe", request: stripeRequest) == .readOnly,
+          classifySecretGateRequest(gateID: "flyctl", request: flyRequest(["apps", "list"])) == .readOnly,
+          classifySecretGateRequest(gateID: "flyctl", request: flyRequest(["deploy"])) == .mutating,
+          classifySecretGateRequest(gateID: "flyctl", request: flyRequest(["auth", "token"])) == .secretDump,
+          matchingDirectAccessLauncher(
+              request: directRequest,
+              configuredGate: nil,
+              trustedAVGateClient: true,
+              launchers: [blockedLauncher],
+              rules: directRules
+          )?.designatedRequirement == blockedLauncher.designatedRequirement,
+          matchingDirectAccessLauncher(
+              request: directRequest,
+              configuredGate: policyGate,
+              trustedAVGateClient: true,
+              launchers: [blockedLauncher],
+              rules: directRules
+          ) == nil,
+          matchingDirectAccessLauncher(
+              request: directRequest,
+              configuredGate: nil,
+              trustedAVGateClient: false,
+              launchers: [blockedLauncher],
+              rules: directRules
+          ) == nil,
+          matchingDirectAccessLauncher(
+              request: directRequest,
+              configuredGate: nil,
+              trustedAVGateClient: true,
+              launchers: [unhardenedLauncher],
+              rules: directRules
+          ) == nil,
+          isTrustedStripeCaller(
+              path: "/opt/homebrew/opt/stripe-isotope/bin/stripe",
+              signing: stripeSigning
+          ),
+          !isTrustedStripeCaller(path: "/tmp/stripe", signing: ghSigning),
+          isStripeCredentialKey("STRIPE_CLI_616263"),
+          !isStripeCredentialKey("STRIPE_CLI_bad-key"),
+          !isStripeCredentialKey("GH_TOKEN_GITHUB_COM")
+    else {
+        return 1
+    }
+
+    func scriptRequest(
+        _ source: String,
+        keys: [String] = [],
+        op: String = "inject",
+        snapshotIncompatibleInterpreter: String? = nil
+    ) -> ApprovalRequest {
+        ApprovalRequest(
+            op: op,
+            keys: keys,
+            target: "/usr/bin/python3",
+            args: ["/tmp/script"],
+            cwd: "/tmp",
+            replaceExistingEnv: false,
+            allowMissingKeys: false,
+            envConflicts: [],
+            shebangScript: "/tmp/script",
+            scriptData: Data(source.utf8),
+            snapshotIncompatibleInterpreter: snapshotIncompatibleInterpreter,
+            tool: nil,
+            title: nil,
+            detail: nil
+        )
+    }
+    let inheritedScript = scriptStartingWithoutApproval(for: scriptRequest(
+        "#!/usr/local/bin/av inject -- /usr/bin/python3\nprint('ok')\n"
+    ))
+    let explicitlyInheritedScript = scriptStartingWithoutApproval(for: scriptRequest("""
+    #!/usr/local/bin/av inject -- /usr/bin/python3
+    # --- automic-vault
+    # capabilities: { inherit: true }
+    # ---
+    print("ok")
+    """))
+    let emptyCeilingSource = """
+    #!/usr/local/bin/av inject -- /usr/bin/python3
+    # --- automic-vault
+    # capabilities: {}
+    # ---
+    print("ok")
+    """
+    let emptyCeilingScript = scriptStartingWithoutApproval(for: scriptRequest(emptyCeilingSource))
+    guard inheritedScript == nil,
+          explicitlyInheritedScript == nil,
+          emptyCeilingScript?.manifest.hasEmptyCapabilityCeiling == true,
+          scriptStartingWithoutApproval(for: scriptRequest(emptyCeilingSource, op: "authorize")) == nil,
+          scriptStartingWithoutApproval(for: scriptRequest(
+              emptyCeilingSource, snapshotIncompatibleInterpreter: "/usr/bin/python3"
+          )) == nil,
+          scriptStartingWithoutApproval(for: scriptRequest(
+              emptyCeilingSource.replacingOccurrences(of: "inject --", with: "inject +TOKEN --"),
+              keys: ["TOKEN"]
+          )) == nil
+    else { return 1 }
+
+    let avSigning = SigningInfo(identifier: "com.automicvault.av", teamIdentifier: "TEAM")
+    func awsRequest(
+        keys: [String] = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
+        args: [String] = ["s3", "ls"],
+        shebangScript: String? = nil,
+        scriptData: Data? = nil,
+        replaceExistingEnv: Bool = false,
+        allowMissingKeys: Bool = false,
+        envConflicts: [String] = []
+    ) -> ApprovalRequest {
+        ApprovalRequest(
+            op: "inject",
+            keys: keys,
+            target: "/opt/homebrew/bin/aws",
+            args: args,
+            cwd: "/tmp",
+            replaceExistingEnv: replaceExistingEnv,
+            allowMissingKeys: allowMissingKeys,
+            envConflicts: envConflicts,
+            shebangScript: shebangScript,
+            scriptData: scriptData,
+            tool: "aws",
+            title: nil,
+            detail: nil
+        )
+    }
+    let readOnlyAws = awsRequest()
+    let longLivedAws = awsRequest(
+        args: ["iam", "get-role", "--role-name", "example"]
+    )
+    let contextualLongLivedAws = approvalRequestWithCredentialContext(longLivedAws)
+    let awsMetadata = HardenerMetadata(
+        name: "aws",
+        hardened: true,
+        secretGate: SecretGateDescriptor(
+            id: "aws",
+            keyPatterns: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
+            routes: [SecretGateRoute(
+                operation: "inject",
+                scriptPath: nil,
+                targetPath: "/opt/homebrew/bin/aws",
+                callerIdentifiers: ["com.automicvault.av"],
+                keyPatterns: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
+                replaceExistingEnv: false,
+                allowMissingKeys: false
+            )]
+        )
+    )
+    let awsDescriptor = awsMetadata.secretGate!
+    let blessedRequest = awsRequest(shebangScript: "/tmp/script", scriptData: Data("script".utf8))
+    let blessedScript = BlessedScript(
+        path: "/tmp/script",
+        checksum: "checksum",
+        keys: blessedRequest.keys,
+        target: blessedRequest.target,
+        replaceExistingEnv: false,
+        allowMissingKeys: false,
+        capabilities: ["aws": .readOnly],
+        launchers: [BlessedScriptLauncher(
+            bundleIdentifier: blockedLauncher.identifier,
+            requirement: blockedLauncher.designatedRequirement
+        )]
+    )
+    let unendorsedBlessedScript = BlessedScript(
+        path: blessedScript.path,
+        checksum: blessedScript.checksum,
+        keys: blessedScript.keys,
+        target: blessedScript.target,
+        replaceExistingEnv: blessedScript.replaceExistingEnv,
+        allowMissingKeys: blessedScript.allowMissingKeys,
+        capabilities: blessedScript.capabilities,
+        launchers: []
+    )
+    let inheritingScript = BlessedScript(
+        path: blessedScript.path,
+        checksum: blessedScript.checksum,
+        keys: blessedScript.keys,
+        target: blessedScript.target,
+        replaceExistingEnv: blessedScript.replaceExistingEnv,
+        allowMissingKeys: blessedScript.allowMissingKeys,
+        inheritsCapabilities: true,
+        capabilities: [:],
+        launchers: []
+    )
+    guard blessedScriptCanAutoApprove(
+        blessedScript,
+        request: readOnlyAws,
+        signing: avSigning,
+        descriptors: [awsDescriptor]
+    ),
+        !blessedScriptCanAutoApprove(
+            blessedScript,
+            request: awsRequest(args: ["s3", "rm", "s3://bucket/key"]),
+            signing: avSigning,
+            descriptors: [awsDescriptor]
+        ),
+        !blessedScriptCanAutoApprove(
+            blessedScript,
+            request: readOnlyGh,
+            signing: ghSigning,
+            descriptors: [ghDescriptor]
+        ),
+        matchingSecretGateDefinition(
+            request: readOnlyAws,
+            signing: avSigning,
+            descriptors: [awsDescriptor]
+        )?.id == "aws",
+        blessedScriptMatches(
+            blessedScript,
+            request: blessedRequest,
+            approval: ScriptApproval(path: "/tmp/script", checksum: "checksum"),
+            launcher: blockedLauncher
+        ),
+        !blessedScriptMatches(
+            blessedScript,
+            request: awsRequest(shebangScript: "/tmp/script"),
+            approval: ScriptApproval(path: "/tmp/script", checksum: "checksum"),
+            launcher: blockedLauncher
+        ),
+        !blessedScriptMatches(
+            unendorsedBlessedScript,
+            request: blessedRequest,
+            approval: ScriptApproval(path: "/tmp/script", checksum: "checksum"),
+            launcher: blockedLauncher
+        ),
+        lostBlessingExplanation(
+            for: ScriptApproval(path: "/tmp/script", checksum: "changed"),
+            blessedScripts: [blessedScript]
+        ) == "Blessing lost because the script contents changed.",
+        lostBlessingExplanation(
+            for: ScriptApproval(path: "/tmp/script", checksum: "checksum"),
+            blessedScripts: [blessedScript]
+        ) == nil,
+        ActiveScriptAuthority(
+            blessings: [inheritingScript],
+            hasEmptyCapabilityCeiling: false
+        ).inheritsLauncherPolicy,
+        !ActiveScriptAuthority(
+            blessings: [inheritingScript],
+            hasEmptyCapabilityCeiling: true
+        ).allowsAutomaticAuthority,
+        !ActiveScriptAuthority(
+            blessings: [inheritingScript, blessedScript],
+            hasEmptyCapabilityCeiling: false
+        ).inheritsLauncherPolicy
+    else { return 1 }
+
+    guard matchingSecretGate(request: readOnlyAws, signing: avSigning, descriptors: [awsDescriptor])?.id == "aws",
+          matchingSecretGate(request: longLivedAws, signing: avSigning, descriptors: [awsDescriptor])?.id == "aws",
+          missingRequiredSecret(for: readOnlyAws, exists: { $0 == "AWS_SECRET_ACCESS_KEY" }) == "AWS_ACCESS_KEY_ID",
+          missingRequiredSecret(for: readOnlyAws, exists: { _ in true }) == nil,
+          missingRequiredSecret(for: awsRequest(allowMissingKeys: true), exists: { _ in false }) == nil,
+          missingRequiredSecret(
+              for: awsRequest(keys: ["AWS_ACCESS_KEY_ID"], envConflicts: ["AWS_ACCESS_KEY_ID"]),
+              exists: { _ in false }
+          ) == nil,
+          missingRequiredSecret(
+              for: awsRequest(
+                  keys: ["AWS_ACCESS_KEY_ID"],
+                  replaceExistingEnv: true,
+                  envConflicts: ["AWS_ACCESS_KEY_ID"]
+              ),
+              exists: { _ in false }
+          ) == "AWS_ACCESS_KEY_ID",
+          matchingSecretGate(request: awsRequest(keys: ["AWS_ACCESS_KEY_ID"]), signing: avSigning, descriptors: [awsDescriptor]) == nil,
+          matchingSecretGate(request: awsRequest(shebangScript: "/tmp/script"), signing: avSigning, descriptors: [awsDescriptor]) == nil,
+          matchingSecretGate(
+              request: readOnlyAws,
+              signing: SigningInfo(identifier: "aws", teamIdentifier: "TEAM"),
+              descriptors: [awsDescriptor]
+          ) == nil,
+          classifySecretGateRequest(gateID: "aws", request: readOnlyAws) == .readOnly,
+          classifySecretGateRequest(gateID: "aws", request: longLivedAws) == .secretDump,
+          classifySecretGateRequest(
+              gateID: "aws",
+              request: awsRequest(args: ["--profile", "dev", "iam", "get-role"])
+          ) == .secretDump,
+          contextualLongLivedAws.title == "Use long-lived AWS credentials?",
+          contextualLongLivedAws.detail?.contains("retain every IAM permission") == true,
+          classifySecretGateRequest(
+              gateID: "aws",
+              request: awsRequest(args: ["s3", "rm", "s3://bucket/key"])
+          ) == .mutating,
+          (SecretGateRequestClassification.allCases
+              .filter { $0 != .unknown }
+              .allSatisfy { secretGateProtectionAllows(.fullIncludingSecretDumps, classification: $0) }),
+          !secretGateProtectionAllows(.fullIncludingSecretDumps, classification: .unknown),
+          !secretGateProtectionAllows(.noAccess, classification: .readOnly),
+          secretGateProtectionAllows(.readOnly, classification: .readOnly),
+          !secretGateProtectionAllows(.readOnly, classification: .unknown),
+          secretGateProtectionAllows(.readOnlyAndLocalWrites, classification: .readOnly),
+          secretGateProtectionAllows(.readOnlyAndLocalWrites, classification: .localWrite),
+          !secretGateProtectionAllows(.readOnlyAndLocalWrites, classification: .mutating),
+          secretGateProtectionAllows(.readOnlyAndUpdates, classification: .readOnly),
+          secretGateProtectionAllows(.readOnlyAndUpdates, classification: .update),
+          !secretGateProtectionAllows(.readOnlyAndUpdates, classification: .mutating),
+          !secretGateProtectionAllows(.fullExceptSecretDumps, classification: .secretDump),
+          !secretGateProtectionAllows(.fullExceptSecretDumps, classification: .unknown)
+    else { return 1 }
+
+    let brewSigning = SigningInfo(identifier: "com.automicvault.av-brew-stub", teamIdentifier: "TEAM")
+    let brewRequest = ApprovalRequest(
+        op: "authorize",
+        keys: [],
+        target: "/opt/homebrew/bin/brew",
+        args: ["info", "ack"],
+        cwd: "/tmp",
+        replaceExistingEnv: false,
+        allowMissingKeys: false,
+        envConflicts: [],
+        shebangScript: nil,
+        scriptData: nil,
+        tool: "brew",
+        title: nil,
+        detail: nil
+    )
+    let brewMetadata = HardenerMetadata(
+        name: "brew",
+        hardened: true,
+        secretGate: SecretGateDescriptor(
+            id: "brew",
+            keyPatterns: [],
+            routes: [SecretGateRoute(
+                operation: "authorize",
+                scriptPath: nil,
+                targetPath: "/opt/homebrew/bin/brew",
+                callerIdentifiers: ["com.automicvault.av-brew-stub"],
+                keyPatterns: [],
+                replaceExistingEnv: false,
+                allowMissingKeys: false
+            )]
+        )
+    )
+    let brewDescriptor = brewMetadata.secretGate!
+    guard matchingSecretGate(request: brewRequest, signing: brewSigning, descriptors: [brewDescriptor])?.id == "brew",
+          matchingSecretGate(request: brewRequest, signing: avSigning, descriptors: [brewDescriptor]) == nil,
+          classifySecretGateRequest(gateID: "brew", request: brewRequest) == .readOnly,
+          brewRequestClassification(["update"]) == .update,
+          brewRequestClassification(["up"]) == .update,
+          brewRequestClassification(["--debug", "update"]) == .mutating,
+          isTrustedBrewStubCaller(path: "/usr/local/bin/brew", signing: brewSigning),
+          !isTrustedBrewStubCaller(path: "/opt/homebrew/bin/brew", signing: avSigning)
+    else { return 1 }
+
+    return 0
+}
+
+@MainActor
+private func awaitWithTimeout<T: Sendable>(
+    duration: Duration,
+    cancellation: ApprovalCancellation,
+    task: Task<T, Never>
+) async -> T? {
+    await withTaskGroup(of: T?.self) { group in
+        group.addTask {
+            await task.value
+        }
+        group.addTask {
+            try? await Task.sleep(for: duration)
+            return nil
+        }
+        let first = await group.next() ?? nil
+        if first == nil {
+            cancellation.cancel()
+            task.cancel()
+        }
+        group.cancelAll()
+        while await group.next() != nil {}
+        return first
+    }
+}
+
+@MainActor
+private func runReblessingApprovalSelfCheck() async -> Bool {
+    // Drive real presentation/queue teardown without granting any authority.
+    for mode in 0..<3 {
+        HumanApprovalQueue.shared.resetForTesting()
+        let cancellation = ApprovalCancellation()
+        let panel = makeApprovalPanel()
+        defer { panel.orderOut(nil); panel.contentView = nil }
+        let scriptData = Data("#!/usr/local/bin/av inject +TOKEN /bin/sh\necho reviewed\n".utf8)
+        guard let declaration = try? blessedScriptDeclaration(data: scriptData) else { return false }
+        let reviewRequest = BlessedScriptReviewRequest(
+            path: "/tmp/av-sheet-self-check-\(UUID().uuidString)",
+            declaration: declaration, scriptData: scriptData, launcher: nil
+        )
+        var reviewAttached = false
+        var samePanel = true
+        var staleApprovalRejected = false
+        var priorState: ApprovalPromptState?
+        var presentations = 0
+        var reviewHadFreeSlot = false
+        var lateCompletion: (@MainActor () -> Void)?
+        let request = ApprovalRequest(
+            op: "inject", keys: [], target: "/self-check", args: [], cwd: "/",
+            replaceExistingEnv: false, allowMissingKeys: false, envConflicts: [],
+            shebangScript: nil, scriptData: nil, tool: nil, title: nil, detail: nil
+        )
+        let task = Task { @MainActor in
+            await approvalWithBlessingReview(cancellation: cancellation, review: { finish in
+                reviewHadFreeSlot = !HumanApprovalQueue.shared.hasActiveSlot
+                    && ActiveApprovalPrompt.current == nil
+                lateCompletion = finish
+                staleApprovalRejected = priorState?.resolve(.approved, source: .programmatic) == false
+                let sheetCancellation = mode == 1 ? cancellation : ApprovalCancellation()
+                presentBlessingReview(reviewRequest, on: panel, cancellation: sheetCancellation, completion: finish)
+                reviewAttached = panel.isVisible && panel.attachedSheet?.sheetParent === panel
+                    && (panel.contentView as? NSHostingView<ApprovalPromptView>)?.rootView.isReviewingBlessing == true
+                if mode == 2 {
+                    ActiveApprovalPrompt.abort()
+                } else {
+                    sheetCancellation.cancel()
+                }
+            }) {
+                presentations += 1
+                let nextDecision: ApprovalDecision = presentations == 1 ? .rebless : .denied
+                let driver = Task { @MainActor in
+                    while !Task.isCancelled {
+                        if let state = ActiveApprovalPrompt.current {
+                            samePanel = samePanel && state.panel === panel
+                            if presentations == 1 { priorState = state }
+                            state.resolve(nextDecision, source: .programmatic)
+                            return
+                        }
+                        await Task.yield()
+                    }
+                }
+                defer { driver.cancel() }
+                return await showApprovalAlert(
+                    request: request, callerPath: "/self-check", pid: getpid(),
+                    signing: SigningInfo(identifier: "self-check", teamIdentifier: "TEST"),
+                    scriptApproval: nil, launcher: nil, launcherFallbackPath: "/self-check",
+                    automaticApprovalExplanation: nil, cancellation: cancellation,
+                    allowsReblessing: presentations == 1, existingPanel: panel
+                )
+            }
+        }
+        let result = await awaitWithTimeout(duration: .seconds(5), cancellation: cancellation, task: task)
+        let expected: ApprovalDecision = mode == 0 ? .denied : mode == 1 ? .canceled : .interrupted
+        guard result == expected, presentations == (mode == 0 ? 2 : 1),
+              reviewHadFreeSlot, reviewAttached, samePanel, staleApprovalRejected,
+              !HumanApprovalQueue.shared.hasActiveSlot,
+              ActiveApprovalPrompt.current == nil else { return false }
+        // A late or duplicate review completion must not resume the command twice.
+        lateCompletion?()
+        lateCompletion?()
+    }
+    return true
+}
+
+@MainActor
+private func runApprovalCallsiteSelfCheck() async -> Int32 {
+    guard await runReblessingApprovalSelfCheck() else { return 20 }
+    let denialGate = SecretGate(id: "gh", keyPatterns: ["TOKEN"], routes: [], defaultProtection: .noAccess, appPolicies: [])
+    let denialScope = TemporaryLauncherDenialScope(gate: denialGate, classification: .mutating)!
+    let deniedLauncher = LauncherIdentity(
+        pid: getpid(), path: "/self-check", identifier: "self-check", teamIdentifier: "TEST",
+        designatedRequirement: "denial-self-check-\(UUID().uuidString)", runtimeProtection: .hardened
+    )
+    TemporaryLauncherDenials.shared.deny(deniedLauncher.designatedRequirement, launcherName: "Self check", scope: denialScope)
+    let deniedRequest = ApprovalRequest(op: "inject", keys: [], target: "/self-check", args: [], cwd: "/",
+        replaceExistingEnv: false, allowMissingKeys: false, envConflicts: [], shebangScript: nil,
+        scriptData: nil, tool: "self-check", title: nil, detail: nil, gateID: "gh")
+    let deniedDecision = await showApprovalAlert(
+        request: deniedRequest, callerPath: "/self-check", pid: getpid(),
+        signing: SigningInfo(identifier: "self-check", teamIdentifier: "TEST"), scriptApproval: nil,
+        launcher: deniedLauncher, launcherFallbackPath: "/self-check", automaticApprovalExplanation: nil,
+        classification: .mutating, denialGate: denialGate
+    )
+    guard deniedDecision == .denied, ActiveApprovalPrompt.current == nil else { return 19 }
+    let deniedRecord = accessRequestRecord(request: deniedRequest, callerPath: "/self-check", decision: "Denied",
+        approvalSource: "Auto", reason: "Denied by two-minute Temporary Launcher Denial", launcher: deniedLauncher)
+    guard !shouldShowAutomaticAccessToast(deniedRecord),
+          deniedRecord.launcherRequirement == deniedLauncher.designatedRequirement,
+          deniedRecord.gateID == "gh", deniedRecord.canConfigureLauncher,
+          deniedRequest.selecting(SelectedSecretValues(values: [:])).gateID == "gh",
+          deniedRequest.requesting(keys: [], title: "", detail: "").gateID == "gh"
+    else { return 19 }
+    let unverifiedChild = LauncherIdentity(
+        pid: getpid(), path: "/unverified-child", identifier: "child", teamIdentifier: "TEST",
+        designatedRequirement: "child", runtimeProtection: .hardenedRuntimeMissing
+    )
+    guard denialActionLauncher(displayedLauncher: unverifiedChild,
+              attributedLaunchers: [unverifiedChild, deniedLauncher])?.designatedRequirement == deniedLauncher.designatedRequirement,
+          denialActionLauncher(displayedLauncher: deniedLauncher,
+              attributedLaunchers: [unverifiedChild])?.designatedRequirement == deniedLauncher.designatedRequirement,
+          denialActionLauncher(displayedLauncher: nil,
+              attributedLaunchers: [deniedLauncher])?.designatedRequirement == deniedLauncher.designatedRequirement,
+          denialActionLauncher(displayedLauncher: unverifiedChild, attributedLaunchers: []) == nil
+    else { return 19 }
+    guard evaluateLauncherDenial(gate: nil, classification: .unknown, launchers: [unverifiedChild]) == nil,
+          evaluateLauncherDenial(gate: nil, classification: .unknown, launchers: [deniedLauncher]) == nil,
+          let releaseDenial = evaluateLauncherDenial(gate: denialGate, classification: .mutating,
+              launchers: [unverifiedChild, deniedLauncher]),
+          releaseDenial.launcher?.designatedRequirement == deniedLauncher.designatedRequirement
+    else { return 19 }
+    let canceledRecord = canceledAccessRequestRecord(request: deniedRequest, callerPath: "/self-check",
+        launcher: unverifiedChild, launchers: [unverifiedChild, deniedLauncher])
+    let interruptedRecord = interruptedAccessRequestRecord(request: deniedRequest, callerPath: "/self-check",
+        launcher: unverifiedChild, launchers: [unverifiedChild, deniedLauncher])
+    guard [canceledRecord, interruptedRecord].allSatisfy({
+        $0.launcherRequirement == deniedLauncher.designatedRequirement && $0.launcher == deniedRecord.launcher
+            && $0.gateID == "gh"
+    }) else { return 19 }
+    let proxyLaunch = ProxySessionLaunch(
+        keys: [], target: "/different-target", arguments: [], cwd: "/", selectedSecretValues: SelectedSecretValues(values: [:]),
+        targetCodeIdentity: nil, launchers: [unverifiedChild, deniedLauncher], launcher: unverifiedChild,
+        identity: ProxyTargetIdentity(pid: getpid(), pidVersion: 0, startUsec: 0, effectiveUserID: getuid(), auditSessionID: 0)
+    )
+    let proxyRecord = proxyLaunch.accessRequestRecord(
+        sessionID: UUID(), method: "GET", origin: "https://example.com", path: "/", queryNames: [], secretNames: [],
+        decision: "Denied", approvalSource: "Auto", reason: deniedRecord.reason, launcher: deniedLauncher
+    )
+    guard proxyRecord.launcher == deniedRecord.launcher,
+          proxyRecord.launcherIconPath == deniedRecord.launcherIconPath,
+          proxyRecord.launcherRequirement == deniedLauncher.designatedRequirement,
+          proxyRecord.callerPath == proxyLaunch.target else { return 19 }
+    let unverifiedRecord = proxyLaunch.accessRequestRecord(
+        sessionID: UUID(), method: "GET", origin: "https://example.com", path: "/", queryNames: [], secretNames: [],
+        decision: "Denied", approvalSource: "Manual", reason: "Destination denied"
+    )
+    guard unverifiedRecord.launcherRequirement == deniedLauncher.designatedRequirement,
+          unverifiedRecord.launcher == deniedRecord.launcher else { return 19 }
+    // A retained ancestor may be absent from the live chain and display identity.
+    // Activating its denial while queued must prevent presentation altogether.
+    let queuedAncestor = LauncherIdentity(pid: 1, path: "/retained-parent", identifier: "retained", teamIdentifier: "TEST",
+        designatedRequirement: "queued-denial-\(UUID().uuidString)", runtimeProtection: .hardened)
+    HumanApprovalQueue.shared.resetForTesting()
+    guard await HumanApprovalQueue.shared.acquire() else { return 19 }
+    let ancestorCancellation = ApprovalCancellation()
+    let ancestorPrompt = Task { @MainActor in
+        await showApprovalAlert(
+            request: deniedRequest, callerPath: "/self-check", pid: getpid(),
+            signing: SigningInfo(identifier: "self-check", teamIdentifier: "TEST"), scriptApproval: nil,
+            launcher: unverifiedChild, denialLaunchers: [unverifiedChild, queuedAncestor],
+            launcherFallbackPath: unverifiedChild.path, automaticApprovalExplanation: nil,
+            classification: .mutating, denialGate: denialGate,
+            cancellation: ancestorCancellation
+        )
+    }
+    let ancestorDeadline = Date().addingTimeInterval(5)
+    while HumanApprovalQueue.shared.pendingCount == 0 && Date() < ancestorDeadline { await Task.yield() }
+    guard HumanApprovalQueue.shared.pendingCount == 1 else {
+        ancestorCancellation.cancel()
+        ancestorPrompt.cancel()
+        HumanApprovalQueue.shared.release()
+        return 19
+    }
+    TemporaryLauncherDenials.shared.deny(queuedAncestor.designatedRequirement, launcherName: "Self check", scope: denialScope)
+    HumanApprovalQueue.shared.release()
+    let ancestorDecision = await awaitWithTimeout(duration: .seconds(5), cancellation: ancestorCancellation, task: ancestorPrompt)
+    guard ancestorDecision == .denied, ActiveApprovalPrompt.current == nil,
+          !HumanApprovalQueue.shared.hasActiveSlot else { return 19 }
+    let registrationRaceLauncher = LauncherIdentity(pid: 1, path: "/race", identifier: "race", teamIdentifier: "TEST",
+        designatedRequirement: "observer-race-\(UUID().uuidString)", runtimeProtection: .hardened)
+    let registrationRaceCancellation = ApprovalCancellation()
+    let registrationRaceTask = Task { @MainActor in
+        await showApprovalAlert(
+            request: deniedRequest, callerPath: "/self-check", pid: getpid(),
+            signing: SigningInfo(identifier: "self-check", teamIdentifier: "TEST"), scriptApproval: nil,
+            launcher: unverifiedChild, denialLaunchers: [registrationRaceLauncher],
+            launcherFallbackPath: unverifiedChild.path, automaticApprovalExplanation: nil,
+            classification: .mutating, denialGate: denialGate,
+            cancellation: registrationRaceCancellation,
+            reevaluate: {
+                TemporaryLauncherDenials.shared.deny(registrationRaceLauncher.designatedRequirement, launcherName: "Self check", scope: denialScope)
+                return false
+            }
+        )
+    }
+    let registrationRaceDecision = await awaitWithTimeout(
+        duration: .seconds(5), cancellation: registrationRaceCancellation, task: registrationRaceTask
+    )
+    guard registrationRaceDecision == .denied, ActiveApprovalPrompt.current == nil else { return 19 }
+    // 1. Queued-transition focus invariant: every freshly created alert starts non-key
+    // and does not inherit focus from a previously key window.
+    let panel1 = makeApprovalPanel()
+    guard !panel1.canBecomeKey,
+          !panel1.canBecomeMain,
+          !panel1.isKeyWindow,
+          panel1.initialFirstResponder == nil,
+          panel1.styleMask.contains(.nonactivatingPanel),
+          panel1.level == .modalPanel,
+          !panel1.hidesOnDeactivate
+    else {
+        fputs("panel1 initial posture failed non-activating / non-key invariant\n", stderr)
+        return 10
+    }
+
+    // Simulate user deliberately clicking panel1 to grant key focus
+    if let clickEvent = NSEvent.mouseEvent(
+        with: .leftMouseDown,
+        location: .zero,
+        modifierFlags: [],
+        timestamp: 0,
+        windowNumber: panel1.windowNumber,
+        context: nil,
+        eventNumber: 0,
+        clickCount: 1,
+        pressure: 1.0
+    ) {
+        panel1.sendEvent(clickEvent)
+    }
+    guard panel1.canBecomeKey else {
+        fputs("panel1 failed to become key after deliberate click\n", stderr)
+        return 11
+    }
+    panel1.orderOut(nil)
+    panel1.close()
+
+    // Verify next queued panel starts non-key by construction, preventing focus auto-promotion
+    let panel2 = makeApprovalPanel()
+    guard !panel2.canBecomeKey,
+          !panel2.canBecomeMain,
+          !panel2.isKeyWindow,
+          panel2.initialFirstResponder == nil
+    else {
+        fputs("panel2 inherited key status or initial first responder across queued transition\n", stderr)
+        return 12
+    }
+    panel2.orderOut(nil)
+    panel2.close()
+
+    // 2. Mode-transition invalidation
+    HumanApprovalQueue.shared.resetForTesting()
+    let startAbortGen = ActiveApprovalPrompt.abortGeneration
+    let abortedRes = await withCheckedContinuation { cont in
+        let promptState = ApprovalPromptState(continuation: cont, panel: panel1)
+        ActiveApprovalPrompt.current = promptState
+        abortActiveApprovalPrompt()
+    }
+    guard abortedRes == .canceled,
+          ActiveApprovalPrompt.abortGeneration == startAbortGen + 1,
+          ActiveApprovalPrompt.current == nil
+    else {
+        fputs("mode-transition invalidation failed to abort active prompt\n", stderr)
+        return 20
+    }
+
+    // 3. Surface elevation and decision source enforcement across all permutations
+    // Case 3a: Both disabled -> standardMac is accepted, elevated sources are not expected
+    let stdMacBothOff = await withCheckedContinuation { cont in
+        let promptState = ApprovalPromptState(continuation: cont, panel: panel1)
+        promptState.resolve(.approved, source: .standardMac, phoneEnabled: false, touchIDEnabled: false)
+    }
+    guard stdMacBothOff == .approved else {
+        fputs("standardMac failed when both elevated surfaces are disabled\n", stderr)
+        return 30
+    }
+
+    // Case 3b: Phone enabled only -> standardMac interrupted, phone approved, touchID interrupted
+    let stdMacPhoneOn = await withCheckedContinuation { cont in
+        let promptState = ApprovalPromptState(continuation: cont, panel: panel1)
+        promptState.resolve(.approved, source: .standardMac, phoneEnabled: true, touchIDEnabled: false)
+    }
+    let phonePhoneOn = await withCheckedContinuation { cont in
+        let promptState = ApprovalPromptState(continuation: cont, panel: panel1)
+        promptState.resolve(.approved, source: .phone, phoneEnabled: true, touchIDEnabled: false)
+    }
+    let touchIDPhoneOn = await withCheckedContinuation { cont in
+        let promptState = ApprovalPromptState(continuation: cont, panel: panel1)
+        promptState.resolve(.approved, source: .touchID, phoneEnabled: true, touchIDEnabled: false)
+    }
+    guard stdMacPhoneOn == .interrupted, phonePhoneOn == .approved, touchIDPhoneOn == .interrupted else {
+        fputs("surface enforcement failed for phone-only configuration\n", stderr)
+        return 31
+    }
+
+    // Case 3c: Touch ID enabled only -> standardMac interrupted, touchID approved, phone interrupted
+    let stdMacTouchIDOn = await withCheckedContinuation { cont in
+        let promptState = ApprovalPromptState(continuation: cont, panel: panel1)
+        promptState.resolve(.approved, source: .standardMac, phoneEnabled: false, touchIDEnabled: true)
+    }
+    let touchIDTouchIDOn = await withCheckedContinuation { cont in
+        let promptState = ApprovalPromptState(continuation: cont, panel: panel1)
+        promptState.resolve(.approved, source: .touchID, phoneEnabled: false, touchIDEnabled: true)
+    }
+    let phoneTouchIDOn = await withCheckedContinuation { cont in
+        let promptState = ApprovalPromptState(continuation: cont, panel: panel1)
+        promptState.resolve(.approved, source: .phone, phoneEnabled: false, touchIDEnabled: true)
+    }
+    guard stdMacTouchIDOn == .interrupted, touchIDTouchIDOn == .approved, phoneTouchIDOn == .interrupted else {
+        fputs("surface enforcement failed for TouchID-only configuration\n", stderr)
+        return 32
+    }
+
+    // Case 3d: Both enabled -> standardMac interrupted, both phone AND touchID approved
+    let stdMacBothOn = await withCheckedContinuation { cont in
+        let promptState = ApprovalPromptState(continuation: cont, panel: panel1)
+        promptState.resolve(.approved, source: .standardMac, phoneEnabled: true, touchIDEnabled: true)
+    }
+    let phoneBothOn = await withCheckedContinuation { cont in
+        let promptState = ApprovalPromptState(continuation: cont, panel: panel1)
+        promptState.resolve(.approved, source: .phone, phoneEnabled: true, touchIDEnabled: true)
+    }
+    let touchIDBothOn = await withCheckedContinuation { cont in
+        let promptState = ApprovalPromptState(continuation: cont, panel: panel1)
+        promptState.resolve(.approved, source: .touchID, phoneEnabled: true, touchIDEnabled: true)
+    }
+    guard stdMacBothOn == .interrupted, phoneBothOn == .approved, touchIDBothOn == .approved else {
+        fputs("surface enforcement failed when both Phone and TouchID are enabled\n", stderr)
+        return 33
+    }
+
+    // Case 3e: Programmatic denial always flows through
+    let progDenied = await withCheckedContinuation { cont in
+        let promptState = ApprovalPromptState(continuation: cont, panel: panel1)
+        promptState.resolve(.denied, source: .programmatic)
+    }
+    guard progDenied == .denied else {
+        fputs("programmatic denial failed\n", stderr)
+        return 34
+    }
+
+    // Temporary phone denials act only on a live, undecided request, exactly once.
+    let phoneDenialGate = SecretGate(id: "gh", keyPatterns: [], routes: [], defaultProtection: .noAccess, appPolicies: [])
+    let phoneDenialScope = TemporaryLauncherDenialScope(gate: phoneDenialGate, classification: .mutating)!
+    for scenario in ["live", "canceled", "resolved", "inactive", "phone-disabled"] {
+        let requirement = "phone-denial-self-check-\(UUID().uuidString)"
+        let cancellation = ApprovalCancellation()
+        let result = await withCheckedContinuation { cont in
+            let state = ApprovalPromptState(continuation: cont, panel: panel1)
+            state.cancellation = cancellation
+            ActiveApprovalPrompt.current = state
+            if scenario == "canceled" { cancellation.cancel() }
+            if scenario == "resolved" { state.resolve(.approved, source: .programmatic) }
+            if scenario == "inactive" { ActiveApprovalPrompt.current = nil }
+            state.denyTemporarily(requirement: requirement, launcherName: "Self check", scope: phoneDenialScope,
+                                  source: .phone, phoneEnabled: scenario != "phone-disabled")
+            let deadline = TemporaryLauncherDenials.shared.deadline(for: requirement, scope: phoneDenialScope)
+            // A replay cannot replace the rule or extend its deadline.
+            state.denyTemporarily(requirement: requirement, launcherName: "Self check", scope: phoneDenialScope,
+                                  source: .phone, phoneEnabled: scenario != "phone-disabled")
+            precondition(TemporaryLauncherDenials.shared.deadline(for: requirement, scope: phoneDenialScope) == deadline)
+            state.resolve(.canceled)
+        }
+        let rules = TemporaryLauncherDenials.shared.active().filter { $0.requirement == requirement }
+        guard rules.count == (scenario == "live" ? 1 : 0),
+              result == (scenario == "live" ? .denied : scenario == "resolved" ? .approved : .canceled) else {
+            fputs("Temporary phone denial failed for \(scenario)\n", stderr)
+            return 35
+        }
+        for rule in rules { TemporaryLauncherDenials.shared.cancel(rule.id) }
+    }
+
+    // 4. Callsite reevaluation through real AuthorizationDecisionReuseCache
+    HumanApprovalQueue.shared.resetForTesting()
+    let slot1Acquired = await HumanApprovalQueue.shared.acquire()
+    guard slot1Acquired, HumanApprovalQueue.shared.hasActiveSlot else {
+        fputs("failed initial queue slot acquisition\n", stderr)
+        return 40
+    }
+
+    let testReq = ApprovalRequest(
+        op: "inject",
+        keys: ["TEST_SECRET"],
+        target: "/bin/zsh",
+        args: [],
+        cwd: "/tmp",
+        replaceExistingEnv: false,
+        allowMissingKeys: false,
+        envConflicts: [],
+        shebangScript: nil,
+        scriptData: nil,
+        tool: nil,
+        title: nil,
+        detail: nil
+    )
+    let helperSigning = SigningInfo(identifier: "com.automicvault", teamIdentifier: "TEAM")
+
+    var selfIdentity = AVProcessIdentity()
+    guard av_process_identity(getpid(), &selfIdentity) else {
+        fputs("failed to obtain live process identity\n", stderr)
+        return 41
+    }
+    let testReuseRequest = testReq.decisionReuseRequest(
+        clientIdentity: selfIdentity,
+        callerPath: "/bin/zsh",
+        signing: helperSigning
+    )
+    var cache = AuthorizationDecisionReuseCache()
+    guard cache.decision(for: testReuseRequest) == nil else {
+        fputs("reuse cache not empty at test start\n", stderr)
+        return 42
+    }
+
+    let testCancellation = ApprovalCancellation()
+    let queuedAlertTask = Task { @MainActor in
+        await showApprovalAlert(
+            request: testReq,
+            callerPath: "/bin/zsh",
+            pid: getpid(),
+            signing: helperSigning,
+            scriptApproval: nil,
+            launcher: nil,
+            launcherFallbackPath: "/bin/zsh",
+            automaticApprovalExplanation: nil,
+            cancellation: testCancellation,
+            reevaluate: {
+                cache.decision(for: testReuseRequest) == .approved
+            }
+        )
+    }
+
+    var queued = false
+    let deadline = Date().addingTimeInterval(5.0)
+    while Date() < deadline {
+        if HumanApprovalQueue.shared.pendingCount == 1 {
+            queued = true
+            break
+        }
+        await Task.yield()
+    }
+    guard queued else {
+        fputs("timed out waiting for request 2 to enqueue in HumanApprovalQueue\n", stderr)
+        return 43
+    }
+
+    // Request 1 records approved decision into reuse cache and releases slot
+    cache.remember(.approved, for: testReuseRequest)
+    HumanApprovalQueue.shared.release()
+
+    let queuedAlertDecision = await awaitWithTimeout(
+        duration: .seconds(5),
+        cancellation: testCancellation,
+        task: queuedAlertTask
+    )
+    guard let queuedAlertDecision else {
+        fputs("timed out waiting for request 2 to resolve after slot release\n", stderr)
+        return 44
+    }
+    guard queuedAlertDecision == .reevaluated,
+          !HumanApprovalQueue.shared.hasActiveSlot,
+          HumanApprovalQueue.shared.pendingCount == 0
+    else {
+        fputs("request 2 failed to reevaluate from cache and release queue slot\n", stderr)
+        return 45
+    }
+
+    // 5. Negative path: verify that stuck approvals terminate on timeout via cancellation without hanging
+    // Case 5a: Queued waiter stuck behind held slot (slot is never released)
+    HumanApprovalQueue.shared.resetForTesting()
+    let stuckSlotAcquired = await HumanApprovalQueue.shared.acquire()
+    guard stuckSlotAcquired, HumanApprovalQueue.shared.hasActiveSlot else {
+        fputs("failed initial queue slot acquisition for stuck queued test\n", stderr)
+        return 50
+    }
+
+    let stuckQueuedCancellation = ApprovalCancellation()
+    let stuckQueuedTask = Task { @MainActor in
+        await showApprovalAlert(
+            request: testReq,
+            callerPath: "/bin/zsh",
+            pid: getpid(),
+            signing: helperSigning,
+            scriptApproval: nil,
+            launcher: nil,
+            launcherFallbackPath: "/bin/zsh",
+            automaticApprovalExplanation: nil,
+            cancellation: stuckQueuedCancellation,
+            reevaluate: { false }
+        )
+    }
+
+    var stuckQueued = false
+    let stuckDeadline = Date().addingTimeInterval(5.0)
+    while Date() < stuckDeadline {
+        if HumanApprovalQueue.shared.pendingCount == 1 {
+            stuckQueued = true
+            break
+        }
+        await Task.yield()
+    }
+    guard stuckQueued else {
+        stuckQueuedCancellation.cancel()
+        stuckQueuedTask.cancel()
+        HumanApprovalQueue.shared.release()
+        fputs("timed out waiting for stuck request to enqueue in HumanApprovalQueue\n", stderr)
+        return 51
+    }
+
+    // Slot is intentionally never released. Verify awaitWithTimeout cancels and returns nil without hanging.
+    let stuckQueuedDecision = await awaitWithTimeout(
+        duration: .milliseconds(500),
+        cancellation: stuckQueuedCancellation,
+        task: stuckQueuedTask
+    )
+    guard stuckQueuedDecision == nil else {
+        HumanApprovalQueue.shared.release()
+        fputs("stuck queued approval unexpectedly completed instead of timing out\n", stderr)
+        return 52
+    }
+
+    HumanApprovalQueue.shared.release()
+    guard !HumanApprovalQueue.shared.hasActiveSlot,
+          HumanApprovalQueue.shared.pendingCount == 0
+    else {
+        fputs("stuck queued approval failed to cleanly drain from queue after cancellation\n", stderr)
+        return 53
+    }
+
+    return 0
+}
+
+private func runApprovalProcessExecutionSelfCheck() -> Int32 {
+    var identity = AVProcessIdentity()
+    guard av_process_identity(getpid(), &identity) else { return 1 }
+    let fullAncestry = approvalProcessIdentities(gateClientPID: getpid(), launcherPID: getpid())
+    guard identity.ppid > 1, fullAncestry.count > 1,
+          fullAncestry.first?.pid == getpid()
+    else {
+        print("Approval ancestry must continue above the selected Launcher")
+        return 1
+    }
+    identity.pidversion = 0
+    identity.audit_session_id = 0
+    var reusedIdentity = identity
+    reusedIdentity.start_usec &+= 1
+    guard let execution = approvalProcessExecution(pid: getpid(), identity: identity),
+          execution.pidVersion == nil,
+          execution.auditSessionID == nil,
+          approvalProcessExecutionIsLive(execution),
+          approvalProcessExecution(pid: getpid(), identity: reusedIdentity) == nil,
+          retainedProcessExecution(pid: getpid(), identity: identity) == nil
+    else { return 1 }
+    return 0
+}
+
+private func selfCheckCodexHelper(relativePath: String = "Contents/Resources/codex") -> VerifiedLauncherHelper {
+    let helper = VerifiedLauncherHelper(
+        id: "", name: "Codex CLI", appName: "ChatGPT",
+        appBundleIdentifier: "com.openai.codex", appTeamIdentifier: "2DC432GLL2",
+        helperSigningIdentifier: "codex", helperTeamIdentifier: "2DC432GLL2",
+        relativePath: relativePath
+    )
+    return VerifiedLauncherHelper(
+        id: userApprovedVerifiedLauncherHelperID(helper), name: helper.name, appName: helper.appName,
+        appBundleIdentifier: helper.appBundleIdentifier, appTeamIdentifier: helper.appTeamIdentifier,
+        helperSigningIdentifier: helper.helperSigningIdentifier, helperTeamIdentifier: helper.helperTeamIdentifier,
+        relativePath: relativePath
+    )
+}
+
+private func runNestedLauncherHelperSelfCheck() -> Bool {
+    let codexVerifiedLauncherHelper = selfCheckCodexHelper(
+        relativePath: "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+    )
+    let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+        .appendingPathComponent("av-nested-helper-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let parent = root.appendingPathComponent("ChatGPT.app")
+    let nested = parent.appendingPathComponent("Contents/Resources/codex-cli/CodexCLI.app")
+    let executable = nested.appendingPathComponent("Contents/MacOS/codex")
+    do {
+        for (url, identifier, name, binary) in [
+            (parent, "com.openai.codex", "ChatGPT", "ChatGPT"),
+            (nested, "codex", "Codex CLI", "codex"),
+        ] {
+            try FileManager.default.createDirectory(
+                at: url.appendingPathComponent("Contents/MacOS"), withIntermediateDirectories: true
+            )
+            let binaryURL = url.appendingPathComponent("Contents/MacOS/" + binary)
+            try Data().write(to: binaryURL)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binaryURL.path)
+            let plist = ["CFBundleIdentifier": identifier, "CFBundleName": name,
+                         "CFBundleExecutable": binary, "CFBundlePackageType": "APPL"]
+            try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+                .write(to: url.appendingPathComponent("Contents/Info.plist"))
+        }
+    } catch { return false }
+    let parentSigning = StaticSigningInfo(
+        identifier: "com.openai.codex", teamIdentifier: "2DC432GLL2", designatedRequirement: "parent"
+    )
+    func candidates(enabled: Bool = true, valid: Bool = true,
+                    runtime: LauncherRuntimeProtection = .hardened) -> [LauncherIdentity] {
+        launcherIdentities(
+            pid: 42, path: executable.path,
+            signing: LiveSigningInfo(
+                identifier: "codex", teamIdentifier: "2DC432GLL2", designatedRequirement: "helper",
+                mainExecutable: executable.path, isAdHoc: false, runtimeProtection: runtime,
+                isDeveloperID: true
+            ),
+            appSigning: { _ in
+                StaticSigningInfo(identifier: "codex", teamIdentifier: "2DC432GLL2",
+                                  designatedRequirement: "helper")
+            },
+            helperConfiguration: VerifiedLauncherHelperConfiguration(
+                disabledHelperIDs: enabled ? [] : [codexVerifiedLauncherHelper.id],
+                userApprovedHelpers: [codexVerifiedLauncherHelper]
+            ),
+            helperSigning: { association, _ in
+                valid && association.appURL.path == parent.path ? parentSigning : nil
+            }
+        )
+    }
+    let launchers = candidates()
+    let gate = SecretGate(id: "aws", keyPatterns: [], routes: [],
+                          defaultProtection: .readOnly, appPolicies: [])
+    let strictGate = SecretGate(id: "gh", keyPatterns: [], routes: [], defaultProtection: .readOnly,
+        appPolicies: [SecretGatePolicy(bundleIdentifier: parentSigning.identifier,
+            requirement: parentSigning.designatedRequirement, protection: .readOnly,
+            runtimeRequirement: .hardened)])
+    guard resolveSecretGatePolicy(gate: strictGate,
+        launchers: candidates(runtime: .hardenedWithLibraryValidationDisabled))?.runtimeProtectionFailure
+            == .hardenedWithLibraryValidationDisabled
+    else { return false }
+    guard launchers.map(\.identifier) == ["com.openai.codex", "codex"],
+          let launcher = launchers.first,
+          resolveSecretGatePolicy(gate: gate, launchers: launchers)?.launcher?.identifier == "com.openai.codex",
+          executionOrigin(among: launchers, callerPID: 99, ancestorFallbackPath: nil)?.identifier == "com.openai.codex",
+          approvalPromptRequester(launcher: launcher, fallback: executable.path).name == "ChatGPT",
+          approvalPromptRequester(launcher: launcher, fallback: executable.path).iconPath == parent.path,
+          temporaryAccessGrantLauncherName(launcher) == "ChatGPT"
+    else { return false }
+    for fallback in [candidates(enabled: false), candidates(valid: false)] {
+        guard fallback.map(\.identifier) == ["codex"], let helper = fallback.first,
+              approvalPromptRequester(launcher: helper, fallback: executable.path).name == "Codex CLI",
+              approvalPromptRequester(launcher: helper, fallback: executable.path).iconPath == nested.path,
+              temporaryAccessGrantLauncherName(helper) == "Codex CLI"
+        else { return false }
+    }
+    return true
+}
+
+private func runClaudeOutsideBundleDefaultSelfCheck() -> Bool {
+    let parent = URL(fileURLWithPath: "/Applications/Claude.app")
+    let path = "/Users/test/Library/Application Support/Claude/claude-code/1/claude.app/Contents/MacOS/claude"
+    let review = LauncherHelperReview(
+        signing: LauncherSigning(identifier: "com.anthropic.claudefordesktop", teamIdentifier: "Q6L2SF6YDW",
+                                 path: parent.path, requirement: "test", runtimeProtection: .hardened),
+        gate: SecretGate(id: "test", keyPatterns: [], routes: [], defaultProtection: .readOnly, appPolicies: []),
+        runtimeRequirement: .hardened, helpers: [claudeCodeVerifiedLauncherHelper]
+    )
+    let selected: Set<String> = [claudeCodeVerifiedLauncherHelper.id]
+    guard review.defaultSelectedHelperIDs(configuration: VerifiedLauncherHelperConfiguration()) == selected,
+          review.defaultSelectedHelperIDs(configuration: VerifiedLauncherHelperConfiguration(disabledHelperIDs: selected)).isEmpty,
+          review.disabledHelperIDs(selected: []).contains(claudeCodeVerifiedLauncherHelper.id),
+          review.disabledHelperIDs(selected: selected).isEmpty
+    else { return false }
+    for scenario in [
+        (team: "Q6L2SF6YDW", runtime: LauncherRuntimeProtection.hardened, parent: true, disabled: false, optedOut: false, expected: true),
+        (team: "OTHER", runtime: .hardened, parent: true, disabled: false, optedOut: false, expected: false),
+        (team: "Q6L2SF6YDW", runtime: .hardened, parent: false, disabled: false, optedOut: false, expected: false),
+        (team: "Q6L2SF6YDW", runtime: .hardened, parent: true, disabled: true, optedOut: false, expected: false),
+        (team: "Q6L2SF6YDW", runtime: .hardened, parent: true, disabled: false, optedOut: true, expected: false),
+    ] {
+        var configuration = VerifiedLauncherHelperConfiguration()
+        if scenario.disabled { configuration.disabledHelperIDs.insert(claudeCodeVerifiedLauncherHelper.id) }
+        if scenario.optedOut { configuration.allowedOutsideBundleHelperIDs.remove(claudeCodeVerifiedLauncherHelper.id) }
+        let signing = LiveSigningInfo(
+            identifier: claudeCodeVerifiedLauncherHelper.helperSigningIdentifier,
+            teamIdentifier: scenario.team,
+            designatedRequirement: "test", mainExecutable: path, isAdHoc: false,
+            runtimeProtection: scenario.runtime, isDeveloperID: true
+        )
+        let association = verifiedLauncherHelperAssociation(
+            path: path, signing: signing, containingAppURLs: [], configuration: configuration,
+            installedAppURL: { _ in scenario.parent ? parent : nil }
+        )
+        if scenario.expected {
+            guard association?.isOutsideBundle == true, association?.appURL == parent else { return false }
+        } else if association != nil { return false }
+    }
+    return true
+}
+
+// Exercise attribution and policy together: the helper represents a strict parent
+// rule but must retain its own runtime posture (issue #378).
+private func runClaudeHelperRuntimeSelfCheck() -> Bool {
+    let helper = claudeCodeVerifiedLauncherHelper
+    let parent = StaticSigningInfo(
+        identifier: helper.appBundleIdentifier, teamIdentifier: helper.appTeamIdentifier,
+        designatedRequirement: "claude-parent-fixture"
+    )
+    let path = "/av-self-check/claude"
+    func candidates(
+        runtime: LauncherRuntimeProtection = .hardenedWithLibraryValidationDisabled,
+        enabled: Bool = true, outsideAllowed: Bool = true, verified: Bool = true,
+        team: String = "Q6L2SF6YDW", identifier: String = "com.anthropic.claude-code",
+        parentInstalled: Bool = true
+    ) -> [LauncherIdentity] {
+        var configuration = VerifiedLauncherHelperConfiguration()
+        if !enabled { configuration.disabledHelperIDs.insert(helper.id) }
+        if !outsideAllowed { configuration.allowedOutsideBundleHelperIDs.remove(helper.id) }
+        return launcherIdentities(
+            pid: 42, path: path,
+            signing: LiveSigningInfo(
+                identifier: identifier, teamIdentifier: team,
+                designatedRequirement: "claude-helper-fixture", mainExecutable: path,
+                isAdHoc: false, runtimeProtection: runtime, isDeveloperID: true
+            ),
+            helperConfiguration: configuration,
+            installedAppURL: { _ in parentInstalled ? URL(fileURLWithPath: "/av-self-check/Claude.app") : nil },
+            helperSigning: { _, _ in verified ? parent : nil }
+        )
+    }
+    for (gateID, protection, classification) in [
+        ("gh", SecretGateProtection.readOnly, SecretGateRequestClassification.readOnly),
+        ("ssh-agent", .fullExceptSecretDumps, .mutating),
+    ] {
+        let gate = SecretGate(id: gateID, keyPatterns: [], routes: [], defaultProtection: .noAccess,
+            appPolicies: [SecretGatePolicy(bundleIdentifier: parent.identifier,
+                requirement: parent.designatedRequirement, protection: protection,
+                runtimeRequirement: .hardened)])
+        for runtime in [LauncherRuntimeProtection.hardened, .hardenedWithLibraryValidationDisabled] {
+            guard let policy = resolveSecretGatePolicy(gate: gate, launchers: candidates(runtime: runtime)),
+                  policy.launcher?.designatedRequirement == parent.designatedRequirement,
+                  policy.launcher?.runtimeProtection == runtime,
+                  policy.launcher?.verifiedHelper == helper,
+                  policy.runtimeProtectionFailure == nil,
+                  policy.protection.allows(classification),
+                  !policy.protection.allows(.secretDump),
+                  !policy.protection.allows(.unknown)
+            else {
+                fputs("Claude helper runtime compatibility failed at \(gateID): \(runtime)\n", stderr)
+                return false
+            }
+        }
+        // No exception from identity strings, a failed verification, an opt-out,
+        // a missing parent, or a newly unsafe runtime.
+        let rejected = [
+            candidates(enabled: false), candidates(outsideAllowed: false), candidates(verified: false),
+            candidates(team: "OTHER"), candidates(identifier: "com.anthropic.other-helper"),
+            candidates(parentInstalled: false), candidates(runtime: .hardenedRuntimeMissing),
+            candidates(runtime: .unsafeEntitlements(["com.apple.security.get-task-allow"])),
+            candidates(runtime: .unsafeEntitlements(["com.apple.security.cs.allow-dyld-environment-variables"])),
+            candidates(runtime: .unsafeEntitlements(["com.apple.security.cs.disable-executable-page-protection"])),
+            [LauncherIdentity(pid: 42, path: path, identifier: parent.identifier,
+                teamIdentifier: parent.teamIdentifier, designatedRequirement: parent.designatedRequirement,
+                runtimeProtection: .hardenedWithLibraryValidationDisabled)],
+        ]
+        for launchers in rejected {
+            guard resolveSecretGatePolicy(gate: gate, launchers: launchers)?.protection.allows(classification) != true
+            else { fputs("Claude helper runtime exception escaped verification\n", stderr); return false }
+        }
+        let approvalGate = SecretGate(id: gateID, keyPatterns: [], routes: [], defaultProtection: protection,
+            appPolicies: [SecretGatePolicy(bundleIdentifier: parent.identifier,
+                requirement: parent.designatedRequirement, protection: .noAccess,
+                runtimeRequirement: .hardened)])
+        guard resolveSecretGatePolicy(gate: approvalGate, launchers: candidates())?.protection == .noAccess
+        else { fputs("Claude helper bypassed Approval Required\n", stderr); return false }
+    }
+    let standaloneGate = SecretGate(id: "gh", keyPatterns: [], routes: [], defaultProtection: .readOnly,
+        appPolicies: [SecretGatePolicy(bundleIdentifier: helper.helperSigningIdentifier,
+            requirement: "claude-helper-fixture", protection: .readOnly, runtimeRequirement: .hardened)])
+    guard resolveSecretGatePolicy(gate: standaloneGate, launchers: candidates(enabled: false))?
+        .runtimeProtectionFailure == .hardenedWithLibraryValidationDisabled
+    else { fputs("Standalone Claude rule lost its runtime requirement\n", stderr); return false }
+
+    let directRequest = ApprovalRequest(op: "inject", keys: ["TEST_TOKEN"], target: "/usr/bin/true",
+        args: [], cwd: "/", replaceExistingEnv: false, allowMissingKeys: false, envConflicts: [],
+        shebangScript: nil, scriptData: nil, tool: nil, title: nil, detail: nil)
+    let directRule = DirectAccessRule(secretName: "TEST_TOKEN",
+        launcher: BlessedScriptLauncher(bundleIdentifier: parent.identifier,
+            requirement: parent.designatedRequirement), runtimeRequirement: .hardened)
+    guard matchingDirectAccessLauncher(request: directRequest, configuredGate: nil,
+        trustedAVGateClient: true, launchers: candidates(), rules: [directRule]) == nil
+    else { fputs("Claude helper exception escaped into Direct Access\n", stderr); return false }
+    return true
+}
+
+private func runDescendantOverrideSelfCheck() -> Bool {
+    func launcher(_ name: String, _ pid: pid_t, runtime: LauncherRuntimeProtection = .hardened) -> LauncherIdentity {
+        LauncherIdentity(pid: pid, path: "/fixture/" + name, identifier: name,
+            teamIdentifier: "TEST", designatedRequirement: name, runtimeProtection: runtime)
+    }
+    let child = launcher("child", 10), parent = launcher("parent", 20), terminal = launcher("terminal", 30)
+    func rule(_ name: String, _ access: SecretGateProtection, override: Bool = false,
+              inherited: Bool = false) -> SecretGatePolicy {
+        SecretGatePolicy(bundleIdentifier: name, requirement: name, protection: access,
+            runtimeRequirement: .hardened, usesGateDefault: inherited, overridesDescendantRules: override)
+    }
+    func gate(_ rules: [SecretGatePolicy]) -> SecretGate {
+        SecretGate(id: "gh", keyPatterns: [], routes: [], defaultProtection: .fullExceptSecretDumps, appPolicies: rules)
+    }
+    let ordinary = gate([rule("child", .readOnly), rule("parent", .fullExceptSecretDumps)])
+    let overridden = gate([rule("child", .readOnly), rule("parent", .fullExceptSecretDumps, override: true)])
+    let valid: (LauncherIdentity, LauncherIdentity) -> Bool = { $0.pid > $1.pid }
+    guard resolveSecretGatePolicy(gate: ordinary, launchers: [child, parent, terminal], verifiesOverride: valid)?.launcher?.pid == child.pid,
+          let selected = resolveSecretGatePolicy(gate: overridden, launchers: [child, parent, terminal], verifiesOverride: valid),
+          selected.launcher?.pid == parent.pid, selected.protection.allows(.mutating),
+          !selected.protection.allows(.unknown), selected.overriddenLaunchers.count == 1,
+          descendantOverrideWarning(policy: selected, gate: overridden, classification: .mutating) != nil,
+          descendantOverrideWarning(policy: selected, gate: overridden, classification: .readOnly) == nil,
+          resolveSecretGatePolicy(gate: overridden, launchers: [child, parent], verifiesOverride: { _, _ in false }) == nil,
+          resolveSecretGatePolicy(gate: overridden, launchers: [child, launcher("parent", 10)], verifiesOverride: valid)?.launcher?.pid == child.pid,
+          resolveSecretGatePolicy(gate: gate([rule("child", .readOnly), rule("parent", .fullExceptSecretDumps, override: true, inherited: true)]),
+              launchers: [child, parent], verifiesOverride: valid)?.launcher?.pid == child.pid,
+          resolveSecretGatePolicy(gate: gate(overridden.appPolicies + [rule("terminal", .noAccess, override: true)]),
+              launchers: [child, parent, terminal], verifiesOverride: valid)?.protection == .noAccess,
+          resolveSecretGatePolicy(gate: overridden,
+              launchers: [launcher("child", 10, runtime: .hardenedRuntimeMissing), parent], verifiesOverride: valid)?.protection == .noAccess,
+          resolveSecretGatePolicy(gate: overridden,
+              launchers: [child, launcher("parent", 20, runtime: .hardenedRuntimeMissing)], verifiesOverride: valid)?.protection == .noAccess,
+          resolveSecretGatePolicy(gate: SecretGate(id: "ssh-agent", keyPatterns: ["SSH"], routes: [],
+              defaultProtection: .noAccess, appPolicies: [rule("parent", .fullExceptSecretDumps)]),
+              launchers: [child, parent], verifiesOverride: valid)?.protection == .noAccess,
+          resolveSecretGatePolicy(gate: SecretGate(id: "ssh-agent", keyPatterns: ["SSH"], routes: [],
+              defaultProtection: .noAccess, appPolicies: [rule("parent", .fullExceptSecretDumps, override: true)]),
+              launchers: [child, parent], verifiesOverride: valid)?.overriddenLaunchers.first?.pid == child.pid,
+          !verifiedLauncherOverrideAncestry(parent, child)
+    else { fputs("Descendant Launcher override resolution failed\n", stderr); return false }
+    // Model same-PID exec after signing validation, while the original parent chain still matches.
+    for changedPID: pid_t? in [nil, child.pid, parent.pid] {
+        func identity(_ pid: pid_t, version: Int32 = 1) -> AVProcessIdentity {
+            var value = AVProcessIdentity()
+            value.pid = pid
+            value.pidversion = version
+            value.start_usec = 100
+            return value
+        }
+        var walking = false
+        let accepted = verifiedLauncherOverrideAncestry(parent, child, processIdentity: { pid in
+            identity(pid, version: walking && changedPID == pid ? 2 : 1)
+        }, validatesLauncher: { _ in true }, originalParent: { observedChild in
+            guard sameProcessIdentity(observedChild, identity(child.pid)) else { return nil }
+            walking = true
+            return identity(parent.pid)
+        })
+        guard accepted == (changedPID == nil) else {
+            fputs("Descendant Launcher override accepted a changed execution\n", stderr)
+            return false
+        }
+    }
+    return true
+}
+
+private func runStandaloneLauncherSelfCheck() -> Int32 {
+    guard runDescendantOverrideSelfCheck() else { return 1 }
+    let codexVerifiedLauncherHelper = selfCheckCodexHelper()
+    guard runClaudeHelperRuntimeSelfCheck() else { return 1 }
+    guard runClaudeOutsideBundleDefaultSelfCheck() else {
+        fputs("Claude outside-bundle default failed\n", stderr)
+        return 1
+    }
+    guard runNestedLauncherHelperSelfCheck() else {
+        fputs("nested Launcher helper attribution failed\n", stderr)
+        return 1
+    }
+    let requirement = #"identifier "com.example.cli" and anchor apple generic"#
+    let developerID = LiveSigningInfo(
+        identifier: "com.example.cli",
+        teamIdentifier: "TEAM",
+        designatedRequirement: requirement,
+        mainExecutable: "/usr/local/bin/example",
+        isAdHoc: false,
+        runtimeProtection: .hardened,
+        isDeveloperID: true
+    )
+    let rejected = LiveSigningInfo(
+        identifier: "com.apple.zsh",
+        teamIdentifier: "unknown",
+        designatedRequirement: #"identifier "com.apple.zsh" and anchor apple"#,
+        mainExecutable: "/bin/zsh",
+        isAdHoc: false,
+        runtimeProtection: .hardened,
+        isDeveloperID: false
+    )
+    let adHoc = LiveSigningInfo(
+        identifier: developerID.identifier,
+        teamIdentifier: developerID.teamIdentifier,
+        designatedRequirement: developerID.designatedRequirement,
+        mainExecutable: "/usr/local/bin/ad-hoc-example",
+        isAdHoc: true,
+        runtimeProtection: .hardened,
+        isDeveloperID: true
+    )
+    let bundledDeveloperID = LiveSigningInfo(
+        identifier: "com.example.helper",
+        teamIdentifier: "TEAM",
+        designatedRequirement: #"identifier "com.example.helper" and anchor apple generic"#,
+        mainExecutable: "/Applications/Example.app/Contents/Helpers/example",
+        isAdHoc: false,
+        runtimeProtection: .hardened,
+        isDeveloperID: true
+    )
+    let bundledCodex = LiveSigningInfo(
+        identifier: codexVerifiedLauncherHelper.helperSigningIdentifier,
+        teamIdentifier: codexVerifiedLauncherHelper.helperTeamIdentifier,
+        designatedRequirement: #"identifier "codex" and anchor apple generic"#,
+        mainExecutable: "/Applications/ChatGPT.app/Contents/Resources/codex",
+        isAdHoc: false,
+        runtimeProtection: .hardened,
+        isDeveloperID: true
+    )
+    let chatGPTURL = URL(fileURLWithPath: "/Applications/ChatGPT.app")
+    let codexAssociation = verifiedLauncherHelperAssociation(
+        path: bundledCodex.mainExecutable,
+        signing: bundledCodex,
+        containingAppURLs: [chatGPTURL],
+        configuration: VerifiedLauncherHelperConfiguration(userApprovedHelpers: [codexVerifiedLauncherHelper]),
+        bundleIdentifier: { _ in codexVerifiedLauncherHelper.appBundleIdentifier }
+    )
+    let unapprovedCodexAssociation = verifiedLauncherHelperAssociation(
+        path: bundledCodex.mainExecutable,
+        signing: bundledCodex,
+        containingAppURLs: [chatGPTURL],
+        configuration: VerifiedLauncherHelperConfiguration(),
+        bundleIdentifier: { _ in codexVerifiedLauncherHelper.appBundleIdentifier }
+    )
+    let disabledCodexAssociation = verifiedLauncherHelperAssociation(
+        path: bundledCodex.mainExecutable,
+        signing: bundledCodex,
+        containingAppURLs: [chatGPTURL],
+        configuration: VerifiedLauncherHelperConfiguration(
+            disabledHelperIDs: [codexVerifiedLauncherHelper.id],
+            userApprovedHelpers: [codexVerifiedLauncherHelper]
+        ),
+        bundleIdentifier: { _ in codexVerifiedLauncherHelper.appBundleIdentifier }
+    )
+    let wrongPathCodexHelper = selfCheckCodexHelper(relativePath: "Contents/Resources/not-codex")
+    let pathBoundCodexHelper = selfCheckCodexHelper()
+    let pathBoundCodexAssociation = verifiedLauncherHelperAssociation(
+        path: bundledCodex.mainExecutable,
+        signing: bundledCodex,
+        containingAppURLs: [chatGPTURL],
+        helpers: [wrongPathCodexHelper, pathBoundCodexHelper],
+        configuration: VerifiedLauncherHelperConfiguration(userApprovedHelpers: [pathBoundCodexHelper]),
+        bundleIdentifier: { _ in codexVerifiedLauncherHelper.appBundleIdentifier }
+    )
+    // Exercise relocation independently of whichever vendor apps are installed.
+    let movedHelperChecks = [
+        (allowed: false, disabled: false, parent: true, identityMatches: true, expected: false),
+        (allowed: true, disabled: false, parent: true, identityMatches: true, expected: true),
+        (allowed: true, disabled: true, parent: true, identityMatches: true, expected: false),
+        (allowed: true, disabled: false, parent: false, identityMatches: true, expected: false),
+        (allowed: true, disabled: false, parent: true, identityMatches: false, expected: false),
+    ].allSatisfy { scenario in
+        let moved = LiveSigningInfo(
+            identifier: bundledCodex.identifier,
+            teamIdentifier: scenario.identityMatches ? bundledCodex.teamIdentifier : "OTHER",
+            designatedRequirement: bundledCodex.designatedRequirement,
+            mainExecutable: "/tmp/av-moved-codex",
+            isAdHoc: false,
+            runtimeProtection: .hardened,
+            isDeveloperID: true
+        )
+        let association = verifiedLauncherHelperAssociation(
+            path: moved.mainExecutable,
+            signing: moved,
+            containingAppURLs: [],
+            configuration: VerifiedLauncherHelperConfiguration(
+                disabledHelperIDs: scenario.disabled ? [codexVerifiedLauncherHelper.id] : [],
+                userApprovedHelpers: [codexVerifiedLauncherHelper],
+                allowedOutsideBundleHelperIDs: scenario.allowed ? [codexVerifiedLauncherHelper.id] : []
+            ),
+            installedAppURL: { _ in scenario.parent ? chatGPTURL : nil }
+        )
+        return scenario.expected
+            ? association?.isOutsideBundle == true && association?.appURL == chatGPTURL
+            : association == nil
+    }
+    let optedInBundledAssociation = verifiedLauncherHelperAssociation(
+        path: bundledCodex.mainExecutable,
+        signing: bundledCodex,
+        containingAppURLs: [chatGPTURL],
+        configuration: VerifiedLauncherHelperConfiguration(
+            userApprovedHelpers: [codexVerifiedLauncherHelper],
+            allowedOutsideBundleHelperIDs: [codexVerifiedLauncherHelper.id]
+        ),
+        bundleIdentifier: { _ in codexVerifiedLauncherHelper.appBundleIdentifier }
+    )
+    let optedInWrongPathAssociation = verifiedLauncherHelperAssociation(
+        path: bundledCodex.mainExecutable,
+        signing: bundledCodex,
+        containingAppURLs: [chatGPTURL],
+        helpers: [wrongPathCodexHelper],
+        configuration: VerifiedLauncherHelperConfiguration(
+            userApprovedHelpers: [wrongPathCodexHelper],
+            allowedOutsideBundleHelperIDs: [wrongPathCodexHelper.id]
+        ),
+        bundleIdentifier: { _ in codexVerifiedLauncherHelper.appBundleIdentifier }
+    )
+    let xcodeGit = LiveSigningInfo(
+        identifier: "com.apple.git",
+        teamIdentifier: "Software Signing",
+        designatedRequirement: #"identifier "com.apple.git" and anchor apple"#,
+        mainExecutable: "/Applications/Xcode.app/Contents/Developer/usr/bin/git",
+        isAdHoc: false,
+        runtimeProtection: .hardened,
+        isDeveloperID: false
+    )
+    let xcodeHelperAssociation = verifiedLauncherHelperAssociation(
+        path: xcodeGit.mainExecutable,
+        signing: xcodeGit,
+        containingAppURLs: [URL(fileURLWithPath: "/Applications/Xcode.app")],
+        configuration: VerifiedLauncherHelperConfiguration(userApprovedHelpers: [codexVerifiedLauncherHelper]),
+        bundleIdentifier: { _ in "com.apple.dt.Xcode" }
+    )
+    let installedCodexValidation: Bool = {
+        let candidates = [
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+        ]
+        guard let path = candidates.first(where: { FileManager.default.fileExists(atPath: $0) })
+        else { return true }
+        let executableURL = URL(fileURLWithPath: path)
+        let codexVerifiedLauncherHelper = selfCheckCodexHelper(
+            relativePath: String(path.dropFirst("/Applications/ChatGPT.app/".count))
+        )
+        guard let signing = executableSigningInfo(path: executableURL.path),
+              let association = verifiedLauncherHelperAssociation(
+                  path: executableURL.path,
+                  signing: signing,
+                  helpers: [codexVerifiedLauncherHelper],
+                  configuration: VerifiedLauncherHelperConfiguration(userApprovedHelpers: [codexVerifiedLauncherHelper])
+              ),
+              verifiedLauncherHelperAppSigningInfo(association) != nil
+        else { return false }
+        let outsideResource = VerifiedLauncherHelperAssociation(
+            helper: codexVerifiedLauncherHelper,
+            appURL: association.appURL,
+            executableURL: URL(fileURLWithPath: "/bin/ls")
+        )
+        guard verifiedLauncherHelperAppSigningInfo(outsideResource) == nil else { return false }
+        let temporary = FileManager.default.temporaryDirectory
+            .appendingPathComponent("av-moved-helper-\(UUID().uuidString)", isDirectory: true)
+        let nestedApp = appBundleURLs(containing: executableURL.path).first {
+            $0 != association.appURL
+        }
+        let source = nestedApp ?? executableURL
+        let destination = temporary.appendingPathComponent(source.lastPathComponent)
+        let movedURL = nestedApp == nil ? destination
+            : destination.appendingPathComponent("Contents/MacOS/codex")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        do {
+            try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: source, to: destination)
+        } catch { return false }
+        guard let movedSigning = executableSigningInfo(path: movedURL.path),
+              let movedAssociation = verifiedLauncherHelperAssociation(
+                  path: movedURL.path,
+                  signing: movedSigning,
+                  configuration: VerifiedLauncherHelperConfiguration(
+                      userApprovedHelpers: [codexVerifiedLauncherHelper],
+                      allowedOutsideBundleHelperIDs: [codexVerifiedLauncherHelper.id]
+                  ),
+                  installedAppURL: { _ in association.appURL }
+              ),
+              movedAssociation.isOutsideBundle,
+              staticCodeIdentity(movedURL) == staticCodeIdentity(executableURL),
+              verifiedLauncherHelperAppSigningInfo(movedAssociation) != nil,
+              // A matching file alone cannot stand in for a different live process.
+              verifiedLauncherHelperSigningInfo(movedAssociation, pid: getpid()) == nil
+        else { return false }
+        let wrongParent = VerifiedLauncherHelperAssociation(
+            helper: codexVerifiedLauncherHelper,
+            appURL: URL(fileURLWithPath: "/Applications/Xcode.app"),
+            executableURL: movedURL,
+            isOutsideBundle: true
+        )
+        return verifiedLauncherHelperAppSigningInfo(wrongParent) == nil
+    }()
+    let installedMainAppValidation = [
+        URL(fileURLWithPath: "/Applications/ChatGPT.app"),
+        URL(fileURLWithPath: "/Applications/Xcode.app"),
+    ].allSatisfy {
+        !FileManager.default.fileExists(atPath: $0.path) || staticSigningInfo(url: $0) != nil
+    }
+    let avGPG = LiveSigningInfo(
+        identifier: "com.automicvault.av-gpg",
+        teamIdentifier: "TEAM",
+        designatedRequirement: #"identifier "com.automicvault.av-gpg" and anchor apple generic"#,
+        mainExecutable: "/Applications/Automic Vault.app/Contents/MacOS/av-gpg",
+        isAdHoc: false,
+        runtimeProtection: .hardened,
+        isDeveloperID: true
+    )
+    let portalHelper = LiveSigningInfo(
+        identifier: "dev.mxcl.portal.sessiond",
+        teamIdentifier: "TEAM",
+        designatedRequirement: #"identifier "dev.mxcl.portal.sessiond" and anchor apple generic"#,
+        mainExecutable: "/Applications/Portal Session Helper.app/Contents/MacOS/portal-sessiond",
+        isAdHoc: false,
+        runtimeProtection: .hardened,
+        isDeveloperID: true
+    )
+    let portalHelperSigning = StaticSigningInfo(
+        identifier: portalHelper.identifier,
+        teamIdentifier: portalHelper.teamIdentifier,
+        designatedRequirement: portalHelper.designatedRequirement
+    )
+    let portalGPGLaunchers = launcherIdentities(
+        pid: 45,
+        path: avGPG.mainExecutable,
+        signing: avGPG,
+        appSigning: { _ in nil }
+    ) + launcherIdentities(
+        pid: 44,
+        path: portalHelper.mainExecutable,
+        signing: portalHelper,
+        appSigning: { _ in portalHelperSigning }
+    )
+    let liveBundleFallback = launcherIdentities(
+        pid: 44,
+        path: bundledDeveloperID.mainExecutable,
+        signing: bundledDeveloperID,
+        appSigning: { _ in nil }
+    ).first
+    let pathOnlyBundleFallback = launcherIdentities(
+        pid: 44,
+        path: bundledDeveloperID.mainExecutable,
+        signing: bundledDeveloperID,
+        appSigning: { _ in nil },
+        allowsStandaloneFallback: false
+    ).first
+    guard launcherPickerAllows(filenameExtension: "226"),
+          satisfiesDeveloperIDRequirement({ _ in errSecSuccess }),
+          let launcher = launcherIdentity(
+              pid: 42,
+              path: developerID.mainExecutable,
+              signing: developerID
+          ),
+          launcher.isStandalone,
+          launcher.designatedRequirement == requirement,
+          targetedAppResourceValidationAvailable,
+          codexAssociation?.helper == codexVerifiedLauncherHelper,
+          codexAssociation?.appURL == chatGPTURL,
+          pathBoundCodexAssociation?.helper == pathBoundCodexHelper,
+          disabledCodexAssociation == nil,
+          unapprovedCodexAssociation == nil,
+          movedHelperChecks,
+          optedInBundledAssociation?.isOutsideBundle == false,
+          optedInWrongPathAssociation == nil,
+          xcodeHelperAssociation == nil,
+          installedCodexValidation,
+          installedMainAppValidation,
+          let liveBundleFallback,
+          liveBundleFallback.isStandalone,
+          liveBundleFallback.identifier == bundledDeveloperID.identifier,
+          temporaryAccessGrantLauncherName(liveBundleFallback) == approvalPromptRequester(
+              launcher: liveBundleFallback, fallback: liveBundleFallback.path
+          ).name,
+          pathOnlyBundleFallback == nil,
+          launcherIdentity(pid: 43, path: adHoc.mainExecutable, signing: adHoc) == nil,
+          launcherIdentity(pid: 43, path: rejected.mainExecutable, signing: rejected) == nil,
+          executionOrigin(
+              among: [liveBundleFallback, launcher],
+              callerPID: launcher.pid,
+              ancestorFallbackPath: "/bin/zsh"
+          )?.pid == liveBundleFallback.pid,
+          executionOrigin(
+              among: [launcher],
+              callerPID: launcher.pid,
+              ancestorFallbackPath: "/bin/zsh"
+          ) == nil,
+          executionOrigin(
+              among: [launcher],
+              callerPID: launcher.pid,
+              ancestorFallbackPath: nil
+          )?.pid == launcher.pid,
+          processChainLabel(paths: [
+              bundledDeveloperID.mainExecutable,
+              "/bin/zsh",
+              "/opt/homebrew/bin/gh",
+          ]) == "example → zsh → gh",
+          executionOrigin(
+              among: portalGPGLaunchers,
+              callerPID: 46,
+              ancestorFallbackPath: portalHelper.mainExecutable
+          )?.identifier == portalHelper.identifier,
+          !appBundleMatchesMainExecutable(
+              URL(fileURLWithPath: "/Applications/Xcode.app"),
+              executablePaths: ["/Applications/Xcode.app/Contents/Developer/usr/bin/git"],
+              bundleExecutableURL: { _ in
+                  URL(fileURLWithPath: "/Applications/Xcode.app/Contents/MacOS/Xcode")
+              }
+          ),
+          appBundleMatchesMainExecutable(
+              URL(fileURLWithPath: "/Applications/Xcode.app"),
+              executablePaths: ["/Applications/Xcode.app/Contents/MacOS/Xcode"],
+              bundleExecutableURL: { _ in
+                  URL(fileURLWithPath: "/Applications/Xcode.app/Contents/MacOS/Xcode")
+              }
+          ),
+          appBundleURL(containing: "/Applications/Example.app/Contents/MacOS/../Resources/payload")?.path
+              == "/Applications/Example.app"
+    else { return 1 }
+    let unhardenedLauncher = LauncherIdentity(
+        pid: launcher.pid,
+        path: launcher.path,
+        identifier: launcher.identifier,
+        teamIdentifier: launcher.teamIdentifier,
+        designatedRequirement: launcher.designatedRequirement,
+        runtimeProtection: .hardenedRuntimeMissing,
+        isStandalone: true
+    )
+    let libraryValidationLauncher = LauncherIdentity(
+        pid: launcher.pid,
+        path: launcher.path,
+        identifier: launcher.identifier,
+        teamIdentifier: launcher.teamIdentifier,
+        designatedRequirement: launcher.designatedRequirement,
+        runtimeProtection: .hardenedWithLibraryValidationDisabled,
+        isStandalone: true
+    )
+    let injectableLauncher = LauncherIdentity(
+        pid: launcher.pid,
+        path: launcher.path,
+        identifier: launcher.identifier,
+        teamIdentifier: launcher.teamIdentifier,
+        designatedRequirement: launcher.designatedRequirement,
+        runtimeProtection: .unsafeEntitlements([
+            "com.apple.security.cs.allow-dyld-environment-variables",
+            "com.apple.security.cs.disable-library-validation",
+        ]),
+        isStandalone: true
+    )
+    let bundledLauncher = LauncherIdentity(
+        pid: 40,
+        path: "/Applications/Example.app/Contents/MacOS/Example",
+        identifier: "com.example.app",
+        teamIdentifier: "TEAM",
+        designatedRequirement: #"identifier "com.example.app" and anchor apple generic"#,
+        runtimeProtection: .hardened
+    )
+    let unhardenedBundledLauncher = LauncherIdentity(
+        pid: bundledLauncher.pid,
+        path: bundledLauncher.path,
+        identifier: bundledLauncher.identifier,
+        teamIdentifier: bundledLauncher.teamIdentifier,
+        designatedRequirement: bundledLauncher.designatedRequirement,
+        runtimeProtection: .hardenedRuntimeMissing
+    )
+    let injectableBundledLauncher = LauncherIdentity(
+        pid: bundledLauncher.pid,
+        path: bundledLauncher.path,
+        identifier: bundledLauncher.identifier,
+        teamIdentifier: bundledLauncher.teamIdentifier,
+        designatedRequirement: bundledLauncher.designatedRequirement,
+        runtimeProtection: injectableLauncher.runtimeProtection
+    )
+
+    let unconfiguredGate = SecretGate(
+        id: "test",
+        keyPatterns: [],
+        routes: [],
+        defaultProtection: .fullIncludingSecretDumps,
+        appPolicies: []
+    )
+    let explicitlyBlockedGate = SecretGate(
+        id: "test",
+        keyPatterns: [],
+        routes: [],
+        defaultProtection: .fullIncludingSecretDumps,
+        appPolicies: [SecretGatePolicy(
+            bundleIdentifier: developerID.identifier,
+            requirement: requirement,
+            protection: .noAccess,
+            requiresHardenedRuntime: true
+        )]
+    )
+    let configuredGate = SecretGate(
+        id: "test",
+        keyPatterns: [],
+        routes: [],
+        defaultProtection: .noAccess,
+        appPolicies: [SecretGatePolicy(
+            bundleIdentifier: developerID.identifier,
+            requirement: requirement,
+            protection: .readOnly,
+            requiresHardenedRuntime: true
+        )]
+    )
+    let libraryLoadingGate = SecretGate(
+        id: "test",
+        keyPatterns: [],
+        routes: [],
+        defaultProtection: .noAccess,
+        appPolicies: [SecretGatePolicy(
+            bundleIdentifier: developerID.identifier,
+            requirement: requirement,
+            protection: .readOnly,
+            runtimeRequirement: .hardenedAllowingLibraryValidationDisabled
+        )]
+    )
+    let defaultRuntimeBlockedPolicy = resolveSecretGatePolicy(
+        gate: unconfiguredGate,
+        launchers: [unhardenedLauncher]
+    )
+    let explicitRuntimeBlockedPolicy = resolveSecretGatePolicy(
+        gate: configuredGate,
+        launchers: [unhardenedLauncher]
+    )
+    let explicitlyNoAccessPolicy = resolveSecretGatePolicy(
+        gate: explicitlyBlockedGate,
+        launchers: [unhardenedLauncher]
+    )
+    let unsafeRuntimeBlockedPolicy = resolveSecretGatePolicy(
+        gate: unconfiguredGate,
+        launchers: [injectableLauncher]
+    )
+    let strictLibraryValidationPolicy = resolveSecretGatePolicy(
+        gate: configuredGate,
+        launchers: [libraryValidationLauncher]
+    )
+    let unhardenedBundledPolicy = resolveSecretGatePolicy(
+        gate: unconfiguredGate,
+        launchers: [unhardenedBundledLauncher]
+    )
+    let injectableBundledPolicy = resolveSecretGatePolicy(
+        gate: unconfiguredGate,
+        launchers: [injectableBundledLauncher]
+    )
+    let mixedRuntimeBlockedPolicy = resolveSecretGatePolicy(
+        gate: unconfiguredGate,
+        launchers: [launcher, unhardenedBundledLauncher]
+    )
+    guard let defaultRuntimeBlockedPolicy,
+          let explicitRuntimeBlockedPolicy,
+          let explicitlyNoAccessPolicy,
+          let unsafeRuntimeBlockedPolicy,
+          let strictLibraryValidationPolicy,
+          let unhardenedBundledPolicy,
+          let injectableBundledPolicy,
+          let mixedRuntimeBlockedPolicy,
+          resolveSecretGatePolicy(gate: unconfiguredGate, launchers: []) == nil,
+          resolveSecretGatePolicy(gate: unconfiguredGate, launchers: [launcher])?.protection == .fullIncludingSecretDumps,
+          resolveSecretGatePolicy(
+              gate: unconfiguredGate,
+              launchers: [libraryValidationLauncher]
+          )?.protection == .fullIncludingSecretDumps,
+          resolveSecretGatePolicy(gate: unconfiguredGate, launchers: [launcher])?.launcher?.designatedRequirement == requirement,
+          resolveSecretGatePolicy(
+              gate: unconfiguredGate,
+              launchers: [launcher, bundledLauncher]
+          )?.launcher?.designatedRequirement == bundledLauncher.designatedRequirement,
+          resolveSecretGatePolicy(
+              gate: unconfiguredGate,
+              launchers: [unhardenedLauncher, bundledLauncher]
+          )?.launcher?.designatedRequirement == bundledLauncher.designatedRequirement,
+          defaultRuntimeBlockedPolicy.protection == .noAccess,
+          defaultRuntimeBlockedPolicy.configuredProtection == .fullIncludingSecretDumps,
+          defaultRuntimeBlockedPolicy.runtimeProtectionFailure == .hardenedRuntimeMissing,
+          launcherRuntimeProtectionApprovalExplanation(
+              policy: defaultRuntimeBlockedPolicy,
+              classification: .readOnly
+          )?.contains("does not enable Hardened Runtime") == true,
+          launcherRuntimeProtectionApprovalExplanation(
+              policy: defaultRuntimeBlockedPolicy,
+              classification: .unknown
+          ) == nil,
+          resolveSecretGatePolicy(gate: explicitlyBlockedGate, launchers: [launcher])?.protection == .noAccess,
+          resolveSecretGatePolicy(gate: configuredGate, launchers: [launcher])?.protection == .readOnly,
+          resolveSecretGatePolicy(
+              gate: configuredGate,
+              launchers: [bundledLauncher, launcher]
+          )?.launcher?.designatedRequirement == launcher.designatedRequirement,
+          explicitRuntimeBlockedPolicy.protection == .noAccess,
+          launcherRuntimeProtectionApprovalExplanation(
+              policy: explicitRuntimeBlockedPolicy,
+              classification: .readOnly
+          )?.contains("Approval is required") == true,
+          launcherRuntimeProtectionApprovalExplanation(
+              policy: explicitlyNoAccessPolicy,
+              classification: .readOnly
+          ) == nil,
+          strictLibraryValidationPolicy.protection == .noAccess,
+          strictLibraryValidationPolicy.runtimeProtectionFailure == .hardenedWithLibraryValidationDisabled,
+          launcherRuntimeProtectionApprovalExplanation(
+              policy: strictLibraryValidationPolicy,
+              classification: .readOnly
+          )?.contains("disables library validation") == true,
+          unhardenedBundledPolicy.protection == .noAccess,
+          unhardenedBundledPolicy.runtimeProtectionFailure == .hardenedRuntimeMissing,
+          launcherRuntimeProtectionApprovalExplanation(
+              policy: unhardenedBundledPolicy,
+              classification: .readOnly
+          )?.contains("does not enable Hardened Runtime") == true,
+          injectableBundledPolicy.protection == .noAccess,
+          injectableBundledPolicy.runtimeProtectionFailure == injectableLauncher.runtimeProtection,
+          mixedRuntimeBlockedPolicy.protection == .noAccess,
+          mixedRuntimeBlockedPolicy.launcher?.designatedRequirement == bundledLauncher.designatedRequirement,
+          resolveSecretGatePolicy(
+              gate: libraryLoadingGate,
+              launchers: [launcher]
+          )?.protection == .readOnly,
+          resolveSecretGatePolicy(
+              gate: libraryLoadingGate,
+              launchers: [libraryValidationLauncher]
+          )?.protection == .readOnly,
+          resolveSecretGatePolicy(
+              gate: libraryLoadingGate,
+              launchers: [injectableLauncher]
+          )?.protection == .noAccess,
+          unsafeRuntimeBlockedPolicy.protection == .noAccess,
+          launcherRuntimeProtectionApprovalExplanation(
+              policy: unsafeRuntimeBlockedPolicy,
+              classification: .readOnly
+          )?.contains("com.apple.security.cs.allow-dyld-environment-variables") == true
+    else { return 1 }
+    return 0
+}
+
+private func runGhReadOnlySelfCheck() -> Int32 {
+    let disclosures = [
+        ["auth", "git-credential", "get"],
+        ["auth", "git-credential", "--", "get"],
+        ["auth", "git-credential", "get", "--help=false"],
+        ["auth", "git-credential", "store"],
+        ["auth", "git-credential", "erase"],
+        ["auth", "git-credential", "future-operation"],
+        ["auth", "token"],
+        ["auth", "status", "--show-token"],
+        ["auth", "status", "--show-token=true"],
+        ["auth", "status", "--show-token=1"],
+    ]
+    for args in disclosures {
+        let classification = ghRequestClassification(args)
+        guard classification == .secretDump,
+              !SecretGateProtection.readOnly.allows(classification),
+              !SecretGateProtection.readOnlyAndLocalWrites.allows(classification),
+              !SecretGateProtection.fullExceptSecretDumps.allows(classification),
+              SecretGateProtection.fullIncludingSecretDumps.allows(classification),
+              temporaryAccessGrantUnavailableReason(
+                  hasToolSpecificGate: true, classification: classification,
+                  launcherRuntimeProtection: nil, agentTaskContext: nil
+              )?.contains("Secret Disclosure") == true
+        else { return 1 }
+    }
+
+    // Aliases can expand to auth token or git-credential without changing argv.
+    // Case variants are distinct alias names in gh, not builtin commands.
+    let unknown = [
+        [], ["--"], ["-R"], ["--hostname"],
+        ["credential-alias"], ["auth", "credential-alias"],
+        ["repo", "credential-alias"], ["search", "credential-alias"],
+        ["AUTH", "token"], ["REPO", "view"], ["repo", "VIEW"],
+        ["--help=false", "auth", "git-credential", "get"],
+        ["auth", "--help=false", "git-credential", "get"],
+        ["auth", "--help=false", "token"],
+        ["auth", "--show-token", "status"],
+        ["--", "auth", "git-credential", "get"],
+        ["--future-option", "auth", "token"],
+        ["repo", "future-command"],
+    ]
+    for args in unknown {
+        let classification = ghRequestClassification(args)
+        guard classification == .unknown,
+              !SecretGateProtection.fullExceptSecretDumps.allows(classification),
+              !SecretGateProtection.fullIncludingSecretDumps.allows(classification),
+              temporaryAccessGrantUnavailableReason(
+                  hasToolSpecificGate: true, classification: classification,
+                  launcherRuntimeProtection: nil, agentTaskContext: nil
+              )?.contains("Unknown") == true
+        else { return 1 }
+    }
+
+    let writes = [
+        ["issue", "create"], ["pr", "merge"], ["release", "create"],
+        ["repo", "fork"], ["workflow", "run"], ["secret", "set"],
+        ["project", "item-add"], ["codespace", "create"],
+        ["api", "--method", "POST", "repos/owner/repo/dispatches"],
+    ]
+    for args in writes {
+        let classification = ghRequestClassification(args)
+        guard classification == .mutating,
+              SecretGateProtection.fullExceptSecretDumps.allows(classification),
+              !SecretGateProtection.readOnly.allows(classification)
+        else { return 1 }
+    }
+
+    let allowed = [
+        ["auth", "status"],
+        ["status"],
+        ["browse"],
+        ["search", "prs", "foo"],
+        ["repo", "view"],
+        ["repo", "list"],
+        ["repo", "ls"],
+        ["issue", "view", "1"],
+        ["issue", "list"],
+        ["issue", "status"],
+        ["pr", "view"],
+        ["pr", "list"],
+        ["pr", "status"],
+        ["pr", "checks"],
+        ["pr", "diff"],
+        ["run", "view"],
+        ["run", "list"],
+        ["workflow", "view"],
+        ["workflow", "list"],
+        ["release", "view"],
+        ["release", "list"],
+        ["gist", "view"],
+        ["gist", "list"],
+        ["cache", "list"],
+        ["secret", "list"],
+        ["variable", "list"],
+        ["ruleset", "view"],
+        ["ruleset", "list"],
+        ["rs", "view"],
+        ["rs", "list"],
+        ["rs", "ls"],
+        ["attestation", "verify"],
+        ["attestation", "trusted-root"],
+        ["at", "verify"],
+        ["at", "trusted-root"],
+        ["agent-task", "view"],
+        ["agent-task", "list"],
+        ["agent", "view"],
+        ["agents", "list"],
+        ["agent-tasks", "list"],
+        ["org", "list"],
+        ["label", "list"],
+        ["gpg-key", "list"],
+        ["ssh-key", "list"],
+        ["-R", "owner/repo", "pr", "view"],
+        ["--hostname=github.example.com", "repo", "view"],
+        ["api", "repos/owner/repo"],
+        ["api", "--method", "GET", "repos/owner/repo"],
+        ["api", "-XGET", "-H", "Accept: application/vnd.github+json", "repos/owner/repo/releases/latest"],
+        ["api", "--method=GET", "-f", "per_page=1", "search/issues"],
+        ["api", "--paginate", "repos/owner/repo/actions/runs", "--jq", ".workflow_runs[].id"],
+        ["api", "graphql", "-f", "query=query { viewer { login } }"],
+        ["api", "graphql", "-fquery={ viewer { login } }"],
+        [
+            "api", "graphql",
+            "-f", "query=query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { body bodyHTML } } }",
+            "-f", "owner=automic-vault",
+            "-f", "repo=automic-vault",
+            "-F", "number=49",
+            "--hostname", "github.com",
+        ],
+        ["api", "graphql", "-f", "query=query Read { viewer { login } } mutation Write { addStar(input: {}) { clientMutationId } }", "-f", "operationName=Read"],
+    ]
+    guard allowed.allSatisfy(ghRequestIsReadOnly) else { return 1 }
+
+    let localWrites = [
+        ["repo", "clone", "owner/repo"],
+        ["pr", "checkout", "123"],
+        ["gist", "clone", "0123456789abcdef"],
+        ["run", "download", "123456"],
+        ["release", "download", "v1.0.0"],
+        ["attestation", "download", "owner/repo"],
+        ["at", "download", "owner/repo"],
+        ["-R", "owner/repo", "repo", "clone"],
+    ]
+    guard localWrites.allSatisfy({ ghRequestClassification($0) == .localWrite }) else { return 1 }
+
+    let denied = [
+        ["api"],
+        ["api", "--method", "POST", "repos/owner/repo/dispatches"],
+        ["api", "-X", "DELETE", "repos/owner/repo"],
+        ["api", "-f", "name=value", "repos/owner/repo"],
+        ["api", "--input", "body.json", "repos/owner/repo"],
+        ["api", "graphql"],
+        ["api", "graphql", "-f", "query=mutation { addStar(input: {}) { clientMutationId } }"],
+        ["api", "graphql", "-f", "query=subscription { viewer { login } }"],
+        ["api", "graphql", "-f", "query=query Read { viewer { login } } mutation Write { addStar(input: {}) { clientMutationId } }"],
+        ["api", "graphql", "-f", "query=query Read { viewer { login } } mutation Write { addStar(input: {}) { clientMutationId } }", "-f", "operationName=Write"],
+        ["api", "graphql", "-F", "query=@query.graphql"],
+        ["api", "graphql", "-f", "query={ viewer { login } }", "-F", "secret=@/etc/passwd"],
+        ["api", "graphql", "-f", "query={ viewer { login } }", "-f", "query={ viewer { name } }"],
+        ["api", "graphql", "--input", "body.json"],
+        ["auth", "token"],
+        ["auth", "status", "--show-token"],
+        ["alias", "set", "x", "repo view"],
+        ["extension", "install", "owner/gh-ext"],
+        ["config", "set", "editor", "vim"],
+        ["skill", "install", "foo"],
+        ["repo", "delete", "owner/name"],
+        ["issue", "create"],
+        ["pr", "merge"],
+        ["run", "rerun"],
+        ["workflow", "enable"],
+        ["release", "create"],
+        ["unknown", "view"],
+        ["--unknown", "repo", "view"],
+    ]
+    guard denied.allSatisfy({
+        let classification = ghRequestClassification($0)
+        return classification != .readOnly && classification != .localWrite
+    }),
+    ghGraphQLIndirectInputExplanation(
+        ["api", "graphql", "-F", "query=@-"]
+    )?.contains("automic authorization fails closed") == true,
+    ghGraphQLIndirectInputExplanation(
+        ["api", "graphql", "-f", "query={ viewer { login } }"]
+    ) == nil
+    else { return 1 }
+    return 0
+}
+
+private func runDockerCredentialSelfCheck() -> Int32 {
+    guard dockerRequestClassification(["search", "alpine"]) == .readOnly,
+          dockerRequestClassification(["pull", "alpine"]) == .localWrite,
+          dockerRequestClassification(["push", "example/image"]) == .mutating,
+          dockerRequestClassification(["future-command"]) == .unknown,
+          dockerRequestClassification(["buildx", "build", "--push", "."]) == .mutating,
+          dockerCredentialSecretName("https://ghcr.io")
+              == "DOCKER_REGISTRY_CREDENTIAL_82445E613488865FCEA004BCAB798DA99E6D3695EEC0072488AFB0A3B0A3D323",
+          let credential = parseDockerCredential(
+              #"{"ServerURL":"https://ghcr.io","Username":"octocat","Secret":"token"}"#
+          ),
+          credential.serverURL == "https://ghcr.io",
+          credential.username == "octocat",
+          credential.secret == "token",
+          parseDockerCredential(
+              #"{"ServerURL":"https://ghcr.io","Username":"octocat","Secret":"token","Extra":true}"#
+          ) == nil
+    else { return 1 }
+    return 0
+}
+
+private func runTerraformCredentialSelfCheck() -> Int32 {
+    guard terraformRequestClassification(["validate"]) == .readOnly,
+          terraformRequestClassification(["fmt"]) == .localWrite,
+          terraformRequestClassification(["fmt", "-check"]) == .readOnly,
+          terraformRequestClassification(["plan"]) == .localWrite,
+          terraformRequestClassification(["providers", "mirror", "/tmp/providers"]) == .localWrite,
+          terraformRequestClassification(["apply"]) == .mutating,
+          terraformRequestClassification(["state", "pull"]) == .readOnly,
+          terraformRequestClassification(["state", "push"]) == .mutating,
+          terraformRequestClassification(["future-command"]) == .unknown,
+          normalizeTerraformHostname("App.Terraform.IO") == "app.terraform.io",
+          normalizeTerraformHostname("app.terraform.io:443") == nil,
+          terraformCredentialSecretName("app.terraform.io")
+              == "TERRAFORM_HOST_CREDENTIAL_E3078C0B1928EE1F19EBBD26404E4C6B5FC1D639629DB0345330C0ECA3FEFC42",
+          parseTerraformCredential(#"{"token":"secret"}"#) == "secret",
+          parseTerraformCredential(#"{"token":"secret","future":true}"#) == nil
+    else { return 1 }
+    return 0
+}
+
+private func runAliyunCredentialSelfCheck() -> Int32 {
+    guard aliyunRequestClassification(["sts", "GetCallerIdentity"]) == .readOnly,
+          aliyunRequestClassification(["ecs", "DescribeInstances"]) == .unknown,
+          normalizeAliyunProfile("prod") == "prod",
+          normalizeAliyunProfile(" prod") == nil,
+          normalizeAliyunProfile("prod\n") == nil,
+          aliyunCredentialSecretName("prod")
+              == "ALIYUN_PROFILE_CREDENTIAL_6754AF9632A2745E85C293E5AAC0863370D9BD3330B9938C00CADFD215227D77",
+          parseAliyunCredential(
+              #"{"mode":"AK","access_key_id":"id","access_key_secret":"secret"}"#
+          ),
+          parseAliyunCredential(
+              #"{"mode":"StsToken","access_key_id":"id","access_key_secret":"secret","sts_token":"token"}"#
+          ),
+          !parseAliyunCredential(
+              #"{"mode":"AK","access_key_id":"id","access_key_secret":"secret","future":true}"#
+          )
+    else { return 1 }
+    return 0
+}
+
+private func runWakaTimeCredentialSelfCheck() -> Int32 {
+    let valid = ["waka_01234567", "89ab", "4cde", "8fab", "0123456789ab"].joined(separator: "-")
+    let bare = ["01234567", "89ab", "4cde", "bfab", "0123456789ab"].joined(separator: "-")
+    let wrongVersion = ["01234567", "89ab", "3cde", "8fab", "0123456789ab"].joined(separator: "-")
+    guard wakatimeRequestClassification(["--today"]) == .readOnly,
+          wakatimeRequestClassification(["--today-goal=123"]) == .readOnly,
+          wakatimeRequestClassification(["--entity", "/tmp/main.rs"]) == .mutating,
+          wakatimeRequestClassification(["--sync-offline-activity=100"]) == .mutating,
+          wakatimeRequestClassification(["--future-operation"]) == .unknown,
+          validWakaTimeAPIKey(valid),
+          validWakaTimeAPIKey(bare),
+          !validWakaTimeAPIKey(wrongVersion)
+    else { return 1 }
+    return 0
+}
+
+private func runKubectlCredentialSelfCheck() -> Int32 {
+    let canonical = #"{"kind":"token","server":"https://example.com/","user":"prod"}"#
+    guard let scope = parseKubectlCredentialScope(canonical),
+          scope.kind == "token",
+          scope.server == "https://example.com/",
+          scope.user == "prod",
+          scope.secretName
+              == "KUBECTL_USER_CREDENTIAL_6754AF9632A2745E85C293E5AAC0863370D9BD3330B9938C00CADFD215227D77",
+          validKubectlCredential(#"{"token":"secret"}"#, kind: "token"),
+          !validKubectlCredential(#"{"token":"secret","future":true}"#, kind: "token"),
+          parseKubectlCredentialScope(
+              #"{"kind":"token","server":"https://user@example.com/","user":"prod"}"#
+          ) == nil,
+          parseKubectlCredentialScope(
+              #"{"kind":"token","server":"http://example.com/","user":"prod"}"#
+          ) == nil
+    else { return 1 }
+    return 0
+}
+
+private func runOxideCredentialSelfCheck() -> Int32 {
+    let canonical = #"{"host":"https://oxide.example","profile":"prod"}"#
+    guard oxideRequestClassification(["auth", "status"]) == .readOnly,
+          oxideRequestClassification(["auth", "login"]) == .mutating,
+          oxideRequestClassification(["auth", "future"]) == .unknown,
+          oxideRequestClassification(["--profile", "prod", "project", "list"]) == .readOnly,
+          oxideRequestClassification(["project", "list"]) == .readOnly,
+          oxideRequestClassification(["project", "create"]) == .mutating,
+          oxideRequestClassification(["future-command"]) == .unknown,
+          oxideRequestClassification(["future-command", "list"]) == .unknown,
+          normalizeOxideHost("https://OXIDE.example/") == "https://oxide.example",
+          normalizeOxideHost("https://oxide.example:443/") == "https://oxide.example",
+          normalizeOxideHost("https://oxide.example/path") == nil,
+          let scope = parseOxideCredentialScope(canonical),
+          scope.profile == "prod",
+          scope.host == "https://oxide.example",
+          scope.secretName
+              == "OXIDE_PROFILE_TOKEN_7B278C7242C18FEA05959821606917F993F33A93618CDF5207AD0DCE95F9BCF0",
+          parseOxideCredential("secret") == "secret",
+          parseOxideCredential("secret\n") == nil,
+          parseOxideCredentialScope(#"{"profile":"prod","host":"https://oxide.example"}"#) == nil
+    else { return 1 }
+    return 0
+}
+
+private func runFastlyCredentialSelfCheck() -> Int32 {
+    let canonical = #"{"endpoint":"https://api.fastly.com","name":"prod"}"#
+    guard fastlyRequestClassification(["service", "list"]) == .unknown,
+          fastlyRequestClassification(["auth", "token"]) == .secretDump,
+          fastlyRequestClassification(["auth", "show", "prod", "--reveal"]) == .secretDump,
+          let scope = parseFastlyCredentialScope(canonical),
+          scope.name == "prod",
+          scope.endpoint == fastlyOfficialAPIEndpoint,
+          scope.secretName
+              == "FASTLY_API_TOKEN_E3A631294416CFFB0B45AFDD0D6160294006526867EF6E5941BB3D4AF97E9CAF",
+          parseFastlyCredential("secret") == "secret",
+          parseFastlyCredential("secret\n") == nil,
+          parseFastlyCredentialScope(
+              #"{"endpoint":"https://example.invalid","name":"prod"}"#
+          ) == nil
+    else { return 1 }
+    return 0
+}
+
+private func runSqlcmdCredentialSelfCheck() -> Int32 {
+    let canonical = #"{"address":"db.example.com","port":1433,"profile":"prod"}"#
+    guard sqlcmdRequestClassification(["query", "SELECT 1"]) == .unknown,
+          sqlcmdRequestClassification(["query", "cs"]) == .unknown,
+          sqlcmdRequestClassification(["--verbosity", "config", "cs"]) == .unknown,
+          sqlcmdRequestClassification(["config", "connection-strings"]) == .secretDump,
+          sqlcmdRequestClassification(["config", "cs"]) == .secretDump,
+          sqlcmdRequestClassification(["config", "view", "--raw"]) == .secretDump,
+          sqlcmdRequestClassification(["config", "show", "--raw"]) == .secretDump,
+          let scope = parseSqlcmdCredentialScope(canonical),
+          scope.profile == "prod",
+          scope.address == "db.example.com",
+          scope.port == 1433,
+          scope.secretName
+              == "SQLCMD_PASSWORD_6754AF9632A2745E85C293E5AAC0863370D9BD3330B9938C00CADFD215227D77",
+          parseSqlcmdPassword("secret") == "secret",
+          parseSqlcmdPassword("secret\n") == nil,
+          parseSqlcmdCredentialScope(#"{"address":"","port":1433,"profile":"prod"}"#) == nil
+    else { return 1 }
+    return 0
+}
+
+private func runGoatCredentialSelfCheck() -> Int32 {
+    let canonical = #"{"did":"did:plc:abc","pds":"https://pds.example"}"#
+    guard goatRequestClassification(["account", "check-auth"]) == .readOnly,
+          goatRequestClassification(["record", "create"]) == .mutating,
+          goatRequestClassification(["future"]) == .unknown,
+          let scope = parseGoatCredentialScope(canonical),
+          scope.secretName
+              == "GOAT_AUTH_SESSION_DA212E2E592DBA2E786AE246CCA580593FCB2A3CFC3641CE1BB9B5D3391963CA",
+          parseGoatCredential(
+              #"{"password":"pass","access_token":"access","session_token":"refresh"}"#
+          ) != nil,
+          parseGoatCredential(
+              #"{"password":"@av","access_token":"access","session_token":"refresh"}"#
+          ) == nil,
+          parseGoatCredential(#"{"password":"pass","access_token":"access"}"#) == nil
+    else { return 1 }
+    return 0
+}
+
+private func runRailwayCredentialSelfCheck() -> Int32 {
+    let canonical = #"{"environment":"production","host":"railway.com"}"#
+    guard railwayRequestClassification(["status"]) == .readOnly,
+          railwayRequestClassification(["deploy"]) == .mutating,
+          railwayRequestClassification(["run", "env"]) == .secretDump,
+          railwayRequestClassification(["variables", "list", "--json"]) == .secretDump,
+          railwayRequestClassification(["future"]) == .unknown,
+          let scope = parseRailwayCredentialScope(canonical),
+          scope.secretName
+              == "RAILWAY_AUTH_DC8779025AEA8CB5CBCE119C0F3B0CD38FF99203728B2ED45EAAC18F0F891B1A",
+          parseRailwayCredential(
+              #"{"token":null,"accessToken":"access","refreshToken":"refresh"}"#
+          ) != nil,
+          parseRailwayCredential(
+              #"{"token":"legacy","accessToken":null,"refreshToken":null}"#
+          ) != nil,
+          parseRailwayCredential(
+              #"{"token":"legacy","accessToken":"access","refreshToken":null}"#
+          ) == nil
+    else { return 1 }
+    return 0
+}
+
+private func runOrdercliCredentialSelfCheck() -> Int32 {
+    let scope = #"{"provider":"foodora"}"#
+    let credential = #"{"access_token":"access","refresh_token":"refresh","client_secret":"","pending_mfa_token":"","cookies_by_host":{"example.com":"cookie"}}"#
+    guard ordercliRequestClassification(["foodora", "history"]) == .readOnly,
+          ordercliRequestClassification(["--version"]) == .readOnly,
+          ordercliRequestClassification(["-v"]) == .readOnly,
+          ordercliRequestClassification(["version"]) == .readOnly,
+          ordercliRequestClassification(["foodora", "login"]) == .mutating,
+          ordercliRequestClassification(["foodora", "future"]) == .unknown,
+          parseOrdercliCredentialScope(scope)?.secretName == ordercliCredentialSecretName,
+          parseOrdercliCredential(credential) == credential,
+          parseOrdercliCredential(
+              #"{"access_token":"access","refresh_token":"refresh","client_secret":"","pending_mfa_token":"","cookies_by_host":null,"future":true}"#
+          ) == nil
+    else { return 1 }
+    return 0
+}
+
+private func runOpenHueCredentialSelfCheck() -> Int32 {
+    let scope = #"{"bridge":"192.0.2.10"}"#
+    guard openhueRequestClassification(["get", "light"]) == .readOnly,
+          openhueRequestClassification(["--help"]) == .readOnly,
+          openhueRequestClassification(["config", "--key", "secret"]) == .localWrite,
+          openhueRequestClassification(["set", "light"]) == .mutating,
+          openhueRequestClassification(["future"]) == .unknown,
+          parseOpenHueCredentialScope(scope)?.bridge == "192.0.2.10",
+          parseOpenHueCredential("application-key") == "application-key",
+          parseOpenHueCredential("@av") == nil
+    else { return 1 }
+    return 0
+}
+
+private func runPlumberCredentialSelfCheck() -> Int32 {
+    let credential = #"{"token":"streamdal-token","connections":{"kafka":{"sasl_password":"password"}}}"#
+    guard plumberRequestClassification(["--version"]) == .readOnly,
+          plumberRequestClassification(["read", "kafka"]) == .mutating,
+          plumberRequestClassification(["future"]) == .unknown,
+          parsePlumberCredentialScope(plumberCredentialScope)?.secretName == plumberCredentialSecretName,
+          parsePlumberCredential(credential) == credential,
+          parsePlumberCredential(#"{"automic_vault":"plumber-config-v1"}"#) == nil
+    else { return 1 }
+    return 0
+}
+
+private func runUAACredentialSelfCheck() -> Int32 {
+    let scope = #"{"store":"contexts"}"#
+    let credential = #"{"targets":{"url:https://uaa.example":{"context":{"access_token":"access","refresh_token":"refresh"}}}}"#
+    guard uaaRequestClassification(["targets"]) == .readOnly,
+          uaaRequestClassification(["context"]) == .secretDump,
+          uaaRequestClassification(["create-client"]) == .mutating,
+          uaaRequestClassification(["curl", "/Users"]) == .unknown,
+          parseUAACredentialScope(scope)?.secretName == uaaCredentialSecretName,
+          parseUAACredential(credential) == credential,
+          parseUAACredential(#"{"targets":{"target":{"context":{"access_token":"@av"}}}}"#) == nil
+    else { return 1 }
+    return 0
+}
+
+private func runAwsReadOnlySelfCheck() -> Int32 {
+    let allowed = [
+        ["--version"],
+        ["s3", "ls"],
+        ["--profile", "dev", "s3", "ls"],
+        ["--region=us-east-1", "ec2", "describe-instances"],
+        ["ec2", "describe-vpcs", "--filters", "Name=is-default,Values=true"],
+        ["iam", "list-users"],
+        ["s3api", "list-objects-v2"],
+        ["s3api", "head-object"],
+        ["sts", "get-caller-identity"],
+        ["cloudfront", "get-distribution", "--id", "example"],
+        ["dynamodb", "get-item", "--table-name", "example", "--key", "{}"],
+        ["dynamodb", "query", "--table-name", "example"],
+        ["help"],
+    ]
+    guard allowed.allSatisfy(awsRequestIsReadOnly) else { return 1 }
+
+    let denied = [
+        ["s3", "rm", "s3://bucket/key"],
+        ["s3", "cp", "file", "s3://bucket/key"],
+        ["ec2", "start-instances"],
+        ["lambda", "invoke"],
+        ["sts", "get-session-token"],
+        ["ecr", "get-login-password"],
+        ["secretsmanager", "get-secret-value"],
+        ["ssm", "get-parameter", "--with-decryption"],
+        ["configure", "get", "aws_secret_access_key"],
+        ["cloudfront", "future-get-operation"],
+        ["--unknown", "s3", "ls"],
+        [],
+    ]
+    guard denied.allSatisfy({ !awsRequestIsReadOnly($0) }) else { return 1 }
+    return 0
+}
+
+private func runBrewReadOnlySelfCheck() -> Int32 {
+    let allowed = [
+        [],
+        ["--version"],
+        ["--prefix", "ack"],
+        ["--cellar"],
+        ["--cache"],
+        ["--repository"],
+        ["--caskroom"],
+        ["--taps"],
+        ["--env"],
+        ["-v"],
+        ["casks"],
+        ["cat", "ack"],
+        ["command", "install"],
+        ["commands"],
+        ["config"],
+        ["deps", "ack"],
+        ["desc", "ack"],
+        ["doctor"],
+        ["formula", "ack"],
+        ["formulae"],
+        ["help", "install"],
+        ["info", "ack"],
+        ["leaves"],
+        ["linkage", "ack"],
+        ["list", "--versions"],
+        ["ls"],
+        ["livecheck", "ack"],
+        ["log", "ack"],
+        ["missing"],
+        ["options", "ack"],
+        ["outdated"],
+        ["readall"],
+        ["search", "ack"],
+        ["shellenv"],
+        ["source", "ack"],
+        ["tab", "ack"],
+        ["tap-info", "homebrew/core"],
+        ["unbottled"],
+        ["uses", "openssl@3"],
+        ["vulns"],
+        ["which-formula", "git"],
+        ["services", "list"],
+        ["services", "info", "postgresql"],
+        ["bundle", "check"],
+        ["bundle", "env"],
+        ["bundle", "list"],
+    ]
+    guard allowed.allSatisfy(brewRequestIsReadOnly) else { return 1 }
+
+    let denied = [
+        ["install", "ack"],
+        ["reinstall", "ack"],
+        ["uninstall", "ack"],
+        ["remove", "ack"],
+        ["rm", "ack"],
+        ["upgrade"],
+        ["cleanup"],
+        ["autoremove"],
+        ["link", "ack"],
+        ["unlink", "ack"],
+        ["pin", "ack"],
+        ["unpin", "ack"],
+        ["tap", "owner/repo"],
+        ["untap", "owner/repo"],
+        ["services"],
+        ["services", "start", "postgresql"],
+        ["services", "restart", "postgresql"],
+        ["services", "stop", "postgresql"],
+        ["services", "kill", "postgresql"],
+        ["services", "cleanup"],
+        ["bundle"],
+        ["bundle", "install"],
+        ["bundle", "dump"],
+        ["bundle", "add", "ack"],
+        ["bundle", "remove", "ack"],
+        ["bundle", "cleanup"],
+        ["bundle", "edit"],
+        ["bundle", "exec", "echo"],
+        ["bundle", "sh"],
+        ["sh"],
+        ["exec", "echo"],
+        ["fetch", "ack"],
+        ["unknown", "view"],
+        ["--debug", "info", "ack"],
+        ["--"],
+    ]
+    guard denied.allSatisfy({ !brewRequestIsReadOnly($0) }) else { return 1 }
+    return 0
+}
+
+private func runTransientApprovalSelfCheck() -> Int32 {
+    func request(
+        startUsec: UInt64 = 456,
+        args: [String] = ["repo", "view"],
+        keys: [String] = ["GH_TOKEN_GITHUB_COM"],
+        policy: AuthorizationDecisionReusePolicy = .reusable
+    ) -> AuthorizationDecisionReuseRequest {
+        AuthorizationDecisionReuseRequest(
+            client: AuthorizationClientExecution(
+                pid: 123,
+                pidVersion: 7,
+                startUsec: startUsec,
+                effectiveUserID: 501,
+                auditSessionID: 42
+            ),
+            callerPath: "/opt/homebrew/bin/gh",
+            signingIdentifier: "gh",
+            signingTeamIdentifier: "TEAM",
+            operation: "keys",
+            secretNames: keys,
+            target: "/opt/homebrew/Cellar/gh-cli/2.94.0/bin/gh",
+            arguments: args,
+            workingDirectory: "/tmp",
+            replaceExistingEnvironment: true,
+            allowMissingSecrets: false,
+            environmentConflicts: [],
+            shebangScript: nil,
+            scriptData: nil,
+            snapshotIncompatibleInterpreter: nil,
+            tool: "gh",
+            title: nil,
+            detail: nil,
+            credentialScope: nil,
+            credentialParent: nil,
+            selectedSecretValues: SelectedSecretValues(values: [:]),
+            policy: policy
+        )
+    }
+    let approval = request()
+    let denial = request(
+        args: ["auth", "token"],
+        keys: ["GH_TOKEN_GITHUB_COM_MXCL"]
+    )
+    let temporaryGrant = request(startUsec: 987, args: ["repo", "create"])
+    let interrupted = request(startUsec: 988, args: ["repo", "delete"])
+    let fallbackAfterDenial = request(args: ["auth", "token"])
+    let freshApproval = request(startUsec: 989, policy: .freshApprovalRequired)
+    var cache = AuthorizationDecisionReuseCache()
+    cache.remember(.approved, for: approval, now: Date(timeIntervalSince1970: 100))
+    cache.remember(.approved, for: freshApproval, now: Date(timeIntervalSince1970: 100))
+    guard cache.decision(for: approval, now: Date(timeIntervalSince1970: 200)) == .approved,
+          cache.decision(for: freshApproval, now: Date(timeIntervalSince1970: 200)) == nil,
+          cache.decision(for: fallbackAfterDenial, now: Date(timeIntervalSince1970: 200)) == nil,
+          cache.decision(for: request(startUsec: 789), now: Date(timeIntervalSince1970: 200)) == nil
+    else {
+        return 1
+    }
+    cache.remember(.denied, for: denial, now: Date(timeIntervalSince1970: 200))
+    cache.remember(
+        .temporaryAccessGrant,
+        for: temporaryGrant,
+        now: Date(timeIntervalSince1970: 200)
+    )
+    cache.remember(.interrupted, for: interrupted, now: Date(timeIntervalSince1970: 200))
+    guard cache.decision(for: denial, now: Date(timeIntervalSince1970: 300)) == .denied,
+          cache.decision(for: fallbackAfterDenial, now: Date(timeIntervalSince1970: 300)) == .denied,
+          cache.decision(for: temporaryGrant, now: Date(timeIntervalSince1970: 300)) == nil,
+          cache.decision(for: interrupted, now: Date(timeIntervalSince1970: 300)) == nil,
+          cache.decision(for: request(startUsec: 789), now: Date(timeIntervalSince1970: 300)) == nil,
+          cache.decision(for: fallbackAfterDenial, now: Date(timeIntervalSince1970: 501)) == nil
+    else {
+        return 1
+    }
+    return 0
+}
+
+private func runRetainedProcessProvenanceSelfCheck() -> Int32 {
+    var currentIdentity = AVProcessIdentity()
+    guard av_process_identity(getpid(), &currentIdentity),
+          currentIdentity.pidversion > 0,
+          currentIdentity.euid == geteuid(),
+          let currentExecution = retainedProcessExecution(
+              pid: getpid(),
+              identity: currentIdentity
+          ),
+          retainedProcessExecutionIsLive(currentExecution)
+    else { return 1 }
+
+    let launcher = LauncherIdentity(
+        pid: 300,
+        path: "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+        identifier: "com.mitchellh.ghostty",
+        teamIdentifier: "TEAM",
+        designatedRequirement: #"identifier "com.mitchellh.ghostty" and anchor apple generic"#,
+        runtimeProtection: .hardened
+    )
+    let herdr = RetainedProcessExecution(
+        pid: 200,
+        pidVersion: 9,
+        startUsec: 123,
+        effectiveUserID: geteuid(),
+        auditSessionID: 10,
+        codeIdentity: Data([1, 2, 3])
+    )
+    let crossUserHerdr = RetainedProcessExecution(
+        pid: herdr.pid,
+        pidVersion: herdr.pidVersion,
+        startUsec: herdr.startUsec,
+        effectiveUserID: geteuid() == 0 ? 1 : 0,
+        auditSessionID: herdr.auditSessionID,
+        codeIdentity: herdr.codeIdentity
+    )
+    let replacedHerdr = RetainedProcessExecution(
+        pid: herdr.pid,
+        pidVersion: herdr.pidVersion + 1,
+        startUsec: herdr.startUsec,
+        effectiveUserID: herdr.effectiveUserID,
+        auditSessionID: herdr.auditSessionID,
+        codeIdentity: herdr.codeIdentity
+    )
+    let chains = [[RetainedProcessChainNode(
+        pid: herdr.pid,
+        path: "/usr/local/bin/herdr",
+        execution: herdr
+    )]]
+    let request = ApprovalRequest(
+        op: "keys",
+        keys: ["GH_TOKEN_GITHUB_COM"],
+        target: "/opt/homebrew/bin/gh",
+        args: ["repo", "view"],
+        cwd: "/tmp",
+        replaceExistingEnv: true,
+        allowMissingKeys: false,
+        envConflicts: [],
+        shebangScript: nil,
+        scriptData: nil,
+        tool: "gh",
+        title: nil,
+        detail: nil
+    )
+    let gate = SecretGate(
+        id: "gh",
+        keyPatterns: ["GH_TOKEN_*"],
+        routes: [],
+        defaultProtection: .noAccess,
+        appPolicies: [SecretGatePolicy(
+            bundleIdentifier: launcher.identifier,
+            requirement: launcher.designatedRequirement,
+            protection: .readOnly
+        )]
+    )
+    var store = RetainedProcessProvenanceStore()
+    store.remember(
+        [herdr, crossUserHerdr],
+        at: .secretGate("gh"),
+        launcher: launcher,
+        isLive: { _ in true }
+    )
+    guard store.match(
+        at: .secretGate("gh"),
+        in: chains,
+        isLive: { _ in true }
+    )?.launcher.designatedRequirement == launcher.designatedRequirement,
+    store.match(
+        at: .secretGate("gh"),
+        in: [[RetainedProcessChainNode(
+            pid: crossUserHerdr.pid,
+            path: "/usr/local/bin/herdr",
+            execution: crossUserHerdr
+        )]],
+        isLive: { _ in true }
+    ) == nil,
+    retainedProvenanceWouldAuthorize(
+        request: request,
+        configuredGate: gate,
+        classification: .readOnly,
+        launcher: launcher,
+        directAccessRules: [],
+        trustedAVGateClient: false
+    ),
+    !retainedProvenanceWouldAuthorize(
+        request: request,
+        configuredGate: gate,
+        classification: .mutating,
+        launcher: launcher,
+        directAccessRules: [],
+        trustedAVGateClient: false
+    ),
+    store.match(
+        at: .directSecret,
+        in: chains,
+        isLive: { _ in true }
+    ) == nil,
+    store.match(
+        at: .secretGate("gh"),
+        in: [[RetainedProcessChainNode(
+            pid: replacedHerdr.pid,
+            path: "/usr/local/bin/herdr",
+            execution: replacedHerdr
+        )]],
+        isLive: { _ in true }
+    ) == nil,
+    store.match(
+        at: .secretGate("gh"),
+        in: chains,
+        isLive: { _ in false }
+    ) == nil
+    else { return 1 }
+    return 0
+}
+
+private func runLaunchAgentHandoffSelfCheck() -> Int32 {
+    let template = try! PropertyListSerialization.data(
+        fromPropertyList: [
+            "Label": approvalLaunchAgentName,
+            "ProgramArguments": ["@AUTOMIC_VAULT_EXECUTABLE@"],
+        ],
+        format: .xml,
+        options: 0
+    )
+    let executableURL = URL(fileURLWithPath: "/Users/example/My Apps/Automic Vault.app/Contents/MacOS/AutomicVaultMenubar")
+    let configured = try! configuredLaunchAgent(template: template, executableURL: executableURL)
+    let plist = try! PropertyListSerialization.propertyList(from: configured, format: nil) as! [String: Any]
+    let binaryConfigured = try! PropertyListSerialization.data(
+        fromPropertyList: plist,
+        format: .binary,
+        options: 0
+    )
+    guard !isLaunchAgentInstance(environment: [:]),
+          isLaunchAgentInstance(environment: ["XPC_SERVICE_NAME": approvalLaunchAgentName]),
+          shouldHandOffToLaunchAgent(environment: [:], launchAgentURL: URL(fileURLWithPath: "/tmp/agent.plist")),
+          !shouldHandOffToLaunchAgent(environment: ["XPC_SERVICE_NAME": approvalLaunchAgentName], launchAgentURL: URL(fileURLWithPath: "/tmp/agent.plist")),
+          !shouldHandOffToLaunchAgent(environment: [:], launchAgentURL: nil),
+          shouldOpenMainWindow(
+              arguments: ["AutomicVaultMenubar", openMainWindowArgument],
+              pending: false,
+              environment: ["XPC_SERVICE_NAME": approvalLaunchAgentName]
+          ),
+          shouldOpenMainWindow(
+              arguments: ["AutomicVaultMenubar"],
+              pending: true,
+              environment: ["XPC_SERVICE_NAME": approvalLaunchAgentName]
+          ),
+          shouldOpenMainWindow(arguments: ["AutomicVaultMenubar"], pending: false, environment: [:]),
+          !shouldOpenMainWindow(
+              arguments: ["AutomicVaultMenubar"],
+              pending: false,
+              environment: ["XPC_SERVICE_NAME": approvalLaunchAgentName]
+          ),
+          requestedSecretGateID(arguments: ["AutomicVaultMenubar", "--secret-gate", "aws"]) == "aws",
+          requestedSecretGateID(arguments: ["AutomicVaultMenubar", "--secret-gate", "../aws"]) == nil,
+          secretGateID(from: URL(string: "automic-vault://secret-gate/aws")!) == "aws",
+          secretGateID(from: URL(string: "automic-vault://secret-gate/aws/extra")!) == nil,
+          launchAgentConfigurationsMatch(configured, binaryConfigured),
+          !launchAgentConfigurationsMatch(nil, configured),
+          plist["ProgramArguments"] as? [String] == [executableURL.path],
+          String(decoding: configured, as: UTF8.self).contains("/Applications/") == false
+    else {
+        return 1
+    }
+    return 0
+}
+
+@MainActor
+private func runMenuStatusSelfCheck() -> Int32 {
+    guard AppDelegate().statusMenuTrackingSelfCheck() else { return 1 }
+    let statusItem = makeStatusMenuItem(title: "Starting Automic Vault")
+    let actionItem = NSMenuItem(title: "Open Automic Vault", action: nil, keyEquivalent: "")
+    setVersionBadge("1.2.3", on: actionItem)
+    let quitSeparator = NSMenuItem.separator()
+    let quitItem = NSMenuItem(title: "Quit", action: nil, keyEquivalent: "q")
+    let items = [statusItem, NSMenuItem.separator(), actionItem, quitSeparator, quitItem]
+    updateMenuVisibility(
+        items,
+        startingUp: true,
+        visibleDuringStartup: [statusItem, quitSeparator, quitItem]
+    )
+    let statusFont = statusItem.attributedTitle?.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+    guard statusItem.isSectionHeader,
+          statusFont == NSFont.menuFont(ofSize: 0),
+          actionItem.title == "Open Automic Vault",
+          actionItem.badge?.stringValue == "v1.2.3",
+          !statusItem.isHidden,
+          items[1].isHidden,
+          actionItem.isHidden,
+          !quitSeparator.isHidden,
+          !quitItem.isHidden
+    else { return 1 }
+    updateMenuVisibility(items, startingUp: false, visibleDuringStartup: [])
+    guard items.allSatisfy({ !$0.isHidden }) else { return 1 }
+
+    let updatingItems = makeUpdatingMenu().items
+    guard updatingItems.map(\.title) == ["Updating…", "", "Quit"],
+          updatingItems[0].isSectionHeader,
+          !updatingItems[2].isEnabled
+    else { return 1 }
+
+    let updatingAlert = NSAlert()
+    updatingAlert.addButton(withTitle: "Install and Relaunch")
+    configureUpdatingAlert(updatingAlert)
+    guard updatingAlert.messageText == "Updating…",
+          updatingAlert.buttons.allSatisfy(\.isHidden),
+          let progress = updatingAlert.accessoryView as? NSProgressIndicator,
+          progress.style == .spinning,
+          progress.isIndeterminate
+    else { return 1 }
+
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    formatter.dateFormat = "h:mm a"
+    func menuRecord(
+        _ time: TimeInterval,
+        launcher: String = "ChatGPT",
+        displayCommand: String = """
+        gh \\
+          repo \\
+          view
+        """
+    ) -> AutoApprovalRecord {
+        AutoApprovalRecord(
+            accessRequestID: UUID(),
+            date: Date(timeIntervalSince1970: time),
+            launcher: launcher,
+            launcherIconPath: "",
+            tool: "gh",
+            displayCommand: displayCommand,
+            keys: ["GH_TOKEN"],
+            wasCanceled: false,
+            wasDenied: false
+        )
+    }
+    let groupedMenuRecords = groupedAutoApprovals([
+        menuRecord(19_800),
+        menuRecord(18_900, displayCommand: "gh issue list"),
+        menuRecord(18_000, launcher: "Codex"),
+        menuRecord(17_100),
+    ])
+    let groupedMenuItem = AppDelegate().autoApprovalMenuItem(groupedMenuRecords[0])
+    for group in groupedMenuRecords {
+        let item = AppDelegate().autoApprovalMenuItem(group)
+        let activity = autoApprovalText(group.record) + (group.count > 1 ? " \u{00D7}\(group.count)" : "")
+        guard let title = item.attributedTitle else { return 1 }
+        let activityStart = title.length - (activity as NSString).length
+        var timeRange = NSRange()
+        guard title.string == item.title, activityStart > 0,
+              title.attribute(.foregroundColor, at: 0, effectiveRange: &timeRange) as? NSColor
+                == .disabledControlTextColor,
+              timeRange == NSRange(location: 0, length: activityStart),
+              title.attribute(.foregroundColor, at: activityStart, effectiveRange: nil) == nil
+        else { return 1 }
+    }
+    guard let groupedSubmenuTitle = groupedMenuItem.submenu?.items.first?.attributedTitle else {
+        return 1
+    }
+    let groupedCommand = groupedMenuRecords[0].record.displayCommand.replacingOccurrences(of: " \\\n  ", with: " ")
+    let groupedCommandStart = groupedSubmenuTitle.length - (groupedCommand as NSString).length
+    let request = ApprovalRequest(
+        op: "inject",
+        keys: ["AWS_SECRET_ACCESS_KEY"],
+        target: "/bin/zsh",
+        args: ["/usr/local/bin/aws", "s3", "ls"],
+        cwd: "/tmp",
+        replaceExistingEnv: true,
+        allowMissingKeys: false,
+        envConflicts: [],
+        shebangScript: "/usr/local/bin/aws",
+        scriptData: nil,
+        tool: nil,
+        title: nil,
+        detail: nil
+    )
+    let envWrapperRequest = ApprovalRequest(
+        op: "inject",
+        keys: ["PULUMI_ACCESS_TOKEN"],
+        target: "/bin/sh",
+        args: ["/usr/local/bin/pulumi", "stack", "ls"],
+        cwd: "/tmp",
+        replaceExistingEnv: false,
+        allowMissingKeys: true,
+        envConflicts: [],
+        shebangScript: "/usr/local/bin/pulumi",
+        scriptData: nil,
+        tool: nil,
+        title: nil,
+        detail: nil
+    )
+    let relativeScriptRequest = ApprovalRequest(
+        op: "inject",
+        keys: [],
+        target: "/bin/bash",
+        args: ["./scripts/publish.sh"],
+        cwd: "/Users/mxcl/src/av",
+        replaceExistingEnv: false,
+        allowMissingKeys: false,
+        envConflicts: [],
+        shebangScript: "/Users/mxcl/src/av/scripts/publish.sh",
+        scriptData: nil,
+        tool: nil,
+        title: nil,
+        detail: nil
+    )
+    let rawCredential = ["ghp", String(repeating: "a", count: 24)].joined(separator: "_")
+    let sensitiveRequest = ApprovalRequest(
+        op: "inject",
+        keys: ["GH_TOKEN"],
+        target: "/opt/homebrew/bin/gh",
+        args: ["api", "-H", "Authorization: Bearer \(rawCredential)"],
+        cwd: "/tmp",
+        replaceExistingEnv: false,
+        allowMissingKeys: false,
+        envConflicts: [],
+        shebangScript: nil,
+        scriptData: nil,
+        tool: "gh",
+        title: nil,
+        detail: nil
+    )
+    let sensitiveRecord = accessRequestRecord(
+        request: sensitiveRequest,
+        callerPath: "/usr/local/bin/av",
+        decision: "Approved",
+        approvalSource: "Auto",
+        reason: "Read Only from app policy",
+        launcher: nil
+    )
+    guard let sensitiveRetrospectiveRecord = autoApprovalRecord(sensitiveRecord) else { return 1 }
+    let sensitiveMenuItem = AppDelegate().autoApprovalMenuItem(
+        groupedAutoApprovals([sensitiveRetrospectiveRecord, sensitiveRetrospectiveRecord])[0]
+    )
+    guard let sensitiveMenuTitle = sensitiveMenuItem.submenu?.items.first?.attributedTitle?.string else {
+        return 1
+    }
+    let recordedApproval = AccessRequestRecord(
+        date: Date(timeIntervalSince1970: 18_900),
+        tool: "aws",
+        command: "aws s3 ls",
+        decision: "Approved",
+        approvalSource: "Auto",
+        reason: "Read Only from app policy",
+        launcher: "Codex",
+        launcherIconPath: "/Applications/Codex.app",
+        callerPath: "/usr/local/bin/av",
+        target: "/bin/zsh",
+        cwd: "/tmp",
+        keys: ["AWS_SECRET_ACCESS_KEY"],
+        detail: nil
+    )
+    guard let restoredApproval = autoApprovalRecord(recordedApproval) else { return 1 }
+    func retrospectiveRecord(_ decision: String, source: String = "Auto") -> AccessRequestRecord {
+        AccessRequestRecord(
+            date: recordedApproval.date,
+            tool: recordedApproval.tool,
+            command: recordedApproval.command,
+            decision: decision,
+            approvalSource: source,
+            reason: recordedApproval.reason,
+            launcher: recordedApproval.launcher,
+            launcherIconPath: recordedApproval.launcherIconPath,
+            callerPath: recordedApproval.callerPath,
+            target: recordedApproval.target,
+            cwd: recordedApproval.cwd,
+            keys: recordedApproval.keys,
+            detail: recordedApproval.detail
+        )
+    }
+    let policyDenial = retrospectiveRecord("Denied")
+    guard automaticAccessRecord(policyDenial).launcherIconPath == "/Applications/Codex.app",
+          restoredApproval.launcherIconPath == "/Applications/Codex.app"
+    else { return 1 }
+    let grantController = TemporaryAccessGrantController()
+    let grantWallNow = Date(timeIntervalSince1970: 20_000)
+    let grantMonotonicNow: TimeInterval = 100
+    let grantAgent = AgentTaskContext(
+        provider: .codex,
+        id: UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
+    )
+    let grant = grantController.start(
+        scope: TemporaryAccessGrantScope(
+            authorizationGateID: "aws",
+            launcherDesignatedRequirement: #"identifier "com.openai.codex" and anchor apple generic"#,
+            launcherRuntimeRequirement: .hardened,
+            agentTaskContext: grantAgent
+        ),
+        launcherName: "Codex",
+        authorizationGateName: "AWS Authorization Gate",
+        wallNow: grantWallNow,
+        monotonicNow: grantMonotonicNow
+    )
+    _ = grantController.start(
+        scope: TemporaryAccessGrantScope(
+            authorizationGateID: "gh",
+            launcherDesignatedRequirement: #"identifier "com.anthropic.claude-code" and anchor apple generic"#,
+            launcherRuntimeRequirement: .hardened,
+            agentTaskContext: AgentTaskContext(provider: .claudeCode, id: UUID())
+        ),
+        launcherName: "Claude Code",
+        authorizationGateName: "GH Authorization Gate",
+        wallNow: grantWallNow,
+        monotonicNow: grantMonotonicNow
+    )
+    let grantSnapshots = grantController.snapshots(
+        wallNow: grantWallNow,
+        monotonicNow: grantMonotonicNow
+    )
+    let stripView = NSHostingView(rootView: TemporaryAccessGrantStripView(
+        grants: grantSnapshots,
+        wallNow: grantWallNow,
+        monotonicNow: grantMonotonicNow,
+        collapse: {},
+        addTenMinutes: { _ in },
+        end: { _ in },
+        setCountdownSuspended: { _, _ in }
+    ))
+    let collapsedStripView = NSHostingView(rootView: CollapsedTemporaryAccessGrantStripView(
+        grantCount: grantSnapshots.count,
+        show: {}
+    ))
+    let grantPanel = makeTemporaryAccessGrantPanel()
+    if CommandLine.arguments.contains("--self-check-grant-panel-layout") {
+        _ = NSApplication.shared
+        guard let screen = NSScreen.main else { return 1 }
+        let anchor = NSRect(x: screen.visibleFrame.midX, y: screen.visibleFrame.maxY, width: 24, height: 24)
+        var positions: [CGFloat] = []
+        for tick in 0..<3 {
+            let host = NSHostingView(rootView: TemporaryAccessGrantStripView(
+                grants: Array(grantSnapshots.prefix(1)),
+                wallNow: grantWallNow.addingTimeInterval(Double(tick)),
+                monotonicNow: grantMonotonicNow + Double(tick),
+                collapse: {}, addTenMinutes: { _ in }, end: { _ in },
+                setCountdownSuspended: { _, _ in }
+            ))
+            let size = installPanelContent(host, in: grantPanel)
+            let frame = autoApprovalToastFrame(anchor: anchor, visibleFrame: screen.visibleFrame, size: size)
+            grantPanel.setFrame(frame, display: true)
+            grantPanel.orderFrontRegardless()
+            positions.append(grantPanel.frame.minY)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+            positions.append(grantPanel.frame.minY)
+        }
+        grantPanel.orderOut(nil)
+        guard Set(positions).count == 1 else {
+            print("FAIL: grant strip moves during countdown refresh", positions)
+            return 2
+        }
+        print("Grant panel layout self-check passed")
+        return 0
+    }
+    let sampleStripFrame = NSRect(x: 200, y: 400, width: 430, height: 120)
+    let stackedToastFrame = autoApprovalToastFrame(
+        anchor: sampleStripFrame,
+        visibleFrame: NSRect(x: 0, y: 0, width: 800, height: 600),
+        size: NSSize(width: 360, height: 120)
+    )
+    guard grantSnapshots.count == 2,
+          temporaryAccessGrantMenuTitle(
+              grant,
+              wallNow: grantWallNow,
+              monotonicNow: grantMonotonicNow
+          ).contains("Codex → AWS Authorization Gate · Codex task 11111111 · 10:00 · Write Access: 1 use · Last used "),
+          stripView.fittingSize.width == 430,
+          collapsedStripView.fittingSize == NSSize(width: 52, height: 44),
+          stackedToastFrame.maxY == sampleStripFrame.minY - 4,
+          temporaryAccessGrantTabFrame(
+              anchor: NSRect(x: 100, y: 576, width: 24, height: 24),
+              visibleFrame: NSRect(x: 0, y: 0, width: 800, height: 600),
+              size: collapsedStripView.fittingSize
+          ) == NSRect(x: -8, y: 548, width: 52, height: 44),
+          temporaryAccessGrantTabFrame(
+              anchor: NSRect(x: 700, y: 576, width: 24, height: 24),
+              visibleFrame: NSRect(x: 0, y: 0, width: 800, height: 600),
+              size: collapsedStripView.fittingSize
+          ) == NSRect(x: 756, y: 548, width: 52, height: 44),
+          shouldAnimateTemporaryAccessGrantPanelTransition(
+              isVisible: true,
+              reduceMotion: false,
+              from: .zero,
+              to: sampleStripFrame
+          ),
+          !shouldAnimateTemporaryAccessGrantPanelTransition(
+              isVisible: true,
+              reduceMotion: true,
+              from: .zero,
+              to: sampleStripFrame
+          ),
+          grantPanel.styleMask.contains(.borderless),
+          grantPanel.styleMask.contains(.nonactivatingPanel),
+          grantPanel.level == .statusBar,
+          grantPanel.collectionBehavior.contains(.canJoinAllSpaces),
+          grantPanel.collectionBehavior.contains(.fullScreenAuxiliary),
+          !grantPanel.hidesOnDeactivate,
+          !grantPanel.canHide,
+          grantPanel.animationBehavior == .none
+    else {
+        print(
+            "temporary grant UI self-check failed:",
+            grantSnapshots.count,
+            temporaryAccessGrantMenuTitle(
+                grant,
+                wallNow: grantWallNow,
+                monotonicNow: grantMonotonicNow
+            ),
+            stripView.fittingSize,
+            collapsedStripView.fittingSize,
+            stackedToastFrame,
+            grantPanel.styleMask.rawValue,
+            grantPanel.level.rawValue,
+            grantPanel.collectionBehavior.rawValue,
+            grantPanel.hidesOnDeactivate,
+            grantPanel.canHide,
+            grantPanel.animationBehavior.rawValue
+        )
+        return 2
+    }
+    guard let historyHeading = autoApprovalHistoryHeading(hasRecords: true) else { return 1 }
+    guard historyHeading.title == "Automic Authorization History",
+          historyHeading.isSectionHeader,
+          !historyHeading.isEnabled,
+          autoApprovalHistoryHeading(hasRecords: false) == nil,
+          autoApprovalRecord(retrospectiveRecord("Approved", source: "Human")) == nil,
+          autoApprovalRecord(policyDenial) == nil,
+          autoApprovalRecord(retrospectiveRecord("Canceled", source: "Manual")) == nil,
+          autoApprovalRecord(retrospectiveRecord("Failed")) == nil,
+          shortAppName("com.openai.codex") == "Codex",
+          approvalEvent(for: nil) == humanApprovalRequiredEvent,
+          approvalEvent(for: .approved) == nil,
+          approvalEvent(for: .denied) == nil,
+          approvalEvent(for: nil, humanApprovalAvailable: false) == nil,
+          AutomaticApprovalFeedback.allCases == [.notification, .menuBarFlash, .none],
+          automaticApprovalFeedback(rawValue: nil) == .notification,
+          automaticApprovalFeedback(rawValue: "notification") == .notification,
+          automaticApprovalFeedback(rawValue: "menuBarFlash") == .menuBarFlash,
+          automaticApprovalFeedback(rawValue: "none") == .none,
+          automaticApprovalFeedback(rawValue: "tampered") == .notification,
+          automaticAccessToastCommand(groupedMenuRecords[0].record.displayCommand, compact: true)
+            == "gh repo view",
+          automaticAccessToastCommand(groupedMenuRecords[0].record.displayCommand, compact: false)
+            == groupedMenuRecords[0].record.displayCommand,
+          AutomaticApprovalFlashSide.left.next == .right,
+          AutomaticApprovalFlashSide.right.next == .left,
+          autoApprovalToolName(request) == "aws",
+          approvalCommandPath(request) == "/usr/local/bin/aws",
+          approvalCommandPath(envWrapperRequest) == "/usr/local/bin/pulumi",
+          approvalPromptCommand(relativeScriptRequest) == "./scripts/publish.sh",
+          exactAuthorizationCommand(envWrapperRequest) == """
+          pulumi \\
+            stack \\
+            ls
+          """,
+          exactAuthorizationCommand(sensitiveRequest).contains(rawCredential),
+          sensitiveRecord.command.contains(rawCredential),
+          !sensitiveRecord.commandForDisplay.contains(rawCredential),
+          sensitiveRecord.commandForDisplay.contains("<redacted>"),
+          !sensitiveRetrospectiveRecord.displayCommand.contains(rawCredential),
+          sensitiveRetrospectiveRecord.displayCommand.contains("<redacted>"),
+          !sensitiveMenuTitle.contains(rawCredential),
+          sensitiveMenuTitle.contains("<redacted>"),
+          automaticAccessToastAccessibilityLabel({
+              var warningRecord = sensitiveRetrospectiveRecord
+              warningRecord.policyWarning = "Descendant rule override: child would require Approval."
+              return warningRecord
+          }(), compact: true).contains("Descendant rule override: child would require Approval."),
+          !automaticAccessToastAccessibilityLabel(
+              sensitiveRetrospectiveRecord,
+              compact: true
+          ).contains(rawCredential),
+          automaticAccessToastAccessibilityLabel(
+              sensitiveRetrospectiveRecord,
+              compact: true
+          ).contains("<redacted>"),
+          scanAlertLevel(["medium"]) == .medium,
+          scanAlertLevel(["medium", "high"]) == .high,
+          doctorStatusTitle(count: 0) == nil,
+          doctorStatusTitle(count: 1) == "One Doctor Report",
+          doctorStatusTitle(count: 2) == "Two Doctor Reports",
+          reblessingStatusTitle(count: 0) == nil,
+          reblessingStatusTitle(count: 1) == "One Blessed Script Needs Reblessing",
+          reblessingStatusTitle(count: 2) == "Two Blessed Scripts Need Reblessing",
+          vulnerabilityStatusTitle(count: 1) == "One Vulnerability Detected",
+          vulnerabilityStatusTitle(count: 2) == "Two Vulnerabilities Detected",
+          groupedMenuRecords.map(\.count) == [2, 1, 1],
+          groupedMenuRecords[0].records[1].displayCommand == "gh issue list",
+          groupedMenuItem.representedObject == nil,
+          groupedMenuItem.submenu?.items.compactMap({ $0.representedObject as? String })
+              == groupedMenuRecords[0].records.map({ $0.accessRequestID.uuidString }),
+          groupedMenuItem.submenu?.items.allSatisfy({ $0.image != nil }) == true,
+          groupedCommandStart > 0,
+          groupedSubmenuTitle.string.hasSuffix(groupedCommand),
+          !groupedSubmenuTitle.string.contains("\\"),
+          !groupedSubmenuTitle.string.contains("\n"),
+          !groupedSubmenuTitle.string.contains(groupedMenuRecords[0].record.launcher),
+          groupedSubmenuTitle.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
+              == .disabledControlTextColor,
+          groupedSubmenuTitle.attribute(
+              .foregroundColor,
+              at: groupedCommandStart,
+              effectiveRange: nil
+          ) == nil,
+          autoApprovalTitle(groupedMenuRecords[0], formatter: formatter)
+              == "5:15 AM\u{2013}5:30 AM ChatGPT used gh \u{00D7}2",
+          autoApprovalTitle(
+              AutoApprovalRecord(
+                  accessRequestID: UUID(),
+                  date: Date(timeIntervalSince1970: 18_900),
+                  launcher: "Codex",
+                  launcherIconPath: "/Applications/Codex.app",
+                  tool: "aws",
+                  displayCommand: "aws s3 ls",
+                  keys: ["AWS_SECRET_ACCESS_KEY"],
+                  wasCanceled: false,
+                  wasDenied: false
+              ),
+              formatter: formatter
+          ) == "5:15 AM – Codex used aws",
+          autoApprovalSubmenuCapacity(visibleHeight: 600) == 26,
+          restoredApproval.accessRequestID == recordedApproval.id,
+          restoredApproval.launcher == "Codex",
+          restoredApproval.tool == "aws",
+          restoredApproval.displayCommand == "aws <arguments hidden>",
+          restoredApproval.keys == ["AWS_SECRET_ACCESS_KEY"],
+          shouldShowAutomaticAccessToast(policyDenial),
+          !shouldShowAutomaticAccessToast(retrospectiveRecord("Denied", source: "Manual")),
+          automaticAccessDecisionLabel(wasDenied: true) == "AUTO REJECTED",
+          automaticAccessDecisionSymbol(wasDenied: true) == "xmark.shield.fill",
+          automaticAccessDecisionLabel(wasDenied: restoredApproval.wasDenied) == "AUTO APPROVED",
+          automaticAccessDecisionSymbol(wasDenied: restoredApproval.wasDenied) == "checkmark.shield.fill",
+          exactAuthorizationCommand(request) == """
+          aws \\
+            s3 \\
+            ls
+          """,
+          accessRequestRecord(
+              request: request,
+              callerPath: "/usr/local/bin/av",
+              decision: "Approved",
+              approvalSource: "Manual",
+              reason: "Approved in prompt",
+              launcher: nil
+          ).command == """
+          aws \\
+            s3 \\
+            ls
+          """,
+          autoApprovalToastFrame(
+              anchor: NSRect(x: 760, y: 600, width: 24, height: 24),
+              visibleFrame: NSRect(x: 0, y: 0, width: 800, height: 600),
+              size: NSSize(width: 360, height: 120)
+          ) == NSRect(x: 432, y: 476, width: 360, height: 120)
+    else {
+        return 1
+    }
+    return 0
+}
+
+@MainActor
+private func runScanSchedulingSelfCheck() -> Int32 {
+    var burstStartedAt: TimeInterval?
+    guard boundedScanDelay(
+        now: 10,
+        burstStartedAt: &burstStartedAt,
+        debounceDelay: 1,
+        maximumDelay: 5
+    ) == 1,
+    boundedScanDelay(
+        now: 14.5,
+        burstStartedAt: &burstStartedAt,
+        debounceDelay: 1,
+        maximumDelay: 5
+    ) == 0.5,
+    boundedScanDelay(
+        now: 15,
+        burstStartedAt: &burstStartedAt,
+        debounceDelay: 1,
+        maximumDelay: 5
+    ) == 0,
+    scanDetectorGroup(["npm"]) == ["npm"],
+    scanDetectorGroup(["bash"]) == ["bash", "zsh"],
+    AppDelegate().checkPeriodicDetectorRefresh()
+    else {
+        return 1
+    }
+    return 0
+}
+
+extension AppDelegate {
+    fileprivate func checkPeriodicDetectorRefresh() -> Bool {
+        detectorMetadata = [
+            DetectorMetadata(name: "git-credential-fill", homepage: "", docsURL: "", requiresPeriodicScan: true),
+            DetectorMetadata(name: "npm", homepage: "", docsURL: ""),
+        ]
+        defer { stopServices() }
+        startDetectorWatchers()
+        guard let poller = periodicDetectorPoller else { return false }
+        let timerIdentity = ObjectIdentifier(poller as AnyObject)
+
+        // Start clean, change only non-file state, and invoke the timer's real
+        // callback. No filesystem event, credential probe, or real CLI runs.
+        isScanRunning = true
+        schedulePeriodicDetectorScan()
+        scheduleScan(detectors: ["npm"], after: 1)
+        schedulePeriodicDetectorScan()
+        runPendingScan()
+        guard !pendingFullScan,
+              pendingScanDetectors == ["git-credential-fill", "npm"],
+              isScanRunning else { return false }
+        scheduleScan(after: 0)
+        schedulePeriodicDetectorScan()
+        guard pendingFullScan, pendingScanDetectors.isEmpty else { return false }
+        scanWorkItem?.cancel()
+        scanWorkItem = nil
+        pendingFullScan = false
+
+        let json = Data(#"{"findings":[{"source":"git-credential-fill","severity":"high","affected":[]},{"source":"npm","severity":"high","affected":[]}]}"#.utf8)
+        guard let findings = try? detectorFindings(from: json) else { return false }
+        applyScanResult(.success(findings, nil))
+        guard latestDetectorFindings.count == 2,
+              let retainedPoller = periodicDetectorPoller,
+              ObjectIdentifier(retainedPoller as AnyObject) == timerIdentity else { return false }
+        applyScanResult(.failed(["git-credential-fill"]))
+        guard latestDetectorFindings.count == 2, scanStatusItem.title == "Scan failed" else { return false }
+        applyScanResult(.success([findings[1]], ["npm"]))
+        guard scanStatusItem.title == "Scan failed" else { return false }
+        // Remediation clears just the refreshed detector; unrelated findings
+        // and the timer's original deadline survive the partial result.
+        applyScanResult(.success([], ["git-credential-fill"]))
+        guard latestDetectorFindings.map(\.source) == ["npm"],
+              failedScanDetectors.isEmpty, scanStatusItem.title != "Scan failed" else { return false }
+        applyScanResult(.failed(nil))
+        applyScanResult(.success([], ["git-credential-fill"]))
+        guard scanStatusItem.title == "Scan failed" else { return false }
+        applyScanResult(.success([], nil))
+        guard !fullScanFailed, scanStatusItem.title == "No Vulnerabilities Detected" else { return false }
+        stopServices()
+        // A timer or watcher callback already enqueued before cancellation
+        // must not leave scan work behind while services are stopped.
+        schedulePeriodicDetectorScan()
+        scheduleScan(detectors: ["npm"], after: 0)
+        scheduleScan(after: 0)
+        applyScanResult(.success([], nil))
+        startDetectorWatchers()
+        return periodicDetectorPoller == nil && missingFilePoller == nil
+            && scanWorkItem == nil && !pendingFullScan && pendingScanDetectors.isEmpty
+    }
+}
+
+@MainActor
+private final class PasteProbeTextView: NSTextView {
+    private(set) var didPaste = false
+
+    override func paste(_ sender: Any?) {
+        didPaste = true
+        NSApp.stop(nil)
+    }
+}
+
+@MainActor
+private func installTextEditingShortcuts() {
+    NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+        let action: Selector? = switch event.charactersIgnoringModifiers?.lowercased() {
+        case "c": #selector(NSText.copy(_:))
+        case "v": #selector(NSText.paste(_:))
+        default: nil
+        }
+        guard event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+              let responder = event.window?.firstResponder,
+              let action,
+              NSApp.sendAction(action, to: responder, from: event)
+        else { return event }
+        return nil
+    }
+}
+
+@MainActor
+private func runTextPasteSelfCheck() -> Int32 {
+    _ = NSApplication.shared
+    installTextEditingShortcuts()
+    let window = NSPanel(
+        contentRect: NSRect(x: 0, y: 0, width: 200, height: 100),
+        styleMask: .titled,
+        backing: .buffered,
+        defer: false
+    )
+    let textView = PasteProbeTextView(frame: window.contentView?.bounds ?? .zero)
+    window.contentView?.addSubview(textView)
+    window.makeKeyAndOrderFront(nil)
+
+    guard window.makeFirstResponder(textView),
+          let event = NSEvent.keyEvent(
+              with: .keyDown,
+              location: .zero,
+              modifierFlags: .command,
+              timestamp: 0,
+              windowNumber: window.windowNumber,
+              context: nil,
+              characters: "v",
+              charactersIgnoringModifiers: "v",
+              isARepeat: false,
+              keyCode: 9
+          )
+    else { return 1 }
+
+    NSApp.setActivationPolicy(.accessory)
+    NSApp.activate()
+    DispatchQueue.main.async {
+        NSApp.postEvent(event, atStart: true)
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+        NSApp.stop(nil)
+    }
+    NSApp.run()
+    return textView.didPaste ? 0 : 1
+}
+
+private final class UpdatePreflightURLProtocol: URLProtocol, @unchecked Sendable {
+    private static let input = try? UpdatePreflightInput(arguments: CommandLine.arguments)
+    private let lock = NSLock()
+    private var stopped = false
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        guard let url = request.url else { return false }
+        return input?.fixture(for: url) != nil
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        guard let url = request.url,
+              let fixture = Self.input?.fixture(for: url),
+              let response = HTTPURLResponse(
+                url: url,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: [
+                    "Content-Type": fixture.data == nil
+                        ? "application/octet-stream"
+                        : "application/json",
+                    "Content-Length": String(fixture.size),
+                ]
+              )
+        else {
+            client?.urlProtocol(self, didFailWithError: UpdatePreflightError.invalidDraft)
+            return
+        }
+
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        do {
+            if let data = fixture.data {
+                client?.urlProtocol(self, didLoad: data)
+            } else if let file = fixture.file {
+                let handle = try FileHandle(forReadingFrom: file)
+                defer { try? handle.close() }
+                while !lock.withLock({ stopped }) {
+                    let data = try handle.read(upToCount: 1024 * 1024) ?? Data()
+                    if data.isEmpty { break }
+                    client?.urlProtocol(self, didLoad: data)
+                }
+            }
+            if !lock.withLock({ stopped }) {
+                client?.urlProtocolDidFinishLoading(self)
+            }
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {
+        lock.withLock { stopped = true }
+    }
+}
+
+@MainActor
+private func runUpdatePreflight() async -> Int32 {
+    do {
+        let input = try UpdatePreflightInput(arguments: CommandLine.arguments)
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        if input.releasesData != nil {
+            sessionConfiguration.protocolClasses = [UpdatePreflightURLProtocol.self]
+                + (sessionConfiguration.protocolClasses ?? [])
+        }
+        let updater = makeUpdater(sessionConfiguration: sessionConfiguration)
+        guard let update = try await updater.check(),
+              update.version == input.expectedVersion
+        else {
+            throw UpdatePreflightError.invalidDraft
+        }
+        let prepared = try await update.prepareInstallation()
+        await prepared.discard()
+        print("Verified update to \(update.version) with AppUpdater.")
+        return 0
+    } catch {
+        fputs("update preflight failed: \(error.localizedDescription)\n", stderr)
+        return 1
+    }
+}
+
+if CommandLine.arguments.contains("--self-check-localization") {
+    let chinese = CommandLine.arguments.contains("--expect-chinese")
+    precondition(localizedUIString("Approval Required") == (chinese ? "需要批准" : "Approval Required"))
+    precondition(String(localized: "Approve Once") == (chinese ? "批准一次" : "Approve Once"))
+    precondition(localizedUIString("Allow for Session") == (chinese ? "在本会话中允许" : "Allow for Session"))
+    precondition(localizedUIString("Untranslated fallback") == "Untranslated fallback")
+    precondition(localizedUIString("Overview") == (chinese ? "概览" : "Overview"))
+    precondition(localizedUIString("No vulnerabilities detected") == (chinese ? "未检测到漏洞" : "No vulnerabilities detected"))
+    precondition(localizedUIString("Activity & Settings") == (chinese ? "活动与设置" : "Activity & Settings"))
+    let dashboardCount = "12"
+    precondition(String(localized: "View all \(dashboardCount) hardened Tools →") ==
+        (chinese ? "查看全部 12 个已加固工具 →" : "View all 12 hardened Tools →"))
+    precondition(String(localized: "\(dashboardCount) recorded requests · 24h") ==
+        (chinese ? "过去 24 小时内记录了 12 次请求" : "12 recorded requests · 24h"))
+
+
+    // Interpolation must preserve technical identifiers, even when they contain
+    // translation keys, format characters, shell syntax, or non-ASCII text.
+    let name = "Settings %1$@ $(id) /tmp/批准"
+    let status: Int32 = -25293
+    let message = String(localized: "Could not save \(name): \(String(status))")
+    precondition(message == (chinese ? "无法保存 \(name)：\(status)" : "Could not save \(name): \(status)"))
+    let sections = [ApprovalPromptSection("Secret Values", "key", [
+        ApprovalPromptRow("Settings", "/tmp/Secrets"),
+    ])]
+    precondition(approvalPromptDetails(sections) == (chinese
+        ? "Secret 值\nSettings: /tmp/Secrets" : "Secret Values\nSettings: /tmp/Secrets"))
+    precondition(sections[0].title == "Secret Values" && sections[0].rows[0].label == "Settings")
+
+    // Localizing a display must not change persisted policy labels, presets,
+    // or the classification that will be sent to the phone and history.
+    precondition(SecretGateProtection.noAccess.rawValue == "noAccess")
+    precondition(SecretGateProtection.noAccess.title == "Approval Required")
+    for level in SecretGateProtection.allCases {
+        precondition(!localizedUIString(level.title).isEmpty)
+        precondition(!level.allows(.unknown))
+    }
+    precondition(!SecretGateProtection.fullExceptSecretDumps.allows(.secretDump))
+    precondition(SecretGateProtection.fullIncludingSecretDumps.allows(.secretDump))
+    precondition(operationClassificationTitle(.unknown) == "Unknown")
+    print("Localization self-check passed")
+    exit(0)
+}
+
+if CommandLine.arguments.contains("--self-check-sleep") {
+    sleep(5)
+    exit(0)
+}
+
+if CommandLine.arguments.contains("--self-check-approvals") {
+    exit(MainActor.assumeIsolated { runApprovalSelfCheck() })
+}
+
+#if DEBUG
+if CommandLine.arguments.contains("--self-check-touch-id-focus") {
+    Task { @MainActor in
+        exit(await touchIDWindowFocusSelfCheck() ? 0 : 1)
+    }
+    NSApplication.shared.run()
+}
+#endif
+
+if CommandLine.arguments.contains("--self-check-approval-callsite") {
+    Task { @MainActor in
+        exit(await runApprovalCallsiteSelfCheck())
+    }
+    // Keep AppKit on the physical main thread after asynchronous queue checks.
+    NSApplication.shared.run()
+}
+
+if CommandLine.arguments.contains("--self-check-approval-process-execution") {
+    exit(runApprovalProcessExecutionSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-standalone-launchers") {
+    exit(runStandaloneLauncherSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-secret-mutations") {
+    Task { @MainActor in
+        exit(await runSecretMutationSelfCheck())
+    }
+    dispatchMain()
+}
+
+if CommandLine.arguments.contains("--self-check-keychain-persistence") {
+    exit(runKeychainPersistenceSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-metadata-disclosure") {
+    exit(runMetadataDisclosureSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-gh-read-only") {
+    exit(runGhReadOnlySelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-docker-credentials") {
+    exit(runDockerCredentialSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-terraform-credentials") {
+    exit(runTerraformCredentialSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-aliyun-credentials") {
+    exit(runAliyunCredentialSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-wakatime-credentials") {
+    exit(runWakaTimeCredentialSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-kubectl-credentials") {
+    exit(runKubectlCredentialSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-oxide-credentials") {
+    exit(runOxideCredentialSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-fastly-credentials") {
+    exit(runFastlyCredentialSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-sqlcmd-credentials") {
+    exit(runSqlcmdCredentialSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-goat-credentials") {
+    exit(runGoatCredentialSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-railway-credentials") {
+    exit(runRailwayCredentialSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-ordercli-credentials") {
+    exit(runOrdercliCredentialSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-openhue-credentials") {
+    exit(runOpenHueCredentialSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-plumber-credentials") {
+    exit(runPlumberCredentialSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-uaa-credentials") {
+    exit(runUAACredentialSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-aws-read-only") {
+    exit(runAwsReadOnlySelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-brew-read-only") {
+    exit(runBrewReadOnlySelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-transient-approvals") {
+    exit(runTransientApprovalSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-retained-provenance") {
+    exit(runRetainedProcessProvenanceSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-dashboard-search") {
+    exit(MainActor.assumeIsolated { runDashboardSearchSelfCheck() })
+}
+
+if CommandLine.arguments.contains("--self-check-update-toolbar") {
+    exit(MainActor.assumeIsolated { runUpdateToolbarSelfCheck() })
+}
+
+if CommandLine.arguments.contains("--self-check-launch-agent-handoff") {
+    exit(runLaunchAgentHandoffSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-menu-status")
+    || CommandLine.arguments.contains("--self-check-grant-panel-layout")
+{
+    exit(MainActor.assumeIsolated { runMenuStatusSelfCheck() })
+}
+
+if CommandLine.arguments.contains("--self-check-scan-scheduling") {
+    exit(runScanSchedulingSelfCheck())
+}
+
+if CommandLine.arguments.contains("--self-check-text-paste") {
+    exit(MainActor.assumeIsolated { runTextPasteSelfCheck() })
+}
+
+if CommandLine.arguments.contains("--verify-update") {
+    Task { @MainActor in
+        exit(await runUpdatePreflight())
+    }
+    dispatchMain()
+}
+
+if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--self-check-git-records" {
+    let url = CommandLine.arguments[2]
+    guard GitTransportOperation(["fetch", url]) != nil else { exit(64) }
+    guard let history = loadAccessRequestRecordsForDisclosure() else { exit(1) }
+    let records = history.filter { $0.target == gitTransportGH && $0.command.contains(url) }
+    guard let data = try? JSONEncoder().encode(records) else { exit(1) }
+    FileHandle.standardOutput.write(data)
+    exit(records.isEmpty ? 1 : 0)
+}
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+app.setActivationPolicy(.accessory)
+app.run()

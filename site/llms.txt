@@ -1,0 +1,81 @@
+# Automic Vault
+
+> Automic Vault hardens supported CLI tools on macOS, moves exposed credentials into the Keychain, and gates their use while you keep your usual commands.
+
+## Product
+
+- [Homepage](https://www.automicvault.xyz/): Explains how Automic Vault complements Apple’s macOS app security with protected credentials and authorization for supported command-line operations. Connects Max Howell’s Homebrew history to the remaining CLI credential gap. Shows operation-level policy, reviewed scripts, and Approval.
+- [Download](https://www.automicvault.xyz/download/): Provides the signed macOS disk image, installation details, included components, and first steps after setup.
+- [Documentation](https://www.automicvault.xyz/docs/): Automic Vault 4.18.0 manual checked against the release on October 8, including descendant Launcher overrides and per-key SSH policies.
+- [Security foundations](https://www.automicvault.xyz/docs/security/): Defines request, identity, authority, Secret delivery, secure defaults, and product boundaries.
+- [App guide](https://www.automicvault.xyz/docs/app/): Explains every destination in the macOS operator console.
+- [Approval and authority](https://www.automicvault.xyz/docs/authority/): Covers Approval routes, temporary authority, Secret Values, and Access Levels.
+- [CLI reference](https://www.automicvault.xyz/docs/cli/): Documents commands, machine-readable catalogs, and exit behavior.
+- [Workflows](https://www.automicvault.xyz/docs/workflows/): Gives known-good paths for GitHub, AWS, Docker, proxying, scripts, and GPG signing.
+- [Blessed Scripts](https://www.automicvault.xyz/docs/blessed-scripts/): Covers script review, capability ceilings, Launcher Endorsements, execution, and revocation.
+- [Reentrant Blessed Scripts](https://www.automicvault.xyz/docs/reentrant-scripts/): Explains agent prompt handoffs, capability and Secret boundaries, intermediate context, state validation, and safe retries.
+- [Troubleshooting](https://www.automicvault.xyz/docs/troubleshooting/): Diagnoses common Approval, Target, Value selection, Launcher, proxy, and Doctor failures.
+- [Hardener reference](https://www.automicvault.xyz/docs/hardeners/): Publishes static HTML and Markdown pages for hardeners documented in the source checkout.
+- [Package catalog](https://pkg.so/): Searchable catalog of developer packages, dependencies, install commands, risk information, and Automic Vault hardening coverage.
+- [Source and releases](https://github.com/automicvault/automicvault): Apache-2.0 source code, tagged releases, implementation history, and public issue tracking.
+
+## Security and Architecture
+
+- [Choose whose Launcher rule applies](https://www.automicvault.xyz/blog/descendant-launcher-policies/): Explains opt-in descendant Launcher rule overrides, explicit denial, ancestry checks, and why disabling an override also needs Approval.
+
+- [Automic Vault vs AWS Secrets Manager](https://www.automicvault.xyz/blog/automic-vault-vs-aws-secrets-manager/): Compares AWS IAM policy, rotation, raw retrieval, and CloudTrail with Automic Vault's AWS hardening and local per-Launcher command policy.
+- [Automic Vault vs HashiCorp Vault](https://www.automicvault.xyz/blog/automic-vault-vs-hashicorp-vault/): Compares Vault tokens, path policies, dynamic secrets, and Agent supervision with Automic Vault's local Tool hardening and execution policy.
+- [Automic Vault vs Infisical](https://www.automicvault.xyz/blog/automic-vault-vs-infisical/): Compares Infisical RBAC, machine identities, CLI injection, and dynamic leases with Automic Vault's Tool hardening and local execution policy.
+- [Automic Vault vs Doppler](https://www.automicvault.xyz/blog/automic-vault-vs-doppler/): Compares Doppler project configs, service tokens, and environment injection with Automic Vault's local hardening and operation-aware policy.
+- [Automic Vault vs Bitwarden](https://www.automicvault.xyz/blog/automic-vault-vs-bitwarden/): Compares Bitwarden session keys, machine accounts, and project-scoped injection with Automic Vault's local Tool hardening and operation-aware policy.
+- [Automic Vault vs 1Password](https://www.automicvault.xyz/blog/automic-vault-vs-1password/): Compares 1Password CLI sessions and newer agent integrations with Automic Vault's Tool hardening, Verified Launcher policy, and per-operation authorization.
+- [About](https://www.automicvault.xyz/about/): Explains Max Howell’s path from creating Homebrew to hardening CLI tools and controlling the authority agents inherit.
+- [The best AWS credential manager](https://www.automicvault.xyz/blog/best-aws-credential-manager/): Explains process-bound AWS credential delivery, temporary STS sessions, signed-launcher policy, MFA and role support, and the fail-closed profile model.
+- [macOS security for the terminal](https://www.automicvault.xyz/blog/bringing-macos-security-to-the-terminal/): Explains inherited CLI authority and the identity, Approval, and Authorization History boundary beneath shells and agent harnesses.
+- [Mac security best practices for agents](https://www.automicvault.xyz/blog/mac-security-best-practices-for-agents/): Gives a least-authority macOS baseline covering Gatekeeper, SIP, local builds, Downloads, privacy grants, and command-line protection.
+- [Security reporting](https://www.automicvault.xyz/.well-known/security.txt): Publishes the current security contact, preferred language, canonical location, and expiration date.
+
+## Incident Analysis
+
+- [Quickstart to Launcher Bundles](https://www.automicvault.xyz/blog/quickstart-to-launcher-bundles/): Create and enroll a native CLI bundle, verify command resolution, and set Launcher-specific policy.
+- [Blog](https://www.automicvault.xyz/blog/): Index of developer security guidance and analyses of package, extension, credential, and local execution incidents.
+- [Keyv npm supply-chain worm](https://www.automicvault.xyz/blog/prevent-keyv-npm-worm/): Explains how protected local credentials and a low-privilege install terminal would have broken the worm's credential theft and stolen-token propagation path.
+- [Nx Console extension compromise](https://www.automicvault.xyz/blog/prevent-nx-console-vscode-compromise/): Analyzes local credential theft by a compromised VS Code extension and the relevant endpoint controls.
+- [GitHub employee device breach](https://www.automicvault.xyz/blog/prevent-github-vscode-extension-breach/): Examines a poisoned editor extension, repository access, and controls at the developer workstation boundary.
+- [LiteLLM PyPI compromise](https://www.automicvault.xyz/blog/prevent-litellm-pypi-compromise/): Maps malicious Python releases and credential theft to local secret storage and executable approval controls.
+
+## Website Policies
+
+- [Privacy](https://www.automicvault.xyz/privacy/): Explains website analytics, local product data boundaries, Keychain storage, logs, diagnostics, updates, and public reporting guidance.
+- [Terms](https://www.automicvault.xyz/terms/): Summarizes website use, Apache-2.0 licensing, release artifacts, package metadata, third-party services, and warranty boundaries.
+
+## Key Facts
+
+- Category: local execution security and secrets management
+- Platform: macOS
+- Current documented release: Automic Vault 4.12.2
+- License: Apache License 2.0
+- Pricing: free open-source software
+- Founder: Max Howell, creator of Homebrew
+- Automic Vault evaluates the complete Tool operation before applying a Secret.
+- Authorization Policy considers the Tool, Target, Verified Launcher, command, arguments, working directory, Secret Names, and selected Value sources.
+- A Secret Name can select a Global Value or the nearest Project Value without project-shaped names.
+- Eligible agent tasks can receive visible, in-memory ten-minute Temporary Access Grants with explicit exclusions.
+- Reentrant Blessed Scripts give agents fixed, reviewed entry points without general Tool, MCP, or Secret Value access.
+- Optional iPhone Approval carries human decisions across enrolled Macs while each Mac keeps its own policy, Secret custody, history, and enforcement. Separately enabled Touch ID Approval may coexist; iPhone allow responses require an active subscription.
+- Secrets remain in Keychain until an authorized Target receives them. The Target controls them after receipt.
+- Root compromise and a malicious authorized Target remain outside the product security boundary.
+
+## Command Surface
+
+- `av scan --show-all` audits credential exposure and unsafe tool configuration.
+- `av doctor --json` checks launchers, dependencies, ownership, permissions, content, and path precedence.
+- `av save [--project-directory=DIR] GH_TOKEN` prompts through `/dev/tty` and stores a Global Value or Project Value in Keychain.
+- `av inject +GH_TOKEN gh auth status` releases a named value to one approved command.
+- `av detectors --json` and `av hardeners --json` publish the installed security catalogs.
+
+## Contact
+
+- Website: https://www.automicvault.xyz/
+- Source: https://github.com/automicvault/automicvault
+- Security reports: https://github.com/automicvault/automicvault/issues

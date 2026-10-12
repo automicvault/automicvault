@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-Y78QKG1T9Y"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-Y78QKG1T9Y');
+  </script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>Automic Vault manual — Automic Vault</title>
+  <meta name="description" content="Automic Vault 4.18.0 manual for macOS, checked against the current source and canonical security model.">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="Automic Vault">
+  <meta property="og:title" content="Automic Vault manual">
+  <meta property="og:description" content="Automic Vault 4.18.0 manual for macOS, checked against the current source and canonical security model.">
+  <meta property="og:url" content="https://www.automicvault.xyz/docs/">
+  <meta property="og:image" content="https://www.automicvault.xyz/preview.jpg">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Automic Vault manual">
+  <meta name="twitter:description" content="Automic Vault 4.18.0 manual for macOS, checked against the current source and canonical security model.">
+  <meta name="twitter:image" content="https://www.automicvault.xyz/preview.jpg">
+  <link rel="canonical" href="index.html">
+  <link rel="alternate" type="text/markdown" title="Markdown" href="index.md">
+  <link rel="alternate" type="text/plain" title="llms.txt" href="../llms.txt">
+  <script type="application/ld+json">
+  {"@context":"https://schema.org","@type":"TechArticle","url":"https://www.automicvault.xyz/docs/","headline":"Automic Vault manual","description":"Automic Vault 4.18.0 manual for macOS, checked against the current source and canonical security model.","dateModified":"2026-10-08","author":{"@id":"https://www.automicvault.xyz/#organization"},"publisher":{"@id":"https://www.automicvault.xyz/#organization"},"about":{"@type":"SoftwareApplication","name":"Automic Vault","softwareVersion": "4.18.0","operatingSystem":"macOS","codeRepository":"https://github.com/automicvault/automicvault"}}
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&amp;family=Geist+Mono:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+  <link rel="icon" href="../favicon.ico@v=5" sizes="16x16 32x32 48x48">
+  <link rel="icon" href="../favicon-dark.svg@v=5" type="image/svg+xml" media="(prefers-color-scheme: dark)">
+  <link rel="icon" href="../favicon.svg@v=5" type="image/svg+xml" media="(prefers-color-scheme: light)">
+  <link rel="mask-icon" href="../safari-pinned-tab.svg@v=5" color="#ffffff" media="(prefers-color-scheme: dark)">
+  <link rel="mask-icon" href="../safari-pinned-tab.svg@v=5" color="#111111" media="(prefers-color-scheme: light)">
+  <link rel="apple-touch-icon" href="../apple-touch-icon.png@v=3">
+  <link rel="stylesheet" href="../styles.css@v=128.css">
+  <link rel="stylesheet" href="styles.css@v=5.css">
+</head>
+<body>
+  <div class="site-shell" id="top">
+    <header class="masthead">
+      <a class="brand" href="../index.html" aria-label="Automic Vault home"><img class="brand-mark" src="../assets/icon@2x.webp@v=3" alt="" width="54" height="54"><span class="brand-type">Automic Vault</span></a>
+      <button class="nav-toggle" type="button" aria-expanded="false" aria-label="Toggle navigation"><span></span><span></span></button>
+      <nav class="nav" aria-label="Main navigation"><a href="../index.html">Home</a><a href="https://pkg.so/">Packages</a><a href="../blog/index.html">Blog</a><a href="index.html" aria-current="page">Docs</a><a href="../download/index.html">Download</a><a href="https://github.com/automicvault/automicvault">GitHub</a></nav>
+    </header>
+    <main>
+      <header class="docs-hero"><div class="docs-hero-inner"><p class="eyebrow">Automic Vault 4.18.0 · macOS</p><h1>Automic Vault manual</h1><p class="lede">Install Automic Vault, understand the operator console, and find the right reference.</p><ul class="docs-provenance" aria-label="Page formats"><li>Source linked</li><li><a href="index.md">Markdown</a></li></ul></div></header>
+      <div class="docs-layout">
+        <nav class="docs-toc" aria-label="Documentation sections">
+          <a class="docs-toc-title" href="index.html">Manual</a>
+          <section class="docs-nav-group">
+            <h2>Documentation</h2>
+            <ul><li><a href="index.html" aria-current="page">Overview</a></li><li><a href="security/index.html">Security foundations</a></li><li><a href="app/index.html">App guide</a></li><li><a href="authority/index.html">Approval and authority</a></li><li><a href="cli/index.html">CLI reference</a></li><li><a href="workflows/index.html">Workflows</a></li><li><a href="blessed-scripts/index.html">Blessed Scripts</a></li><li><a href="reentrant-scripts/index.html">Reentrant Blessed Scripts</a></li><li><a href="troubleshooting/index.html">Troubleshooting</a></li><li><a href="hardeners/index.html">Hardeners</a></li></ul>
+          </section>
+          <section class="docs-nav-group">
+            <h2>On this page</h2>
+            <ul><li class="docs-nav-depth-2"><a href="index.html#install-and-verify">Install and verify</a></li><li class="docs-nav-depth-2"><a href="index.html#start-here">Start here</a></li><li class="docs-nav-depth-2"><a href="index.html#interface-map">Interface map</a></li></ul>
+          </section>
+        </nav>
+        <article class="docs-content"><h1 id="automic-vault-manual">Automic Vault manual</h1>
+<p>This is the user and operator manual for Automic Vault 4.18.0 on
+macOS, checked against the release source on October 8, 2026. This
+release includes descendant Launcher rule overrides and per-key SSH
+policies. UI screenshots show 3.16.0 and illustrate older layouts;
+follow the text for current behavior. Use your installed build's help
+and catalogs to check its command surface.</p>
+<p>Automic Vault does more than store a Secret. It authorizes a complete
+operation: the Verified Launcher, Gate Client, Target, command and
+arguments, working directory, requested Secret Names, and selected Value
+sources. If allowed, it applies the Secret to the Target without
+displaying the stored Value.</p>
+<ul>
+<li><a href="../download/index.html">Download</a></li>
+<li><a href="https://github.com/automicvault/automicvault">Source and
+releases</a></li>
+<li><a
+href="https://github.com/automicvault/automicvault/blob/main/docs/domain-language.md">Canonical
+Domain Language</a></li>
+<li><a
+href="https://github.com/automicvault/automicvault/blob/main/docs/architecture.md">Architecture
+and security boundaries</a></li>
+<li><a
+href="https://github.com/automicvault/automicvault/blob/main/docs/positioning.md">Product
+positioning</a></li>
+</ul>
+<h2 id="install-and-verify">Install and verify</h2>
+<pre class="sh"><code>brew install --cask automic-vault/isotopes/automic-vault
+open /Applications/Automic\ Vault.app
+av --version
+av help</code></pre>
+<p>You may instead use the <a
+href="https://github.com/automicvault/automicvault/releases/latest">latest
+release</a> or review the <a
+href="../install.sh">website installer</a>.
+The menu bar app owns Approval UI and Authorization Policy. Open it
+before an operation that needs Approval: <code>av open</code>. Complete
+the app's attended CLI installation when prompted; installing the
+protected CLI requires administrator authentication.</p>
+<h2 id="start-here">Start here</h2>
+<p>Scan the Mac, save one Value through the hidden terminal prompt, and
+apply it only to the Target that needs it:</p>
+<pre class="sh"><code>av scan --show-all
+av save GH_TOKEN
+av inject +GH_TOKEN gh auth status</code></pre>
+<p><code>av save</code> defaults to hidden single-line terminal input.
+Since 4.6.0, <code>--multiline</code> accepts hidden multiline input and
+<code>--stdin</code> reads exact redirected input to EOF. See <a
+href="authority/index.html#saving-safely">saving safely</a>. Do not remove
+the old credential until the approved command succeeds. For a Tool with
+a supplied hardener, prefer its Tool-specific flow:</p>
+<pre class="sh"><code>av hardeners --json | jq &#39;.hardeners[] | select(.applicable) | {name, hardened}&#39;
+av harden gh
+av doctor gh</code></pre>
+<h2 id="interface-map">Interface map</h2>
+<p>The main window is an operator console for exposure, authority, live
+use, and evidence. Global search filters the selected destination;
+Refresh recomputes live state. The Overview summarizes Findings,
+hardening, recent activity, and available updates. The sidebar separates
+four jobs:</p>
+<table>
+<thead>
+<tr>
+<th>Job</th>
+<th>Destinations</th>
+<th>Question answered</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Discover</td>
+<td>Detectors, Doctor</td>
+<td>Where is supported insecure state, and is the protected route
+healthy?</td>
+</tr>
+<tr>
+<td>Establish authority</td>
+<td>Hardened Tools, Authorization Gates, Blessed Scripts, Launcher
+Bundles</td>
+<td>Which exact code and operations can ask for authority?</td>
+</tr>
+<tr>
+<td>Operate</td>
+<td>Secrets, Active Proxies</td>
+<td>Which named Values exist, and which proxy sessions are live?</td>
+</tr>
+<tr>
+<td>Audit and configure</td>
+<td>Authorization History, Settings</td>
+<td>Why was an operation allowed or denied, and which approval routes
+are enabled?</td>
+</tr>
+</tbody>
+</table>
+<p>Counts are live summaries, not security conclusions. A zero beside
+Active Proxies means no proxy session is registered now; it does not
+prove that no Target currently holds a Value it received earlier. A
+clean Doctor view means the checks implemented by that build passed; it
+is not a whole-machine attestation.</p>
+<p class="docs-source-link"><a href="index.md">Read this page as Markdown</a></p></article>
+      </div>
+    </main>
+    <footer class="docs-footer"><p class="docs-footer-line">Authorize the operation, not just the identity.</p><div class="docs-footer-meta"><div class="docs-footer-links"><a href="index.html#top">Back to top</a><a href="index.html">Docs</a><a href="index.md">Markdown</a><a href="../download/index.html">Download</a><a href="https://github.com/automicvault/automicvault">Source</a></div><span>Automic Vault 4.18.0 manual</span></div></footer>
+  </div>
+  <script src="../app.js@v=26"></script>
+</body>
+</html>
